@@ -1,0 +1,47 @@
+[project]
+name = "odic"
+version = "0.1.0"
+authors = [
+    { name="Daniel Hails", email="odic@hails.info" },
+]
+description = "On-Disk Input-keyed Cache — disk-backed memoization with pydantic-aware encoding"
+requires-python = ">=3.10"
+dynamic = ["dependencies", "readme"]
+
+[project.optional-dependencies]
+pydantic = ["pydantic>=2"]
+
+[project.urls]
+"Homepage" = "https://github.com/DJRHails/odic"
+"Bug Tracker" = "https://github.com/DJRHails/odic/issues"
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+readme = {file = ["README.md"], content-type = "text/markdown"}
+
+[tool.setuptools.packages]
+find = {}
+
+[tool.bumpver]
+current_version = "0.1.0"
+version_pattern = "MAJOR.MINOR.PATCH"
+commit_message = "bump version {old_version} -> {new_version}"
+commit = true
+tag = true
+push = true
+
+[tool.bumpver.file_patterns]
+"pyproject.toml" = [
+    'current_version = "{version}"',
+    'version = "{version}"',
+]
+"odic/__init__.py" = [
+    '__version__ = "{version}"',
+]
+"README.md" = [
+    "{version}",
+]
