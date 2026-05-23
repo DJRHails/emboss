@@ -1,4 +1,4 @@
-"""odic — On-Disk Input-keyed Cache.
+"""emboss — On-Disk Input-keyed Cache.
 
 Disk-backed memoization built on `diskcache`, with auto-detection of
 pydantic v2 `BaseModel` return types (encoded via `model_dump`, decoded
@@ -8,7 +8,7 @@ script invocations.
 Usage::
 
     import diskcache
-    from odic import cached
+    from emboss import cached
 
     cache = diskcache.Cache("/tmp/my-cache")
 
@@ -29,7 +29,7 @@ Usage::
 See README.md for the full feature list.
 """
 
-from odic._cached import cached, safe_jsonable_encoder
+from emboss._cached import cached, safe_jsonable_encoder
 
 __version__ = "0.1.0"
 __all__ = ["cached", "safe_jsonable_encoder"]

@@ -1,4 +1,4 @@
-"""Internal: `@cached` decorator implementation. Public API lives in `odic.__init__`."""
+"""Internal: `@cached` decorator implementation. Public API lives in `emboss.__init__`."""
 
 from __future__ import annotations
 

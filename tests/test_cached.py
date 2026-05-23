@@ -1,4 +1,4 @@
-"""End-to-end round-trip tests for odic.cached."""
+"""End-to-end round-trip tests for emboss.cached."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import diskcache
 import pytest
 from pydantic import BaseModel
 
-from odic import cached
+from emboss import cached
 
 
 class M(BaseModel):
@@ -93,7 +93,7 @@ def test_optional_basemodel_none_caches(cache):
 
 
 def test_none_return_caches(cache):
-    """Pre-odic behaviour skipped caching None; we want None cached too."""
+    """Pre-emboss behaviour skipped caching None; we want None cached too."""
     calls = {"n": 0}
 
     @cached(cache)

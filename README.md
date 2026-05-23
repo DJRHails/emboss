@@ -1,17 +1,17 @@
-# odic
+# emboss
 
 **O**n-**D**isk **I**nput-keyed **C**ache — disk-backed memoization with pydantic-aware encoding.
 
 Version: 0.1.0
 
 ```bash
-pip install odic              # core (just diskcache)
-pip install odic[pydantic]    # + pydantic v2 BaseModel support
+pip install emboss              # core (just diskcache)
+pip install emboss[pydantic]    # + pydantic v2 BaseModel support
 ```
 
 ## Why
 
-`functools.lru_cache` is per-process. `diskcache` survives invocations but pickles values as-is — which breaks the moment your cached return type is a pydantic `BaseModel` defined in `__main__` (the new process can't unpickle `__main__.MyModel`). `odic` fixes that by detecting BaseModel return annotations and converting to/from plain dicts at the cache boundary.
+`functools.lru_cache` is per-process. `diskcache` survives invocations but pickles values as-is — which breaks the moment your cached return type is a pydantic `BaseModel` defined in `__main__` (the new process can't unpickle `__main__.MyModel`). `emboss` fixes that by detecting BaseModel return annotations and converting to/from plain dicts at the cache boundary.
 
 Plus: a `None`-aware sentinel so functions returning `None` actually cache instead of re-running every call.
 
@@ -19,7 +19,7 @@ Plus: a `None`-aware sentinel so functions returning `None` actually cache inste
 
 ```python
 import diskcache
-from odic import cached
+from emboss import cached
 
 cache = diskcache.Cache("/tmp/my-cache")
 
@@ -34,7 +34,7 @@ fetch("https://api.example.com/users/1")  # cached, no network
 
 ## Pydantic BaseModel returns
 
-`odic` reads the function's return type annotation. If it sees a `BaseModel`, `list[BaseModel]`, `dict[str, BaseModel]`, or `BaseModel | None`, it serialises via `model.model_dump()` before pickling and rehydrates via `Model.model_validate(...)` on read. The cached value on disk is a plain dict — round-trips cleanly across process boundaries, even for models defined in `__main__`.
+`emboss` reads the function's return type annotation. If it sees a `BaseModel`, `list[BaseModel]`, `dict[str, BaseModel]`, or `BaseModel | None`, it serialises via `model.model_dump()` before pickling and rehydrates via `Model.model_validate(...)` on read. The cached value on disk is a plain dict — round-trips cleanly across process boundaries, even for models defined in `__main__`.
 
 ```python
 from pydantic import BaseModel

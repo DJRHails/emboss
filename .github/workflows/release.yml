@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/odic
+      url: https://pypi.org/p/emboss
     permissions:
       # Required for OIDC trusted publishing.
       id-token: write
@@ -49,4 +49,4 @@ jobs:
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         # No `with:` block needed — OIDC handles auth, project is
-        # `odic` (matches pyproject.toml `name`).
+        # `emboss` (matches pyproject.toml `name`).
