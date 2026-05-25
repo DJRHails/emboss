@@ -2,7 +2,7 @@
 
 **O**n-**D**isk **I**nput-keyed **C**ache — disk-backed memoization with pydantic-aware encoding.
 
-Version: 0.1.0
+Version: 0.2.0
 
 ```bash
 pip install emboss              # core (just diskcache)
