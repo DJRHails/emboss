@@ -30,6 +30,8 @@ See README.md for the full feature list.
 """
 
 from emboss._cached import cached, safe_jsonable_encoder
+from emboss._file_cache import FileCache
+from emboss._protocol import Cache
 
 __version__ = "0.1.0"
-__all__ = ["cached", "safe_jsonable_encoder"]
+__all__ = ["Cache", "FileCache", "cached", "safe_jsonable_encoder"]
