@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import functools
 import hashlib
 import inspect
 import json
 import logging
+import textwrap
 import types
 import typing
 from collections.abc import Callable
@@ -145,6 +147,26 @@ def _decode(value: Any, model_cls: type | None, container: str) -> Any:
     return value
 
 
+def _canonical_source(raw_source: str) -> str:
+    """Normalize function source so cosmetic edits don't change the cache key.
+
+    Round-trips through the AST (`ast.unparse(ast.parse(...))`), which discards
+    formatting that never affects behaviour — indentation, line breaks, spacing,
+    trailing commas, comments, quote style — while preserving everything that
+    does, including string-literal *contents* (so two functions whose only
+    difference is the spaces inside a string still get distinct keys).
+
+    Falls back to the raw source when it can't be parsed (e.g. the source is
+    unavailable, or a decorator references names not importable at parse time),
+    so keying degrades to the pre-0.3 whitespace-sensitive behaviour rather
+    than crashing.
+    """
+    try:
+        return ast.unparse(ast.parse(textwrap.dedent(raw_source)))
+    except (SyntaxError, ValueError, TypeError, RecursionError):
+        return raw_source
+
+
 def cached(
     cache: Cache | None = None,
     *,
@@ -170,16 +192,21 @@ def cached(
         cache = diskcache.Cache()
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        func_source = inspect.getsource(func)
-        func_hash = hashlib.md5(func_source.encode()).hexdigest()
+        raw_source = inspect.getsource(func)
+        # Primary key uses the AST-canonical source (whitespace/comment-agnostic);
+        # the legacy key uses the raw source — the pre-0.3 scheme — so existing
+        # entries keep matching and get migrated forward on first read.
+        raw_hash = hashlib.md5(raw_source.encode()).hexdigest()
+        canon_hash = hashlib.md5(_canonical_source(raw_source).encode()).hexdigest()
         try:
             return_anno = inspect.signature(func).return_annotation
         except (TypeError, ValueError):
             return_anno = inspect.Parameter.empty
         model_cls, container = _model_info(return_anno)
+        is_async = asyncio.iscoroutinefunction(func)
 
-        @functools.wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> T:
+        def _keys(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[str, str]:
+            """`(canonical key, legacy raw-source key)` for one call's arguments."""
             json_args = [safe_jsonable_encoder(arg, default=default) for arg in args]
             json_kwargs = {
                 k: safe_jsonable_encoder(v, default=default) for k, v in kwargs.items()
@@ -187,14 +214,34 @@ def cached(
             arg_hash = hashlib.md5(
                 f"{json.dumps(json_args)}{json.dumps(json_kwargs)}".encode()
             ).hexdigest()
-            key: str = hashlib.md5(
-                f"{func.__name__}{func_hash}{arg_hash}".encode()
-            ).hexdigest()
+            key = hashlib.md5(f"{func.__name__}{canon_hash}{arg_hash}".encode()).hexdigest()
+            legacy = hashlib.md5(f"{func.__name__}{raw_hash}{arg_hash}".encode()).hexdigest()
+            return key, legacy
 
+        def _lookup(key: str, legacy_key: str) -> Any:
+            """Read the canonical key; on miss, fall back to the legacy raw-source
+            key and migrate the value forward so later reads hit directly."""
             raw = cache.get(key, default=_MISSING)
+            if raw is _MISSING and legacy_key != key:
+                raw = cache.get(legacy_key, default=_MISSING)
+                if raw is not _MISSING:
+                    cache.set(key, raw)
+            return raw
+
+        def _store(key: str, legacy_key: str, encoded: Any) -> None:
+            """Write back under both the canonical and raw-source keys, so callers
+            on either keying scheme find the entry."""
+            cache.set(key, encoded)
+            if legacy_key != key:
+                cache.set(legacy_key, encoded)
+
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> T:
+            key, legacy_key = _keys(args, kwargs)
+            raw = _lookup(key, legacy_key)
             if raw is not _MISSING:
                 decoded = _decode(raw, model_cls, container)
-                if asyncio.iscoroutinefunction(func):
+                if is_async:
 
                     async def return_cached():
                         return decoded
@@ -202,17 +249,17 @@ def cached(
                     return return_cached()  # type: ignore[return-value]
                 return decoded  # type: ignore[return-value]
 
-            if asyncio.iscoroutinefunction(func):
+            if is_async:
 
                 async def execute():
                     result = await func(*args, **kwargs)  # type: ignore[misc]
-                    cache.set(key, _encode(result, model_cls, container))
+                    _store(key, legacy_key, _encode(result, model_cls, container))
                     return result
 
                 return execute()  # type: ignore[return-value]
 
             result = func(*args, **kwargs)
-            cache.set(key, _encode(result, model_cls, container))
+            _store(key, legacy_key, _encode(result, model_cls, container))
             return result
 
         return wrapper
