@@ -2,7 +2,7 @@
 
 **O**n-**D**isk **I**nput-keyed **C**ache — disk-backed memoization with pydantic-aware encoding.
 
-Version: 0.1.0
+Version: 0.2.0
 
 ```bash
 pip install emboss              # core (just diskcache)
@@ -84,6 +84,58 @@ The previous behaviour (skip-cache-on-None) is replaced by a `_MISSING` sentinel
 ## Cache key
 
 Arguments are converted via `safe_jsonable_encoder` (recursive JSON-friendly conversion handling sets, bytes, dates, `Path`, BaseModel, and objects with `__dict__`), then hashed with the function source + name. Re-decorating the same function body → same key; changing the function body → new key (transparent cache invalidation on code change).
+
+### Custom or strict encoder (`default=`)
+
+`safe_jsonable_encoder` mirrors `json.dumps(default=)`: pass a callable that handles types no built-in handler matched, or `None` for strict mode that raises on unknown types.
+
+```python
+# strict mode — raise on anything we can't serialise
+@cached(cache, default=None)
+def f(x: dict) -> str:
+    ...
+
+# custom fallback — e.g. include a deterministic hash for opaque objects
+def my_default(obj):
+    return obj.cache_key() if hasattr(obj, "cache_key") else hashlib.md5(repr(obj).encode()).hexdigest()
+
+@cached(cache, default=my_default)
+def g(complicated_input) -> dict:
+    ...
+```
+
+The package default is `default=str`, which preserves the loose 0.1 behaviour of falling back to `str(obj)`. Use strict mode when your inputs include objects without `__dict__` whose `str(obj)` includes a memory address — those addresses change every process invocation and would silently bust the cache key.
+
+## Pluggable backends (`Cache` protocol)
+
+`cached` accepts any object satisfying the runtime-checkable `Cache` protocol:
+
+```python
+from typing import Any, Protocol, runtime_checkable
+
+@runtime_checkable
+class Cache(Protocol):
+    def get(self, key: str, default: Any = None) -> Any: ...
+    def set(self, key: str, value: Any) -> Any: ...
+```
+
+Structural typing — no inheritance required. `diskcache.Cache`, `emboss.FileCache`, and any custom Redis / in-memory adapter you write all work out of the box.
+
+## `FileCache` backend — NFS-safe alternative to diskcache
+
+```python
+from emboss import FileCache, cached
+
+cache = FileCache(".data/cache")
+
+@cached(cache)
+def expensive(x: int) -> dict:
+    ...
+```
+
+`diskcache` stores entries in SQLite, and SQLite over NFS has broken file-locking — two cluster nodes hitting the same `.data/cache` mount on VAST get `sqlite3.OperationalError: locking protocol`. `FileCache` writes one file per key via `tempfile + os.replace` (atomic rename, NFS-safe), with `(key, value)` pickled. Concurrent writers race on the same file path but POSIX rename is atomic and the winning version is by construction equally correct (cache values are pure functions of the key).
+
+Drop-in for the subset of `diskcache.Cache` API `@cached` uses (`get`, `set`, `__contains__`, `__getitem__`, `__setitem__`, `__delitem__`, `delete`, `clear`, `close`, context-manager). Extra diskcache kwargs (`timeout`, `size_limit`, `eviction_policy`) are accepted and ignored so call sites switch with no code changes.
 
 ## Async support
 

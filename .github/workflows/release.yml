@@ -1,29 +1,58 @@
 name: Release to PyPI
 
-# Triggered on push of a version tag (e.g. v0.1.0). Builds the wheel + sdist
-# from the tagged commit and publishes to PyPI via Trusted Publishing (OIDC) —
-# no PyPI token needed; the runner mints a short-lived OIDC token that PyPI
-# exchanges via the pre-registered publisher configured in PyPI's UI.
+# Auto-publishes to PyPI whenever a commit on main bumps the package version.
+# Publishing uses Trusted Publishing (OIDC) — no PyPI token; the runner mints a
+# short-lived OIDC token that PyPI exchanges via the pre-registered publisher.
+# The version-change guard is essential: PyPI rejects duplicate versions, so the
+# publish job only runs when `v<version>` is not already tagged. On publish it
+# cuts the `v<version>` tag + a GitHub release so the next unchanged push skips.
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches: [main]
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
 jobs:
+  check:
+    name: Detect version bump
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - name: Checkout (no creds)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Read version and check for an existing tag
+        id: v
+        run: |
+          version=$(grep -m1 '^version = ' pyproject.toml | sed -E 's/^version = "(.*)"/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "v$version already released — skipping publish"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$version is new — will publish"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build-and-publish:
     name: Build + publish to PyPI
+    needs: check
+    if: needs.check.outputs.publish == 'true'
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/emboss
     permissions:
-      # Required for OIDC trusted publishing.
-      id-token: write
+      id-token: write # OIDC trusted publishing
+      contents: write # create the release tag
 
     steps:
       - name: Checkout (no creds)
@@ -48,5 +77,15 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        # No `with:` block needed — OIDC handles auth, project is
-        # `emboss` (matches pyproject.toml `name`).
+        # No `with:` block — OIDC handles auth; project `emboss` matches pyproject.
+
+      - name: Tag the release and cut a GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          gh release create "v$VERSION" \
+            --title "v$VERSION" \
+            --target "$TARGET_SHA" \
+            --generate-notes

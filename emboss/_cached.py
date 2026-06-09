@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import functools
 import hashlib
@@ -16,6 +17,8 @@ from typing import Any, TypeVar, Union
 
 import diskcache
 
+from emboss._protocol import Cache
+
 try:
     from pydantic import BaseModel
 except ImportError:  # pragma: no cover — pydantic is optional for callers
@@ -28,16 +31,27 @@ logger = logging.getLogger(__name__)
 _MISSING = object()
 
 
-def safe_jsonable_encoder(obj: Any) -> Any:
-    """Convert objects to JSON-serializable forms for cache keys."""
+def safe_jsonable_encoder(
+    obj: Any,
+    *,
+    default: Callable[[Any], Any] | None = str,
+) -> Any:
+    """Convert objects to JSON-serializable forms for cache keys.
+
+    `default` mirrors `json.dumps(default=)`: called on values no built-in
+    handler matches. `default=None` raises `TypeError` on unknown types
+    (strict mode — useful when objects without `__dict__` might leak
+    process-specific addresses into keys); `default=str` (the package
+    default) preserves the pre-0.2 loose fallback.
+    """
     if obj is None or isinstance(obj, (bool, int, float, str)):
         return obj
     if isinstance(obj, (list, tuple)):
-        return [safe_jsonable_encoder(item) for item in obj]
+        return [safe_jsonable_encoder(item, default=default) for item in obj]
     if isinstance(obj, dict):
-        return {str(k): safe_jsonable_encoder(v) for k, v in obj.items()}
+        return {str(k): safe_jsonable_encoder(v, default=default) for k, v in obj.items()}
     if isinstance(obj, set):
-        return sorted([safe_jsonable_encoder(item) for item in obj])
+        return sorted([safe_jsonable_encoder(item, default=default) for item in obj])
     if isinstance(obj, bytes):
         return obj.decode("utf-8", errors="ignore")
     try:
@@ -64,8 +78,14 @@ def safe_jsonable_encoder(obj: Any) -> Any:
     if BaseModel is not None and isinstance(obj, BaseModel):
         return obj.model_dump()
     if hasattr(obj, "__dict__"):
-        return safe_jsonable_encoder(obj.__dict__)
-    return str(obj)
+        return safe_jsonable_encoder(obj.__dict__, default=default)
+    if default is None:
+        raise TypeError(
+            f"safe_jsonable_encoder cannot encode {type(obj).__name__!r} for a cache key. "
+            "Either convert to a primitive/dict in the caller, or pass `default=` "
+            "(e.g. `default=str` for the loose fallback) when constructing the cache."
+        )
+    return default(obj)
 
 
 def _is_basemodel_class(cls: Any) -> bool:
@@ -127,10 +147,43 @@ def _decode(value: Any, model_cls: type | None, container: str) -> Any:
     return value
 
 
+def _canonical_source(raw_source: str) -> str:
+    """Normalize function source so cosmetic edits don't change the cache key.
+
+    Round-trips through the AST (`ast.unparse(ast.parse(...))`), which discards
+    formatting that never affects behaviour — indentation, line breaks, spacing,
+    trailing commas, comments, quote style — while preserving everything that
+    does, including string-literal *contents* (so two functions whose only
+    difference is the spaces inside a string still get distinct keys).
+
+    Falls back to the raw source when it can't be parsed (e.g. the source is
+    unavailable, or a decorator references names not importable at parse time),
+    so keying degrades to the pre-0.3 whitespace-sensitive behaviour rather
+    than crashing.
+    """
+    try:
+        return ast.unparse(ast.parse(
+          .dedent(raw_source)))
+    except (SyntaxError, ValueError, TypeError, RecursionError):
+        return raw_source
+
+
 def cached(
-    cache: diskcache.Cache | None = None,
+    cache: Cache | None = None,
+    *,
+    default: Callable[[Any], Any] | None = str,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Disk-backed memoization decorator.
+
+    `cache` accepts any object satisfying the `Cache` protocol
+    (`.get(key, default=...)` / `.set(key, value)`) — `diskcache.Cache`,
+    `emboss.FileCache`, or your own backend. Defaults to a fresh in-memory
+    `diskcache.Cache()`.
+
+    `default` is threaded into `safe_jsonable_encoder` for cache-key
+    construction (see that function for semantics). The package default
+    `str` preserves the loose 0.1 behaviour; pass `default=None` for strict
+    mode that raises on unknown argument types.
 
     Detects `BaseModel` / `list[Model]` / `dict[str, Model]` return annotations
     and stores them as dicts (rehydrated on read) so model classes defined in
@@ -145,29 +198,56 @@ def cached(
         cache = diskcache.Cache(os.environ.get("EMBOSS_CACHE_DIR"))
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        func_source = inspect.getsource(func)
-        func_hash = hashlib.md5(func_source.encode()).hexdigest()
+        raw_source = inspect.getsource(func)
+        # Primary key uses the AST-canonical source (whitespace/comment-agnostic);
+        # the legacy key uses the raw source — the pre-0.3 scheme — so existing
+        # entries keep matching and get migrated forward on first read.
+        raw_hash = hashlib.md5(raw_source.encode()).hexdigest()
+        canon_hash = hashlib.md5(_canonical_source(raw_source).encode()).hexdigest()
         try:
             return_anno = inspect.signature(func).return_annotation
         except (TypeError, ValueError):
             return_anno = inspect.Parameter.empty
         model_cls, container = _model_info(return_anno)
+        is_async = asyncio.iscoroutinefunction(func)
 
-        @functools.wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> T:
-            json_args = [safe_jsonable_encoder(arg) for arg in args]
-            json_kwargs = {k: safe_jsonable_encoder(v) for k, v in kwargs.items()}
+        def _keys(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[str, str]:
+            """`(canonical key, legacy raw-source key)` for one call's arguments."""
+            json_args = [safe_jsonable_encoder(arg, default=default) for arg in args]
+            json_kwargs = {
+                k: safe_jsonable_encoder(v, default=default) for k, v in kwargs.items()
+            }
             arg_hash = hashlib.md5(
                 f"{json.dumps(json_args)}{json.dumps(json_kwargs)}".encode()
             ).hexdigest()
-            key: str = hashlib.md5(
-                f"{func.__name__}{func_hash}{arg_hash}".encode()
-            ).hexdigest()
+            key = hashlib.md5(f"{func.__name__}{canon_hash}{arg_hash}".encode()).hexdigest()
+            legacy = hashlib.md5(f"{func.__name__}{raw_hash}{arg_hash}".encode()).hexdigest()
+            return key, legacy
 
+        def _lookup(key: str, legacy_key: str) -> Any:
+            """Read the canonical key; on miss, fall back to the legacy raw-source
+            key and migrate the value forward so later reads hit directly."""
             raw = cache.get(key, default=_MISSING)
+            if raw is _MISSING and legacy_key != key:
+                raw = cache.get(legacy_key, default=_MISSING)
+                if raw is not _MISSING:
+                    cache.set(key, raw)
+            return raw
+
+        def _store(key: str, legacy_key: str, encoded: Any) -> None:
+            """Write back under both the canonical and raw-source keys, so callers
+            on either keying scheme find the entry."""
+            cache.set(key, encoded)
+            if legacy_key != key:
+                cache.set(legacy_key, encoded)
+
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> T:
+            key, legacy_key = _keys(args, kwargs)
+            raw = _lookup(key, legacy_key)
             if raw is not _MISSING:
                 decoded = _decode(raw, model_cls, container)
-                if asyncio.iscoroutinefunction(func):
+                if is_async:
 
                     async def return_cached():
                         return decoded
@@ -175,17 +255,17 @@ def cached(
                     return return_cached()  # type: ignore[return-value]
                 return decoded  # type: ignore[return-value]
 
-            if asyncio.iscoroutinefunction(func):
+            if is_async:
 
                 async def execute():
                     result = await func(*args, **kwargs)  # type: ignore[misc]
-                    cache.set(key, _encode(result, model_cls, container))
+                    _store(key, legacy_key, _encode(result, model_cls, container))
                     return result
 
                 return execute()  # type: ignore[return-value]
 
             result = func(*args, **kwargs)
-            cache.set(key, _encode(result, model_cls, container))
+            _store(key, legacy_key, _encode(result, model_cls, container))
             return result
 
         return wrapper
