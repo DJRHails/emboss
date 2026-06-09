@@ -92,6 +92,23 @@ def test_optional_basemodel_none_caches(cache):
     assert calls["n"] == 2
 
 
+def test_env_var_sets_default_cache_dir(tmp_path, monkeypatch):
+    """With no explicit cache, EMBOSS_CACHE_DIR controls where the cache lands."""
+    cache_dir = tmp_path / "env-cache"
+    monkeypatch.setenv("EMBOSS_CACHE_DIR", str(cache_dir))
+    calls = {"n": 0}
+
+    @cached()
+    def f(x: int) -> dict:
+        calls["n"] += 1
+        return {"value": x + 1}
+
+    assert f(1) == {"value": 2}
+    assert f(1) == {"value": 2}
+    assert calls["n"] == 1, "second call should hit the cache"
+    assert (cache_dir / "cache.db").exists(), "cache should live at EMBOSS_CACHE_DIR"
+
+
 def test_none_return_caches(cache):
     """Pre-emboss behaviour skipped caching None; we want None cached too."""
     calls = {"n": 0}

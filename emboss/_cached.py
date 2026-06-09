@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import json
 import logging
+import os
 import types
 import typing
 from collections.abc import Callable
@@ -134,9 +135,14 @@ def cached(
     Detects `BaseModel` / `list[Model]` / `dict[str, Model]` return annotations
     and stores them as dicts (rehydrated on read) so model classes defined in
     `__main__` round-trip across script invocations.
+
+    When no `cache` is passed, the default cache directory is read from the
+    `EMBOSS_CACHE_DIR` environment variable at cache-creation time; if unset,
+    `diskcache` falls back to a temporary directory as before. The cache
+    location never affects keying (keys are function source + arguments).
     """
     if cache is None:
-        cache = diskcache.Cache()
+        cache = diskcache.Cache(os.environ.get("EMBOSS_CACHE_DIR"))
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         func_source = inspect.getsource(func)

@@ -32,6 +32,16 @@ fetch("https://api.example.com/users/1")  # network
 fetch("https://api.example.com/users/1")  # cached, no network
 ```
 
+## Default cache directory
+
+Passing a `diskcache.Cache` is optional. With `@cached()` (no cache argument), emboss creates one at the directory named by the `EMBOSS_CACHE_DIR` environment variable; if unset, `diskcache` falls back to a temporary directory.
+
+```bash
+EMBOSS_CACHE_DIR=.data/cache python my_script.py
+```
+
+The cache location never affects keying — keys are function source + arguments either way.
+
 ## Pydantic BaseModel returns
 
 `emboss` reads the function's return type annotation. If it sees a `BaseModel`, `list[BaseModel]`, `dict[str, BaseModel]`, or `BaseModel | None`, it serialises via `model.model_dump()` before pickling and rehydrates via `Model.model_validate(...)` on read. The cached value on disk is a plain dict — round-trips cleanly across process boundaries, even for models defined in `__main__`.
