@@ -11,6 +11,9 @@ dynamic = ["dependencies", "readme"]
 [project.optional-dependencies]
 pydantic = ["pydantic>=2"]
 
+[project.scripts]
+emboss = "emboss._cli:main"
+
 [project.urls]
 "Homepage" = "https://github.com/DJRHails/emboss"
 "Bug Tracker" = "https://github.com/DJRHails/emboss/issues"

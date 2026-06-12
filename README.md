@@ -106,6 +106,56 @@ def g(complicated_input) -> dict:
 
 The package default is `default=str`, which preserves the loose 0.1 behaviour of falling back to `str(obj)`. Use strict mode when your inputs include objects without `__dict__` whose `str(obj)` includes a memory address — those addresses change every process invocation and would silently bust the cache key.
 
+## Cache identity & migration
+
+Every `@cached` function has a stable identity — `"name:body_hash"` — which combines with the per-call argument hash to form the cache key. `cache_id()` returns it, and `func.__emboss__` carries the full metadata:
+
+```python
+from emboss import cache_id
+
+@cached(cache)
+def fetch_user(uid: int) -> dict:
+    ...
+
+cache_id(fetch_user)   # "fetch_user:3f2a9c..." (32-hex hash of the AST-canonical source)
+```
+
+The `emboss id` CLI prints the same token without writing a script — handy for capturing an identity before (or after) an edit:
+
+```bash
+emboss id mypkg.users:fetch_user            # dotted module path
+emboss id src/mypkg/users.py:fetch_user     # file path
+emboss id --rev HEAD~1 src/mypkg/users.py:fetch_user   # identity as of a git revision
+```
+
+`--rev` reads the file out of git (`git show`), so you can recover the pre-edit identity even if you forgot to capture it first. It imports the module to do this, so it's best-effort: if the module's imports fail, it reports the error and exits 1.
+
+### `also_accept` — keep warm entries through a rename or refactor
+
+Renaming a function or editing its body changes its identity, so existing entries stop matching. When the *behaviour* is unchanged, pass the old identity and emboss falls back to the old keys on a miss — copying each hit forward to the new key (write-through), so the fallback can be dropped once the cache has migrated:
+
+```python
+old_id = cache_id(fetch_user)   # capture before the rename, e.g. "fetch_user:3f2a9c..."
+
+@cached(cache, also_accept=["fetch_user:3f2a9c..."])
+def get_user(uid: int) -> dict:
+    ...  # same behaviour, new name — old entries are reused, not recomputed
+```
+
+Different arguments still miss as usual — migration only redirects keys, never serves a value computed for other inputs. Malformed tokens (anything not `"name:body_hash"`) raise `ValueError` at decoration time.
+
+### `unsafe_manual_key` — opt out of source-based invalidation
+
+`unsafe_manual_key` pins the identity to a fixed string instead of the source hash:
+
+```python
+@cached(cache, unsafe_manual_key="v1")
+def summarise(text: str) -> str:
+    ...  # edit freely — entries keyed on "summarise:v1" keep matching
+```
+
+**Warning: this disables emboss's invalidate-on-edit safety net.** Editing the body no longer invalidates the cache, so stale results are served until *you* bump the key (`"v1"` → `"v2"`). Use it only when you accept that responsibility — e.g. a hot cache you must not re-bill for cosmetic-but-not-quite-canonical churn. `also_accept` works alongside it, e.g. to migrate source-keyed entries into a manual-key identity.
+
 ## Pluggable backends (`Cache` protocol)
 
 `cached` accepts any object satisfying the runtime-checkable `Cache` protocol:
