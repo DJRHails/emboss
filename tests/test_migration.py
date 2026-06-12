@@ -9,8 +9,13 @@ import re
 
 import diskcache
 import pytest
+from pydantic import BaseModel
 
 from emboss import cache_id, cached
+
+
+class Payload(BaseModel):
+    v: int
 
 
 @pytest.fixture
@@ -100,7 +105,15 @@ def test_also_accept_different_args_still_miss(cache):
 
 
 def test_also_accept_rejects_malformed_tokens(cache):
-    for bad in ["no-colon-here", "name:", ":hash"]:
+    bad_tokens = [
+        "no-colon-here",
+        "name:",
+        ":hash",
+        "fetch: 3f2a9c",  # stray space after the colon — the classic copy-paste artifact
+        "fetch :3f2a9c",
+        "fe tch:3f2a9c",
+    ]
+    for bad in bad_tokens:
         with pytest.raises(ValueError, match=re.escape(repr(bad))):
 
             @cached(cache, also_accept=[bad])
@@ -151,6 +164,89 @@ def test_unsafe_manual_key_survives_body_edit(cache):
 def test_unsafe_manual_key_rejects_empty_string(cache):
     with pytest.raises(ValueError, match="non-empty"):
         cached(cache, unsafe_manual_key="")
+
+
+def test_unsafe_manual_key_rejects_whitespace(cache):
+    with pytest.raises(ValueError, match="whitespace"):
+        cached(cache, unsafe_manual_key="v 1")
+
+
+def test_manual_keys_do_not_collide_across_functions(cache):
+    """Adjacent name/key boundaries must not alias (the undelimited-preimage bug)."""
+
+    @cached(cache, unsafe_manual_key="bX")
+    def ab(x: int) -> int:
+        return 1
+
+    @cached(cache, unsafe_manual_key="X")
+    def abb(x: int) -> int:
+        return 2
+
+    assert ab(5) == 1
+    assert abb(5) == 2  # was 1 (ab's entry) when the preimage had no delimiter
+
+
+def test_also_accept_migrates_from_manual_key_identity(cache):
+    calls = {"n": 0}
+
+    @cached(cache, unsafe_manual_key="v1")
+    def f(x: int) -> int:
+        calls["n"] += 1
+        return x * 11
+
+    assert f(2) == 22
+    old = cache_id(f)  # "f:v1"
+
+    @cached(cache, also_accept=[old])
+    def g(x: int) -> int:
+        calls["n"] += 1
+        return x * 11
+
+    assert g(2) == 22  # migrated out of the manual-key identity
+    assert calls["n"] == 1
+
+
+def test_also_accept_first_listed_identity_wins(cache):
+    @cached(cache)
+    def one(x: int) -> int:
+        return 1
+
+    @cached(cache)
+    def two(x: int) -> int:
+        return 2
+
+    assert one(0) == 1
+    assert two(0) == 2
+
+    @cached(cache, also_accept=[cache_id(one), cache_id(two)])
+    def merged(x: int) -> int:
+        return 3
+
+    assert merged(0) == 1  # fallbacks are tried in list order; first hit wins
+
+
+def test_also_accept_write_through_stores_encoded_form(cache):
+    """Promotion must copy the ENCODED entry (a plain dict), not a model instance —
+    otherwise models defined in `__main__` stop round-tripping across processes."""
+    calls = {"n": 0}
+
+    @cached(cache)
+    def make(x: int) -> Payload:
+        calls["n"] += 1
+        return Payload(v=x)
+
+    assert make(1) == Payload(v=1)
+    old = cache_id(make)
+
+    @cached(cache, also_accept=[old])
+    def build(x: int) -> Payload:
+        calls["n"] += 1
+        return Payload(v=x)
+
+    assert build(1) == Payload(v=1)  # migrated, not recomputed
+    assert calls["n"] == 1
+    promoted = cache.get(_key_for(cache_id(build), [1]))
+    assert type(promoted) is dict and promoted == {"v": 1}
 
 
 def test_also_accept_works_with_unsafe_manual_key(cache):

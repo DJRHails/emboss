@@ -13,7 +13,7 @@ import os
 import textwrap
 import types
 import typing
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar, Union
 
@@ -158,14 +158,20 @@ def _canonical_source(raw_source: str) -> str:
     does, including string-literal *contents* (so two functions whose only
     difference is the spaces inside a string still get distinct keys).
 
-    Falls back to the raw source when it can't be parsed (e.g. the source is
-    unavailable, or a decorator references names not importable at parse time),
-    so keying degrades to the pre-0.3 whitespace-sensitive behaviour rather
-    than crashing.
+    Falls back to the raw source when it can't be parsed as a standalone
+    block even after `textwrap.dedent` (e.g. a lambda extracted from the
+    middle of an expression), so keying degrades to the pre-0.3
+    whitespace-sensitive behaviour rather than crashing. The fallback is
+    logged at WARNING level because cosmetic edits then re-key the function.
     """
     try:
         return ast.unparse(ast.parse(textwrap.dedent(raw_source)))
     except (SyntaxError, ValueError, TypeError, RecursionError):
+        logger.warning(
+            "emboss: could not parse function source for canonical keying; "
+            "falling back to raw source (cosmetic edits will re-key). Source begins: %r",
+            raw_source[:80],
+        )
         return raw_source
 
 
@@ -174,16 +180,19 @@ class EmbossInfo:
     """Cache-identity metadata attached to every `@cached` wrapper as `__emboss__`.
 
     `cache_id` is `f"{name}:{body_hash}"` — the function's identity in the
-    keying scheme (`key = md5(name + body_hash + arg_hash)`), where `body_hash`
-    is the md5 of the AST-canonical source, or the `unsafe_manual_key` when one
-    was pinned. `also_accept` echoes the raw fallback identities passed at
-    decoration time.
+    keying scheme (see `_derive_key`), where `body_hash` is the md5 of the
+    AST-canonical source, or the `unsafe_manual_key` when one was pinned.
+    `also_accept` echoes the raw fallback identities passed at decoration time.
     """
 
     name: str
     body_hash: str
-    cache_id: str
     also_accept: tuple[str, ...]
+
+    @property
+    def cache_id(self) -> str:
+        """`f"{name}:{body_hash}"` — the token `also_accept` consumes."""
+        return f"{self.name}:{self.body_hash}"
 
 
 def cache_id(func: Callable[..., Any]) -> str:
@@ -211,32 +220,52 @@ def _parse_accept_token(token: str) -> tuple[str, str]:
     """Split an `also_accept` token into `(name, body_hash)`.
 
     Tokens are prior cache identities as returned by `cache_id` —
-    `"name:body_hash"`. Malformed tokens fail at decoration time so a typo
-    can't silently disable migration.
+    `"name:body_hash"`. Malformed tokens — wrong shape, or any whitespace
+    (the classic copy-paste artifact, which would otherwise silently never
+    match a key) — fail at decoration time instead of silently disabling
+    migration.
     """
     name, sep, body_hash = token.partition(":")
-    if not sep or not name or not body_hash:
+    if not sep or not name or not body_hash or any(ch.isspace() for ch in token):
         raise ValueError(
             f"also_accept token {token!r} is not a cache identity of the form "
-            "'name:body_hash' — pass the string returned by emboss.cache_id() for "
-            "the old function (e.g. 'fetch_user:0123abcd...')."
+            "'name:body_hash' (no whitespace) — pass the string returned by "
+            "emboss.cache_id() for the old function (e.g. 'fetch_user:0123abcd...')."
         )
     return name, body_hash
+
+
+def _derive_key(name: str, body_hash: str, arg_hash: str, *, manual: bool) -> str:
+    """Derive the on-disk cache key for one identity + argument hash.
+
+    Source-hashed identities keep the historical undelimited preimage
+    (`name + body_hash + arg_hash`) so on-disk caches written by earlier
+    releases stay valid; `body_hash` is then a fixed-width 32-hex md5, which
+    makes the name/body boundary unambiguous. Manual identities
+    (`unsafe_manual_key`) carry arbitrary-length hashes, so they get an
+    explicit `":"` delimiter after the name — function names cannot contain a
+    colon and undelimited preimages never do, so manual identities can collide
+    neither with each other nor with source-hashed ones (without the
+    delimiter, `ab` + key `"bX"` and `abb` + key `"X"` share a key).
+    """
+    sep = ":" if manual else ""
+    return hashlib.md5(f"{name}{sep}{body_hash}{arg_hash}".encode()).hexdigest()
 
 
 def cached(
     cache: Cache | None = None,
     *,
     default: Callable[[Any], Any] | None = str,
-    also_accept: list[str] | None = None,
+    also_accept: Sequence[str] | None = None,
     unsafe_manual_key: str | None = None,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Disk-backed memoization decorator.
 
     `cache` accepts any object satisfying the `Cache` protocol
     (`.get(key, default=...)` / `.set(key, value)`) — `diskcache.Cache`,
-    `emboss.FileCache`, or your own backend. Defaults to a fresh in-memory
-    `diskcache.Cache()`.
+    `emboss.FileCache`, or your own backend. Defaults to a `diskcache.Cache`
+    rooted at `$EMBOSS_CACHE_DIR`, or a temporary directory when unset
+    (see below).
 
     `default` is threaded into `safe_jsonable_encoder` for cache-key
     construction (see that function for semantics). The package default
@@ -253,7 +282,9 @@ def cached(
     tokens raise `ValueError` at decoration time.
 
     `unsafe_manual_key` replaces the source-derived body hash with a fixed,
-    caller-managed string. **WARNING — this opts out of emboss's
+    caller-managed string (non-empty, no whitespace — it becomes the
+    `body_hash` half of the cache identity, which `also_accept` tokens must
+    round-trip). **WARNING — this opts out of emboss's
     invalidate-on-edit safety net**: editing the function body no longer
     invalidates its cache, so stale results are served until *you* bump the
     key string (e.g. `"v1"` → `"v2"`) — the caller is responsible for bumping
@@ -271,9 +302,11 @@ def cached(
     """
     if cache is None:
         cache = diskcache.Cache(os.environ.get("EMBOSS_CACHE_DIR"))
-    if unsafe_manual_key is not None and not unsafe_manual_key:
+    if unsafe_manual_key is not None and (
+        not unsafe_manual_key or any(ch.isspace() for ch in unsafe_manual_key)
+    ):
         raise ValueError(
-            "unsafe_manual_key must be a non-empty string (e.g. 'v1') — "
+            "unsafe_manual_key must be a non-empty string without whitespace (e.g. 'v1') — "
             "omit it to key on the function source instead."
         )
     accepted_identities = tuple(_parse_accept_token(token) for token in (also_accept or []))
@@ -290,12 +323,21 @@ def cached(
         info = EmbossInfo(
             name=func.__name__,
             body_hash=body_hash,
-            cache_id=f"{func.__name__}:{body_hash}",
             also_accept=tuple(also_accept or ()),
         )
+        is_manual = unsafe_manual_key is not None
+        # `typing.get_type_hints` (not `inspect.signature`) so PEP 563 modules —
+        # `from __future__ import annotations` stringifies every annotation — still
+        # get model detection. Unresolvable annotations (e.g. forward refs to
+        # TYPE_CHECKING-only imports) degrade to pass-through encoding, as before.
         try:
-            return_anno = inspect.signature(func).return_annotation
-        except (TypeError, ValueError):
+            return_anno = typing.get_type_hints(func).get("return", inspect.Parameter.empty)
+        except Exception:
+            logger.debug(
+                "emboss: could not resolve type hints for %s; "
+                "pydantic model encoding disabled for it.",
+                func.__name__,
+            )
             return_anno = inspect.Parameter.empty
         model_cls, container = _model_info(return_anno)
         is_async = asyncio.iscoroutinefunction(func)
@@ -309,10 +351,14 @@ def cached(
             arg_hash = hashlib.md5(
                 f"{json.dumps(json_args)}{json.dumps(json_kwargs)}".encode()
             ).hexdigest()
-            key = hashlib.md5(f"{func.__name__}{body_hash}{arg_hash}".encode()).hexdigest()
+            key = _derive_key(info.name, info.body_hash, arg_hash, manual=is_manual)
+            # A token's origin — source hash or manual key — is indistinguishable
+            # from its text, so try both derivations; the spurious form is a key
+            # nothing ever writes (one harmless extra `get` on the miss path).
             accept_keys = [
-                hashlib.md5(f"{name}{accepted_hash}{arg_hash}".encode()).hexdigest()
+                _derive_key(name, accepted_hash, arg_hash, manual=manual)
                 for name, accepted_hash in accepted_identities
+                for manual in (False, True)
             ]
             return key, accept_keys
 
@@ -329,6 +375,12 @@ def cached(
                 raw = cache.get(accept_key, default=_MISSING)
                 if raw is not _MISSING:
                     cache.set(key, raw)
+                    logger.debug(
+                        "emboss: migrated cache entry for %s from fallback key %s to %s",
+                        info.name,
+                        accept_key,
+                        key,
+                    )
                     return raw
             return _MISSING
 

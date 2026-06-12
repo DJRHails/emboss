@@ -2,8 +2,6 @@
 
 **O**n-**D**isk **I**nput-keyed **C**ache — disk-backed memoization with pydantic-aware encoding.
 
-Version: 0.2.0
-
 ```bash
 pip install emboss              # core (just diskcache)
 pip install emboss[pydantic]    # + pydantic v2 BaseModel support
@@ -40,7 +38,7 @@ Passing a `diskcache.Cache` is optional. With `@cached()` (no cache argument), e
 EMBOSS_CACHE_DIR=.data/cache python my_script.py
 ```
 
-The cache location never affects keying — keys are function source + arguments either way.
+The cache location never affects keying — keys are function identity + arguments either way (see [Cache identity & migration](#cache-identity--migration)).
 
 ## Pydantic BaseModel returns
 
@@ -83,7 +81,7 @@ The previous behaviour (skip-cache-on-None) is replaced by a `_MISSING` sentinel
 
 ## Cache key
 
-Arguments are converted via `safe_jsonable_encoder` (recursive JSON-friendly conversion handling sets, bytes, dates, `Path`, BaseModel, and objects with `__dict__`), then hashed with the function source + name. Re-decorating the same function body → same key; changing the function body → new key (transparent cache invalidation on code change).
+Arguments are converted via `safe_jsonable_encoder` (recursive JSON-friendly conversion handling sets, bytes, dates, `Path`, BaseModel, and objects with `__dict__`), then hashed with the function's cache identity — its name plus the hash of its AST-canonical source (see [Cache identity & migration](#cache-identity--migration)). Re-decorating the same function body → same key; changing the function body → new key (transparent cache invalidation on code change, unless you opt out with `unsafe_manual_key`).
 
 ### Custom or strict encoder (`default=`)
 
@@ -137,16 +135,18 @@ Renaming a function or editing its body changes its identity, so existing entrie
 ```python
 old_id = cache_id(fetch_user)   # capture before the rename, e.g. "fetch_user:3f2a9c..."
 
-@cached(cache, also_accept=["fetch_user:3f2a9c..."])
+@cached(cache, also_accept=[old_id])   # a literal "fetch_user:3f2a9c..." works too
 def get_user(uid: int) -> dict:
     ...  # same behaviour, new name — old entries are reused, not recomputed
 ```
 
-Different arguments still miss as usual — migration only redirects keys, never serves a value computed for other inputs. Malformed tokens (anything not `"name:body_hash"`) raise `ValueError` at decoration time.
+Different arguments still miss as usual — migration only redirects keys, never serves a value computed for other inputs. Malformed tokens (anything not `"name:body_hash"`, or containing whitespace) raise `ValueError` at decoration time.
+
+Migration via `also_accept` is the *only* fallback: the implicit raw-source fallback that pre-0.3 entries were read through has been removed, so entries that only exist under a pre-0.3 key are reachable solely by declaring their old identity in `also_accept`.
 
 ### `unsafe_manual_key` — opt out of source-based invalidation
 
-`unsafe_manual_key` pins the identity to a fixed string instead of the source hash:
+`unsafe_manual_key` pins the identity to a fixed string (non-empty, no whitespace) instead of the source hash:
 
 ```python
 @cached(cache, unsafe_manual_key="v1")

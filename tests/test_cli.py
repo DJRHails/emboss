@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 import textwrap
 
 from emboss._cli import main
@@ -94,6 +95,10 @@ def test_id_rev_recovers_pre_edit_identity(tmp_path, capsys):
     subprocess.run(["git", "add", "climod_rev.py"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "v1"], cwd=repo, check=True)
 
+    # Capture the identity BEFORE the edit — `--rev` must recover exactly this.
+    assert main(["id", f"{path}:f"]) == 0
+    pre_edit_id = capsys.readouterr().out.strip()
+
     # Edit the working tree: the committed identity and the current one diverge.
     path.write_text(
         textwrap.dedent(_MODULE_TEMPLATE).format(cache_dir=tmp_path / "cache", factor=3)
@@ -106,7 +111,8 @@ def test_id_rev_recovers_pre_edit_identity(tmp_path, capsys):
 
     assert _ID_PATTERN.fullmatch(old_id)
     assert _ID_PATTERN.fullmatch(new_id)
-    assert old_id != new_id  # the body edit re-keyed; --rev recovered the pre-edit id
+    assert old_id == pre_edit_id  # --rev recovered the exact pre-edit identity
+    assert old_id != new_id  # the body edit re-keyed
 
 
 def test_id_rev_requires_file_target(capsys):
@@ -120,3 +126,26 @@ def test_id_rev_unknown_revision_errors(tmp_path, capsys):
     assert main(["id", "--rev", "not-a-rev", f"{path}:f"]) == 1
     err = capsys.readouterr().err
     assert "git show" in err
+
+
+def test_id_module_import_failure_errors(tmp_path, capsys):
+    """README: 'if the module's imports fail, it reports the error and exits 1'."""
+    path = tmp_path / "climod_importfail.py"
+    path.write_text("import does_not_exist_xyz\n")
+    assert main(["id", f"{path}:f"]) == 1
+    err = capsys.readouterr().err
+    assert "ModuleNotFoundError" in err
+    assert "does_not_exist_xyz" in err
+    # The half-initialized module must not linger and shadow later imports.
+    assert "_emboss_file_climod_importfail" not in sys.modules
+
+
+def test_id_file_named_like_stdlib_module(tmp_path, capsys):
+    """A file target named `json.py` must not clobber the real `json` module."""
+    import json as real_json
+
+    path = _write_module(tmp_path, "json")
+    assert main(["id", f"{path}:f"]) == 0
+    out = capsys.readouterr().out.strip()
+    assert _ID_PATTERN.fullmatch(out)
+    assert sys.modules["json"] is real_json
