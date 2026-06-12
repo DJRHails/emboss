@@ -29,9 +29,17 @@ Usage::
 See README.md for the full feature list.
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
 from emboss._cached import cache_id, cached, safe_jsonable_encoder
 from emboss._file_cache import FileCache
 from emboss._protocol import Cache
 
-__version__ = "0.3.0"
+# Single source of truth: the version declared in pyproject.toml, read back from
+# installed package metadata — so `__version__` can never drift from the release
+# (a hardcoded string here once shipped as 0.3.0 inside the 0.4.0 wheel).
+try:
+    __version__ = version("emboss")
+except PackageNotFoundError:  # running from a source tree that isn't installed
+    __version__ = "0+unknown"
 __all__ = ["Cache", "FileCache", "cache_id", "cached", "safe_jsonable_encoder"]
