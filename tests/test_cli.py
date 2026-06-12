@@ -132,12 +132,15 @@ def test_id_module_import_failure_errors(tmp_path, capsys):
     """README: 'if the module's imports fail, it reports the error and exits 1'."""
     path = tmp_path / "climod_importfail.py"
     path.write_text("import does_not_exist_xyz\n")
+    path_before = list(sys.path)
     assert main(["id", f"{path}:f"]) == 1
     err = capsys.readouterr().err
     assert "ModuleNotFoundError" in err
     assert "does_not_exist_xyz" in err
-    # The half-initialized module must not linger and shadow later imports.
+    # The half-initialized module must not linger and shadow later imports,
+    # and the sibling-dir sys.path entry must not leak past the failure.
     assert "_emboss_file_climod_importfail" not in sys.modules
+    assert sys.path == path_before
 
 
 def test_id_file_named_like_stdlib_module(tmp_path, capsys):
@@ -145,7 +148,9 @@ def test_id_file_named_like_stdlib_module(tmp_path, capsys):
     import json as real_json
 
     path = _write_module(tmp_path, "json")
+    path_before = list(sys.path)
     assert main(["id", f"{path}:f"]) == 0
     out = capsys.readouterr().out.strip()
     assert _ID_PATTERN.fullmatch(out)
     assert sys.modules["json"] is real_json
+    assert sys.path == path_before  # in-process main() must not leak path entries

@@ -112,6 +112,7 @@ def test_also_accept_rejects_malformed_tokens(cache):
         "fetch: 3f2a9c",  # stray space after the colon — the classic copy-paste artifact
         "fetch :3f2a9c",
         "fe tch:3f2a9c",
+        "f:v:1",  # extra colon — parses ambiguously, so it is rejected outright
     ]
     for bad in bad_tokens:
         with pytest.raises(ValueError, match=re.escape(repr(bad))):
@@ -169,6 +170,31 @@ def test_unsafe_manual_key_rejects_empty_string(cache):
 def test_unsafe_manual_key_rejects_whitespace(cache):
     with pytest.raises(ValueError, match="whitespace"):
         cached(cache, unsafe_manual_key="v 1")
+
+
+def test_unsafe_manual_key_rejects_colon(cache):
+    """A ':' inside the manual key makes the identity parse ambiguously —
+    `"f" + "v:1"` reads back as name `"f"`, hash `"v:1"`, whose undelimited
+    derivation collides with the written key of name `"fv"`, hash `"1"` —
+    so it is rejected at decoration time (both ends: key and token)."""
+    with pytest.raises(ValueError, match="':'"):
+        cached(cache, unsafe_manual_key="v:1")
+
+    @cached(cache, unsafe_manual_key="1")
+    def fv(x: int) -> int:
+        return 111
+
+    assert fv(1) == 111
+    with pytest.raises(ValueError, match="exactly one ':'"):
+
+        @cached(cache, also_accept=["f:v:1"])  # would alias fv's written key
+        def f(x: int) -> int:
+            return 333
+
+
+def test_also_accept_rejects_bare_string(cache):
+    with pytest.raises(TypeError, match="wrap it in a list"):
+        cached(cache, also_accept="fetch_user:0123abcd")
 
 
 def test_manual_keys_do_not_collide_across_functions(cache):

@@ -9,6 +9,7 @@ working tree, recovering the pre-edit identity after the fact.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib
 import importlib.util
 import subprocess
@@ -33,7 +34,9 @@ def _import_module_from_file(path: Path, module_name: str) -> types.ModuleType:
         spec.loader.exec_module(module)
     except BaseException:
         # A broken, half-initialized module must not shadow later imports.
-        del sys.modules[module_name]
+        # pop, not del: the module may have removed its own entry, and a
+        # KeyError here would mask the import error we are propagating.
+        sys.modules.pop(module_name, None)
         raise
     return module
 
@@ -51,7 +54,10 @@ def _import_file_target(path: Path, module_name: str, sibling_dir: Path) -> type
     try:
         return _import_module_from_file(path, module_name=module_name)
     finally:
-        sys.path.remove(str(sibling_dir))
+        # The imported module may itself prune sys.path; a missing entry must
+        # not mask the import error (or fail a successful import).
+        with contextlib.suppress(ValueError):
+            sys.path.remove(str(sibling_dir))
 
 
 def _git_file_at_rev(rev: str, path: Path) -> bytes:
@@ -76,9 +82,9 @@ def _resolve_function(target: str, rev: str | None) -> Callable[..., Any]:
     """Import `target` (`pkg.mod:func` or `path/to/mod.py:func`) and return the function.
 
     With `rev`, the target must be a file path; its content is taken from git
-    at that revision (written to a temp file and imported from there). The
-    original file's directory is prepended to `sys.path` for file targets so
-    sibling imports resolve against the working tree (best-effort).
+    at that revision (written to a temp file and imported from there). File
+    targets are imported via `_import_file_target`, which scopes sibling-import
+    resolution to the working-tree directory.
     """
     module_part, sep, func_name = target.rpartition(":")
     if not sep or not module_part or not func_name:

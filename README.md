@@ -140,13 +140,13 @@ def get_user(uid: int) -> dict:
     ...  # same behaviour, new name — old entries are reused, not recomputed
 ```
 
-Different arguments still miss as usual — migration only redirects keys, never serves a value computed for other inputs. Malformed tokens (anything not `"name:body_hash"`, or containing whitespace) raise `ValueError` at decoration time.
+Different arguments still miss as usual — migration only redirects keys, never serves a value computed for other inputs. Malformed tokens (anything not `"name:body_hash"` with exactly one colon, or containing whitespace) raise `ValueError` at decoration time.
 
 Migration via `also_accept` is the *only* fallback: the implicit raw-source fallback that pre-0.3 entries were read through has been removed, so entries that only exist under a pre-0.3 key are reachable solely by declaring their old identity in `also_accept`.
 
 ### `unsafe_manual_key` — opt out of source-based invalidation
 
-`unsafe_manual_key` pins the identity to a fixed string (non-empty, no whitespace) instead of the source hash:
+`unsafe_manual_key` pins the identity to a fixed string (non-empty, no whitespace or `:`) instead of the source hash:
 
 ```python
 @cached(cache, unsafe_manual_key="v1")

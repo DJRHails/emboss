@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import diskcache
 import pytest
 from pydantic import BaseModel
@@ -121,3 +123,52 @@ def test_none_return_caches(cache):
     f("any")
     f("any")
     assert calls["n"] == 1
+
+
+def test_unresolvable_annotation_still_caches(cache):
+    """`typing.get_type_hints` raises NameError on an unresolvable forward ref
+    (e.g. a TYPE_CHECKING-only type); decoration must degrade to pass-through
+    encoding, not crash."""
+    calls = {"n": 0}
+
+    @cached(cache)
+    # The undefined name is the point of the test — see docstring.
+    def f(x: int) -> "NoSuchType":  # ty: ignore[unresolved-reference]  # noqa: F821
+        calls["n"] += 1
+        return {"v": x}
+
+    assert f(2) == {"v": 2}
+    assert f(2) == {"v": 2}
+    assert calls["n"] == 1
+
+
+def test_pep563_model_encoding_stores_plain_dict(cache):
+    """Under `from __future__ import annotations` (active in this module) the
+    return annotation is a string; model detection must still engage and store
+    a plain dict — a pickled model defined in `__main__` would fail to
+    unpickle in a later process."""
+
+    @cached(cache)
+    def f(x: int) -> M:
+        return M(name="p", n=x)
+
+    assert f(1) == M(name="p", n=1)
+    (key,) = list(cache)
+    raw = cache.get(key)
+    assert type(raw) is dict and raw == {"name": "p", "n": 1}
+
+
+def test_unparseable_source_falls_back_with_warning(cache, caplog):
+    """A lambda extracted mid-expression has no standalone-parseable source:
+    keying falls back to the raw source (whitespace-sensitive) and says so at
+    WARNING level."""
+    with caplog.at_level(logging.WARNING, logger="emboss._cached"):
+        # The dict literal is load-bearing: getsource() then yields a lone
+        # `"double": ...` dict-item line, which cannot parse standalone.
+        fns = {
+            "double": cached(cache)(lambda x: x * 2),
+        }
+
+    assert "could not parse function source" in caplog.text
+    assert fns["double"](3) == 6
+    assert fns["double"](3) == 6  # still caches on the fallback key

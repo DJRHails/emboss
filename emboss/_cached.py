@@ -220,17 +220,27 @@ def _parse_accept_token(token: str) -> tuple[str, str]:
     """Split an `also_accept` token into `(name, body_hash)`.
 
     Tokens are prior cache identities as returned by `cache_id` —
-    `"name:body_hash"`. Malformed tokens — wrong shape, or any whitespace
-    (the classic copy-paste artifact, which would otherwise silently never
-    match a key) — fail at decoration time instead of silently disabling
-    migration.
+    `"name:body_hash"`, exactly one colon (manual keys cannot contain `":"`,
+    so no valid identity has two). Malformed tokens — wrong shape, extra
+    colons, or any whitespace (the classic copy-paste artifact, which would
+    otherwise silently never match a key) — fail at decoration time instead
+    of silently disabling migration. Rejecting extra colons also keeps a
+    token's `manual=False` derivation colon-free, which `_derive_key` relies
+    on for collision-freedom.
     """
     name, sep, body_hash = token.partition(":")
-    if not sep or not name or not body_hash or any(ch.isspace() for ch in token):
+    if (
+        not sep
+        or not name
+        or not body_hash
+        or ":" in body_hash
+        or any(ch.isspace() for ch in token)
+    ):
         raise ValueError(
             f"also_accept token {token!r} is not a cache identity of the form "
-            "'name:body_hash' (no whitespace) — pass the string returned by "
-            "emboss.cache_id() for the old function (e.g. 'fetch_user:0123abcd...')."
+            "'name:body_hash' (exactly one ':', no whitespace) — pass the string "
+            "returned by emboss.cache_id() for the old function "
+            "(e.g. 'fetch_user:0123abcd...')."
         )
     return name, body_hash
 
@@ -243,10 +253,13 @@ def _derive_key(name: str, body_hash: str, arg_hash: str, *, manual: bool) -> st
     releases stay valid; `body_hash` is then a fixed-width 32-hex md5, which
     makes the name/body boundary unambiguous. Manual identities
     (`unsafe_manual_key`) carry arbitrary-length hashes, so they get an
-    explicit `":"` delimiter after the name — function names cannot contain a
-    colon and undelimited preimages never do, so manual identities can collide
-    neither with each other nor with source-hashed ones (without the
-    delimiter, `ab` + key `"bX"` and `abb` + key `"X"` share a key).
+    explicit `":"` delimiter after the name. Because `":"` is rejected in
+    manual keys, accept-token halves, and Python identifiers, every manual
+    preimage contains exactly one colon (which pins `name` and, with the
+    fixed-width `arg_hash` suffix, `body_hash`) and no undelimited preimage
+    contains any — so distinct identities cannot share a preimage in either
+    form (without the delimiter, `ab` + key `"bX"` and `abb` + key `"X"`
+    share a key).
     """
     sep = ":" if manual else ""
     return hashlib.md5(f"{name}{sep}{body_hash}{arg_hash}".encode()).hexdigest()
@@ -282,7 +295,7 @@ def cached(
     tokens raise `ValueError` at decoration time.
 
     `unsafe_manual_key` replaces the source-derived body hash with a fixed,
-    caller-managed string (non-empty, no whitespace — it becomes the
+    caller-managed string (non-empty, no whitespace or `":"` — it becomes the
     `body_hash` half of the cache identity, which `also_accept` tokens must
     round-trip). **WARNING — this opts out of emboss's
     invalidate-on-edit safety net**: editing the function body no longer
@@ -303,11 +316,21 @@ def cached(
     if cache is None:
         cache = diskcache.Cache(os.environ.get("EMBOSS_CACHE_DIR"))
     if unsafe_manual_key is not None and (
-        not unsafe_manual_key or any(ch.isspace() for ch in unsafe_manual_key)
+        not unsafe_manual_key
+        or ":" in unsafe_manual_key
+        or any(ch.isspace() for ch in unsafe_manual_key)
     ):
+        # A ":" would let the identity parse ambiguously — "f" + "v:1" reads back
+        # as name "f", hash "v:1", whose undelimited derivation collides with the
+        # written key of name "fv", hash "1" (see _derive_key).
         raise ValueError(
-            "unsafe_manual_key must be a non-empty string without whitespace (e.g. 'v1') — "
-            "omit it to key on the function source instead."
+            "unsafe_manual_key must be a non-empty string without whitespace or ':' "
+            "(e.g. 'v1') — omit it to key on the function source instead."
+        )
+    if isinstance(also_accept, str):
+        raise TypeError(
+            "also_accept must be a sequence of cache identities, not a bare string — "
+            f"wrap it in a list: also_accept=[{also_accept!r}]"
         )
     accepted_identities = tuple(_parse_accept_token(token) for token in (also_accept or []))
 
@@ -332,11 +355,13 @@ def cached(
         # TYPE_CHECKING-only imports) degrade to pass-through encoding, as before.
         try:
             return_anno = typing.get_type_hints(func).get("return", inspect.Parameter.empty)
-        except Exception:
+        except Exception as exc:  # annotation expressions can raise anything
             logger.debug(
-                "emboss: could not resolve type hints for %s; "
+                "emboss: could not resolve type hints for %s (%s: %s); "
                 "pydantic model encoding disabled for it.",
                 func.__name__,
+                type(exc).__name__,
+                exc,
             )
             return_anno = inspect.Parameter.empty
         model_cls, container = _model_info(return_anno)
@@ -353,8 +378,10 @@ def cached(
             ).hexdigest()
             key = _derive_key(info.name, info.body_hash, arg_hash, manual=is_manual)
             # A token's origin — source hash or manual key — is indistinguishable
-            # from its text, so try both derivations; the spurious form is a key
-            # nothing ever writes (one harmless extra `get` on the miss path).
+            # from its text, so try both derivations. The spurious form can only
+            # match a key written for the same identity string (colon-freedom of
+            # manual keys and token halves keeps the preimage spaces disjoint —
+            # see _derive_key), so it's one harmless extra `get` on the miss path.
             accept_keys = [
                 _derive_key(name, accepted_hash, arg_hash, manual=manual)
                 for name, accepted_hash in accepted_identities
