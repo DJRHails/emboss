@@ -1,6 +1,6 @@
 [project]
 name = "emboss"
-version = "0.3.0"
+version = "0.4.0"
 authors = [
     { name="Daniel Hails", email="emboss@hails.info" },
 ]
@@ -10,6 +10,9 @@ dynamic = ["dependencies", "readme"]
 
 [project.optional-dependencies]
 pydantic = ["pydantic>=2"]
+
+[project.scripts]
+emboss = "emboss._cli:main"
 
 [project.urls]
 "Homepage" = "https://github.com/DJRHails/emboss"

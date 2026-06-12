@@ -10,9 +10,11 @@ import inspect
 import json
 import logging
 import os
+import textwrap
 import types
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, TypeVar, Union
 
 import diskcache
@@ -162,16 +164,72 @@ def _canonical_source(raw_source: str) -> str:
     than crashing.
     """
     try:
-        return ast.unparse(ast.parse(
-          .dedent(raw_source)))
+        return ast.unparse(ast.parse(textwrap.dedent(raw_source)))
     except (SyntaxError, ValueError, TypeError, RecursionError):
         return raw_source
+
+
+@dataclass(frozen=True, kw_only=True)
+class EmbossInfo:
+    """Cache-identity metadata attached to every `@cached` wrapper as `__emboss__`.
+
+    `cache_id` is `f"{name}:{body_hash}"` — the function's identity in the
+    keying scheme (`key = md5(name + body_hash + arg_hash)`), where `body_hash`
+    is the md5 of the AST-canonical source, or the `unsafe_manual_key` when one
+    was pinned. `also_accept` echoes the raw fallback identities passed at
+    decoration time.
+    """
+
+    name: str
+    body_hash: str
+    cache_id: str
+    also_accept: tuple[str, ...]
+
+
+def cache_id(func: Callable[..., Any]) -> str:
+    """Return the cache identity (`"name:body_hash"`) of an `@cached` function.
+
+    The identity is what `also_accept` consumes: capture it *before* a rename
+    or body edit, then pass it to the new definition so the warm cache entries
+    keep matching (see `cached`).
+
+    Raises:
+        TypeError: if `func` is not an `@cached`-wrapped function (it lacks the
+            `__emboss__` metadata attached at decoration time).
+    """
+    info = getattr(func, "__emboss__", None)
+    if not isinstance(info, EmbossInfo):
+        raise TypeError(
+            f"{getattr(func, '__qualname__', func)!r} is not an @cached-wrapped function "
+            "(missing __emboss__ metadata) — cache_id() only works on functions "
+            "decorated with emboss.cached."
+        )
+    return info.cache_id
+
+
+def _parse_accept_token(token: str) -> tuple[str, str]:
+    """Split an `also_accept` token into `(name, body_hash)`.
+
+    Tokens are prior cache identities as returned by `cache_id` —
+    `"name:body_hash"`. Malformed tokens fail at decoration time so a typo
+    can't silently disable migration.
+    """
+    name, sep, body_hash = token.partition(":")
+    if not sep or not name or not body_hash:
+        raise ValueError(
+            f"also_accept token {token!r} is not a cache identity of the form "
+            "'name:body_hash' — pass the string returned by emboss.cache_id() for "
+            "the old function (e.g. 'fetch_user:0123abcd...')."
+        )
+    return name, body_hash
 
 
 def cached(
     cache: Cache | None = None,
     *,
     default: Callable[[Any], Any] | None = str,
+    also_accept: list[str] | None = None,
+    unsafe_manual_key: str | None = None,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Disk-backed memoization decorator.
 
@@ -185,6 +243,23 @@ def cached(
     `str` preserves the loose 0.1 behaviour; pass `default=None` for strict
     mode that raises on unknown argument types.
 
+    `also_accept` lists *old* cache identities — `cache_id` strings of the
+    form `"name:body_hash"` — whose entries are still honoured. On a miss
+    under the current key, each accepted identity is tried in order and a hit
+    is copied forward to the current key (write-through), so a
+    behaviour-preserving rename or body refactor keeps its warm cache.
+    Capture the identity with `emboss.cache_id(func)` before editing, or
+    recover it afterwards with the `emboss id --rev <rev>` CLI. Malformed
+    tokens raise `ValueError` at decoration time.
+
+    `unsafe_manual_key` replaces the source-derived body hash with a fixed,
+    caller-managed string. **WARNING — this opts out of emboss's
+    invalidate-on-edit safety net**: editing the function body no longer
+    invalidates its cache, so stale results are served until *you* bump the
+    key string (e.g. `"v1"` → `"v2"`) — the caller is responsible for bumping
+    it on every behaviour change. `also_accept` still works alongside it
+    (e.g. to migrate source-keyed entries into a manual-key identity).
+
     Detects `BaseModel` / `list[Model]` / `dict[str, Model]` return annotations
     and stores them as dicts (rehydrated on read) so model classes defined in
     `__main__` round-trip across script invocations.
@@ -192,18 +267,32 @@ def cached(
     When no `cache` is passed, the default cache directory is read from the
     `EMBOSS_CACHE_DIR` environment variable at cache-creation time; if unset,
     `diskcache` falls back to a temporary directory as before. The cache
-    location never affects keying (keys are function source + arguments).
+    location never affects keying (keys are function identity + arguments).
     """
     if cache is None:
         cache = diskcache.Cache(os.environ.get("EMBOSS_CACHE_DIR"))
+    if unsafe_manual_key is not None and not unsafe_manual_key:
+        raise ValueError(
+            "unsafe_manual_key must be a non-empty string (e.g. 'v1') — "
+            "omit it to key on the function source instead."
+        )
+    accepted_identities = tuple(_parse_accept_token(token) for token in (also_accept or []))
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        raw_source = inspect.getsource(func)
-        # Primary key uses the AST-canonical source (whitespace/comment-agnostic);
-        # the legacy key uses the raw source — the pre-0.3 scheme — so existing
-        # entries keep matching and get migrated forward on first read.
-        raw_hash = hashlib.md5(raw_source.encode()).hexdigest()
-        canon_hash = hashlib.md5(_canonical_source(raw_source).encode()).hexdigest()
+        # The function's identity is `name:body_hash`. The body hash is the
+        # AST-canonical source (whitespace/comment-agnostic), unless
+        # `unsafe_manual_key` pins it to a caller-managed string instead.
+        if unsafe_manual_key is not None:
+            body_hash = unsafe_manual_key
+        else:
+            raw_source = inspect.getsource(func)
+            body_hash = hashlib.md5(_canonical_source(raw_source).encode()).hexdigest()
+        info = EmbossInfo(
+            name=func.__name__,
+            body_hash=body_hash,
+            cache_id=f"{func.__name__}:{body_hash}",
+            also_accept=tuple(also_accept or ()),
+        )
         try:
             return_anno = inspect.signature(func).return_annotation
         except (TypeError, ValueError):
@@ -211,8 +300,8 @@ def cached(
         model_cls, container = _model_info(return_anno)
         is_async = asyncio.iscoroutinefunction(func)
 
-        def _keys(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[str, str]:
-            """`(canonical key, legacy raw-source key)` for one call's arguments."""
+        def _keys(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> tuple[str, list[str]]:
+            """`(current key, also_accept fallback keys)` for one call's arguments."""
             json_args = [safe_jsonable_encoder(arg, default=default) for arg in args]
             json_kwargs = {
                 k: safe_jsonable_encoder(v, default=default) for k, v in kwargs.items()
@@ -220,31 +309,38 @@ def cached(
             arg_hash = hashlib.md5(
                 f"{json.dumps(json_args)}{json.dumps(json_kwargs)}".encode()
             ).hexdigest()
-            key = hashlib.md5(f"{func.__name__}{canon_hash}{arg_hash}".encode()).hexdigest()
-            legacy = hashlib.md5(f"{func.__name__}{raw_hash}{arg_hash}".encode()).hexdigest()
-            return key, legacy
+            key = hashlib.md5(f"{func.__name__}{body_hash}{arg_hash}".encode()).hexdigest()
+            accept_keys = [
+                hashlib.md5(f"{name}{accepted_hash}{arg_hash}".encode()).hexdigest()
+                for name, accepted_hash in accepted_identities
+            ]
+            return key, accept_keys
 
-        def _lookup(key: str, legacy_key: str) -> Any:
-            """Read the canonical key; on miss, fall back to the legacy raw-source
-            key and migrate the value forward so later reads hit directly."""
+        def _lookup(key: str, accept_keys: list[str]) -> Any:
+            """Read the current key; on miss, try each `also_accept` fallback key
+            in order and migrate the first hit forward to the current key so
+            later reads hit directly."""
             raw = cache.get(key, default=_MISSING)
-            if raw is _MISSING and legacy_key != key:
-                raw = cache.get(legacy_key, default=_MISSING)
+            if raw is not _MISSING:
+                return raw
+            for accept_key in accept_keys:
+                if accept_key == key:
+                    continue
+                raw = cache.get(accept_key, default=_MISSING)
                 if raw is not _MISSING:
                     cache.set(key, raw)
-            return raw
+                    return raw
+            return _MISSING
 
-        def _store(key: str, legacy_key: str, encoded: Any) -> None:
-            """Write back under both the canonical and raw-source keys, so callers
-            on either keying scheme find the entry."""
+        def _store(key: str, encoded: Any) -> None:
+            """Write back under the current key only — old identities are read
+            (and migrated) via `also_accept`, never written to."""
             cache.set(key, encoded)
-            if legacy_key != key:
-                cache.set(legacy_key, encoded)
 
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> T:
-            key, legacy_key = _keys(args, kwargs)
-            raw = _lookup(key, legacy_key)
+            key, accept_keys = _keys(args, kwargs)
+            raw = _lookup(key, accept_keys)
             if raw is not _MISSING:
                 decoded = _decode(raw, model_cls, container)
                 if is_async:
@@ -259,15 +355,16 @@ def cached(
 
                 async def execute():
                     result = await func(*args, **kwargs)  # type: ignore[misc]
-                    _store(key, legacy_key, _encode(result, model_cls, container))
+                    _store(key, _encode(result, model_cls, container))
                     return result
 
                 return execute()  # type: ignore[return-value]
 
             result = func(*args, **kwargs)
-            _store(key, legacy_key, _encode(result, model_cls, container))
+            _store(key, _encode(result, model_cls, container))
             return result
 
+        wrapper.__emboss__ = info  # type: ignore[attr-defined]
         return wrapper
 
     return decorator

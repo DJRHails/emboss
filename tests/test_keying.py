@@ -106,8 +106,8 @@ def test_string_literal_whitespace_invalidates(cache):
     assert calls == [1, 2]
 
 
-def test_legacy_raw_source_key_is_migrated(cache):
-    """A pre-0.3 entry stored under the raw-source key is read and migrated forward."""
+def test_legacy_raw_source_key_no_longer_read(cache):
+    """The implicit pre-0.3 raw-source fallback is gone — only `also_accept` migrates."""
     import hashlib
     import inspect
     import json
@@ -126,7 +126,5 @@ def test_legacy_raw_source_key_is_migrated(cache):
     legacy_key = hashlib.md5(f"f{raw_hash}{arg_hash}".encode()).hexdigest()
     cache.set(legacy_key, 999)
 
-    assert f(5) == 999  # served from the legacy entry
-    assert calls == []  # body never ran
-    assert f(5) == 999  # now served from the migrated canonical key
-    assert calls == []
+    assert f(5) == 50  # MISS — the planted raw-source entry is ignored, body recomputes
+    assert calls == [5]
