@@ -1,1 +1,4 @@
-diskcache>=5
+# emboss core has no runtime dependencies (stdlib sqlite3 + filesystem).
+# Optional extras (see pyproject.toml [project.optional-dependencies]):
+#   emboss[pydantic]   — pydantic v2 BaseModel return-type support
+#   emboss[diskcache]  — use diskcache.Cache as a backend (still supported)

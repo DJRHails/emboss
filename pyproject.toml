@@ -1,6 +1,6 @@
 [project]
 name = "emboss"
-version = "0.4.1"
+version = "0.5.0"
 authors = [
     { name="Daniel Hails", email="emboss@hails.info" },
 ]
@@ -10,6 +10,8 @@ dynamic = ["dependencies", "readme"]
 
 [project.optional-dependencies]
 pydantic = ["pydantic>=2"]
+diskcache = ["diskcache>=5"]  # use diskcache.Cache as a backend (no longer required)
+dev = ["pytest", "pydantic>=2", "diskcache>=5"]
 
 [project.scripts]
 emboss = "emboss._cli:main"
@@ -30,7 +32,7 @@ readme = {file = ["README.md"], content-type = "text/markdown"}
 find = {}
 
 [tool.bumpver]
-current_version = "0.3.0"
+current_version = "0.5.0"
 version_pattern = "MAJOR.MINOR.PATCH"
 commit_message = "bump version {old_version} -> {new_version}"
 commit = true

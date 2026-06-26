@@ -1,16 +1,21 @@
 """emboss — On-Disk Input-keyed Cache.
 
-Disk-backed memoization built on `diskcache`, with auto-detection of
-pydantic v2 `BaseModel` return types (encoded via `model_dump`, decoded
-via `model_validate`) so models defined in `__main__` round-trip across
-script invocations.
+Dependency-free disk-backed memoization, with auto-detection of pydantic v2
+`BaseModel` return types (encoded via `model_dump`, decoded via `model_validate`)
+so models defined in `__main__` round-trip across script invocations.
+
+Three backends, all satisfying the `Cache` protocol:
+
+- `SqliteCache` — single-file, size-bounded, LRU (the default; stdlib only).
+- `FileCache` — file-per-key, NFS-safe and replication-safe (shared mounts /
+  Syncthing across machines).
+- `diskcache.Cache` — still supported as a drop-in (`pip install emboss[diskcache]`).
 
 Usage::
 
-    import diskcache
-    from emboss import cached
+    from emboss import cached, SqliteCache
 
-    cache = diskcache.Cache("/tmp/my-cache")
+    cache = SqliteCache("/tmp/my-cache")
 
     @cached(cache)
     def expensive(url: str) -> dict:
@@ -32,8 +37,12 @@ See README.md for the full feature list.
 from importlib.metadata import PackageNotFoundError, version
 
 from emboss._cached import cache_id, cached, safe_jsonable_encoder
+from emboss._fanout_cache import FanoutCache
 from emboss._file_cache import FileCache
+from emboss._log_cache import LogCache
 from emboss._protocol import Cache
+from emboss._sqlite_cache import SqliteCache
+from emboss._transfer import transfer
 
 # Single source of truth: the version declared in pyproject.toml, read back from
 # installed package metadata — so `__version__` can never drift from the release
@@ -42,4 +51,14 @@ try:
     __version__ = version("emboss")
 except PackageNotFoundError:  # running from a source tree that isn't installed
     __version__ = "0+unknown"
-__all__ = ["Cache", "FileCache", "cache_id", "cached", "safe_jsonable_encoder"]
+__all__ = [
+    "Cache",
+    "FanoutCache",
+    "FileCache",
+    "LogCache",
+    "SqliteCache",
+    "cache_id",
+    "cached",
+    "safe_jsonable_encoder",
+    "transfer",
+]

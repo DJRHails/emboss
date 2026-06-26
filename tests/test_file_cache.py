@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import pickle
 
 import pytest
 
 from emboss import FileCache, cached
+from emboss._file_cache import _key_to_path
 
 
 @pytest.fixture
@@ -24,12 +26,11 @@ def test_set_then_get(cache):
     assert cache.get("k") == {"a": 1}
 
 
-def test_set_returns_false_on_existing_key(cache):
-    """Concurrent-writer guard: cache values are pure functions of the key,
-    so don't overwrite — the existing file is by construction equally correct."""
+def test_set_overwrites_existing_key(cache):
+    """set() overwrites via atomic rename (last writer wins)."""
     assert cache.set("k", "first") is True
-    assert cache.set("k", "second") is False
-    assert cache.get("k") == "first"  # original retained
+    assert cache.set("k", "second") is True
+    assert cache.get("k") == "second"
 
 
 def test_delete(cache):
@@ -164,6 +165,75 @@ def test_no_residual_tempfiles_after_set(cache, tmp_path):
     # Atomic-rename leaves no .tmp files in the shard dir.
     tmp_leftovers = list((tmp_path / "cache").glob("**/.*.tmp"))
     assert tmp_leftovers == []
+
+
+def test_iteration_recovers_keys(cache):
+    cache.set("alpha", 1)
+    cache.set("beta", 2)
+    cache.set(("tuple", "key"), 3)  # non-string key recovered too
+    assert len(cache) == 3
+    assert sorted(k for k in cache if isinstance(k, str)) == ["alpha", "beta"]
+    assert ("tuple", "key") in list(cache)
+    assert cache.volume() > 0
+
+
+def test_legacy_raw_value_still_readable(tmp_path):
+    """Files written before key-recovery held a bare value (no _Entry) and must
+    still read; they just don't yield a key on iteration."""
+    c = FileCache(tmp_path / "cache")
+    path = _key_to_path(c.directory, "k")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump("legacy-raw", f)  # old format
+    assert c.get("k") == "legacy-raw"  # readable
+    assert list(c) == []  # but key not recoverable from a legacy file
+
+
+def test_unbounded_by_default_keeps_everything(tmp_path):
+    c = FileCache(tmp_path / "cache")  # size_limit=None
+    val = b"x" * 10_000
+    for i in range(20):
+        c.set(f"key{i:02d}", val)
+    assert all(c.get(f"key{i:02d}") == val for i in range(20))
+
+
+def test_size_limit_bounds_total(tmp_path):
+    root = tmp_path / "cache"
+    c = FileCache(root, size_limit=30_000)
+    val = b"x" * 10_000  # ~10 KB pickled
+    for i in range(20):
+        c.set(f"key{i:02d}", val)
+    total = sum(p.stat().st_size for p in root.glob("**/*.pkl"))
+    assert total <= 30_000  # eviction kept it under the cap
+    assert len(list(root.glob("**/*.pkl"))) < 20  # some were evicted
+
+
+def test_lru_evicts_oldest_by_mtime(tmp_path):
+    root = tmp_path / "cache"
+    c = FileCache(root)  # unbounded during sets, so we control mtimes first
+    val = b"x" * 10_000
+    for name, mtime in (("old", 100.0), ("mid", 200.0), ("new", 300.0)):
+        c.set(name, val)
+        os.utime(_key_to_path(root, name), (mtime, mtime))
+    c.size_limit = 25_000  # ~2 of the 3 entries fit (low-water 22.5 KB)
+    c._evict()
+    assert c.get("old") is None  # least-recently-used evicted first
+    assert c.get("mid") == val
+    assert c.get("new") == val
+
+
+def test_get_bumps_mtime_to_protect_from_eviction(tmp_path):
+    root = tmp_path / "cache"
+    c = FileCache(root, size_limit=25_000)
+    val = b"x" * 10_000
+    for name, mtime in (("a", 100.0), ("b", 200.0)):
+        c.set(name, val)
+        os.utime(_key_to_path(root, name), (mtime, mtime))
+    c.get("a")  # touch the older entry -> bumps its mtime to now (most recent)
+    c.set("c", val)  # pushes over the cap, triggers eviction
+    assert c.get("b") is None  # 'b' is now the least-recently-used -> evicted
+    assert c.get("a") == val  # 'a' survived because it was read recently
+    assert c.get("c") == val
 
 
 def test_set_with_unpicklable_value_cleans_up_tempfile(cache, tmp_path):

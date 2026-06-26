@@ -6,7 +6,7 @@ from typing import Any
 
 import diskcache
 
-from emboss import Cache, FileCache, cached
+from emboss import Cache, FileCache, SqliteCache, cached
 
 
 def test_filecache_satisfies_protocol(tmp_path):
@@ -14,7 +14,16 @@ def test_filecache_satisfies_protocol(tmp_path):
     assert isinstance(fc, Cache)
 
 
-def test_diskcache_satisfies_protocol(tmp_path):
+def test_sqlitecache_satisfies_protocol(tmp_path):
+    sc = SqliteCache(tmp_path / "sc")
+    try:
+        assert isinstance(sc, Cache)
+    finally:
+        sc.close()
+
+
+def test_diskcache_still_satisfies_protocol(tmp_path):
+    """diskcache is no longer a runtime dep but stays a supported backend."""
     dc = diskcache.Cache(str(tmp_path / "dc"))
     try:
         assert isinstance(dc, Cache)

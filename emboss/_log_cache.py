@@ -1,0 +1,447 @@
+"""LogCache — a log-structured, replication-safe cache with few inodes.
+
+`FileCache` is replication-safe but writes one file per key — millions of inodes
+for a big cache, and slow `du`/`rsync`/Syncthing scans. The obvious fix
+(bundling many keys into one file per prefix) makes sync *worse*: two nodes both
+rewriting the same `<prefix>` file means a syncer's last-write-wins discards a
+whole bundle of one node's entries.
+
+`LogCache` gets few inodes AND conflict-free sync by giving every writer its own
+files. Entries are sharded by a stable hash of the key into prefixes; within a
+prefix each node appends to **its own** log:
+
+    directory/<prefix>/<writer_id>.log       # written by exactly ONE node
+    directory/<prefix>/<writer_id>.lock      # flock; excludes append/compact races
+    directory/<prefix>/<writer_id>.spill/*   # large values, one file each
+
+Because no file is ever written by two nodes, a file syncer just ships each
+node's logs around — last-write-wins never fires, so a sync conflict can't lose
+data. Same-node processes sharing a node-log are serialised by the per-writer
+lock file. Inodes are bounded by ~(#prefixes x #writers), not entry count.
+
+- **Reads** consult a per-prefix in-memory index (built by scanning that
+  prefix's logs once; rebuilt when a log's size changes — a peer's appends). The
+  freshness check is throttled by `index_ttl`, so warm reads are an in-memory
+  lookup. A miss just recomputes — safe under eventual consistency.
+- **Writes** append a length-framed record; a torn tail from a crash is ignored.
+- **Large values spill to side files** (`min_file_size`, default 32 KB): the
+  record holds a filename reference instead of the value, keeping the log small
+  (so a 100 MB value doesn't balloon the append log). Spill files live under the
+  writer's own namespace, so they sync conflict-free too, and are removed on
+  overwrite / delete / compaction.
+- **Deletes** append a tombstone.
+- **Compaction** rewrites *this node's own* log (under its lock, atomic rename),
+  dropping superseded / tombstoned / expired records and their spill files. It
+  never touches a peer's files. Auto-runs past `max_log_bytes`; also `compact()`.
+
+Tunables (defaults chosen via `python scripts/bench.py`):
+- `index_ttl` (1.0 s) — index reuse before re-stat'ing for peers' appends; the
+  dominant read lever (~10^4/s always-fresh -> ~10^5/s throttled), at the cost of
+  up to `index_ttl` of staleness on cross-node writes (own writes immediate).
+- `prefix_width` (2 -> 256 shards) — inodes vs per-log size. Aim ~1k entries per
+  prefix: width 1 (<~10k entries), 2 (~10k-2M), 3 (>~2M); avoid >=4 (the parent
+  dir then holds 65k+ subdirs — the cliff). Must match across a directory.
+- `min_file_size` (32 KB) — values this big or larger spill to side files.
+- `max_log_bytes` (4 MB) — per-log size that triggers compaction.
+
+Benchmark (local SSD, 512-byte values), order of magnitude:
+    set ~10^4 ops/s     get ~10^5 ops/s (index_ttl=1.0; ~10^4/s if index_ttl=0)
+The headline win is inodes: ~256 files for *any* number of small entries.
+
+`writer_id` defaults to the hostname and **must be unique per node**. Implements
+the `Cache` protocol subset `@cached` needs plus dunders, `len()`, iteration,
+`volume()`.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import os
+import pickle
+import shutil
+import socket
+import struct
+import threading
+import time
+import uuid
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any, NamedTuple
+
+_MISSING = object()
+_HEADER = struct.Struct(">I")  # 4-byte big-endian record length
+_DEFAULT_MAX_LOG_BYTES = 4 * 2**20  # compact a node's per-prefix log past 4 MB
+_DEFAULT_PREFIX_WIDTH = 2  # 2 hex chars -> 256 shard dirs
+_DEFAULT_INDEX_TTL = 1.0  # seconds a per-prefix index is reused before re-stat'ing
+_DEFAULT_MIN_FILE_SIZE = 2**15  # 32 KB — values this big or larger spill to files
+
+
+class _Record(NamedTuple):
+    key: str
+    value: Any  # the value (inline) or None when spilled
+    expire_time: float | None
+    store_time: float
+    deleted: bool
+    spill: str | None  # relative path to a side file holding the value, or None
+
+
+def _iter_records(path: Path) -> Iterator[_Record]:
+    """Yield records from a log, stopping at the first torn/corrupt tail."""
+    with open(path, "rb") as f:
+        while True:
+            header = f.read(_HEADER.size)
+            if len(header) < _HEADER.size:
+                return
+            (length,) = _HEADER.unpack(header)
+            blob = f.read(length)
+            if len(blob) < length:
+                return  # truncated final write (crash mid-append)
+            try:
+                yield _Record(*pickle.loads(blob))
+            except Exception:  # noqa: BLE001 — a corrupt tail ends the log
+                return
+
+
+def _frame(rec: _Record) -> bytes:
+    blob = pickle.dumps(tuple(rec), protocol=pickle.HIGHEST_PROTOCOL)
+    return _HEADER.pack(len(blob)) + blob
+
+
+def _sanitize(writer_id: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in writer_id) or "node"
+
+
+def _flock(fileobj: Any, op: int) -> None:
+    """Best-effort advisory lock (POSIX); no-op where fcntl is unavailable."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover — non-POSIX
+        return
+    with contextlib.suppress(OSError):
+        fcntl.flock(fileobj.fileno(), op)
+
+
+class LogCache:
+    """Log-structured cache: per-writer, prefix-sharded append logs + spillover."""
+
+    def __init__(
+        self,
+        directory: str | os.PathLike[str] = ".cache",
+        size_limit: int | None = None,
+        writer_id: str | None = None,
+        max_log_bytes: int = _DEFAULT_MAX_LOG_BYTES,
+        prefix_width: int = _DEFAULT_PREFIX_WIDTH,
+        index_ttl: float = _DEFAULT_INDEX_TTL,
+        min_file_size: int = _DEFAULT_MIN_FILE_SIZE,
+        **_kwargs: Any,
+    ) -> None:
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.size_limit = size_limit
+        self.max_log_bytes = max_log_bytes
+        self.prefix_width = prefix_width
+        self.index_ttl = index_ttl
+        self.min_file_size = min_file_size
+        self.writer_id = _sanitize(writer_id or socket.gethostname())
+        self._lock = threading.Lock()  # serialise this process's threads
+        self._index: dict[str, dict[str, _Record]] = {}
+        self._sig: dict[str, dict[str, int]] = {}
+        self._checked: dict[str, float] = {}  # monotonic time of last freshness check
+
+    # ── layout ────────────────────────────────────────────────────────────────
+
+    def _prefix(self, key: Any) -> str:
+        return hashlib.md5(str(key).encode()).hexdigest()[: self.prefix_width]
+
+    def _log_path(self, prefix: str) -> Path:
+        return self.directory / prefix / f"{self.writer_id}.log"
+
+    @contextlib.contextmanager
+    def _writer_lock(self, prefix: str) -> Iterator[None]:
+        """Exclude same-node appends/compactions on this writer's log. The lock
+        file is never replaced, so the flock stays valid across compaction's
+        rename (unlike locking the log file itself)."""
+        lock_path = self.directory / prefix / f"{self.writer_id}.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        f = open(lock_path, "a+")  # noqa: SIM115
+        try:
+            import fcntl
+
+            _flock(f, fcntl.LOCK_EX)
+            yield
+        except ImportError:  # pragma: no cover — non-POSIX: no cross-process lock
+            yield
+        finally:
+            with contextlib.suppress(ImportError):
+                import fcntl
+
+                _flock(f, fcntl.LOCK_UN)
+            f.close()
+
+    # ── spillover (large values -> side files) ─────────────────────────────────
+
+    def _spill_write(self, prefix: str, blob: bytes) -> str:
+        """Write a value blob to a side file under this writer's namespace; return
+        its path relative to `directory` (so any reader can resolve it)."""
+        rel_dir = f"{prefix}/{self.writer_id}.spill"
+        full_dir = self.directory / rel_dir
+        full_dir.mkdir(parents=True, exist_ok=True)
+        name = f"{uuid.uuid4().hex}.val"
+        full = full_dir / name
+        tmp = full.with_name(name + ".tmp")
+        with open(tmp, "wb") as f:
+            f.write(blob)
+        os.replace(tmp, full)
+        return f"{rel_dir}/{name}"
+
+    def _spill_read(self, rel: str) -> Any:
+        with open(self.directory / rel, "rb") as f:
+            return pickle.load(f)
+
+    def _spill_delete(self, rel: str) -> None:
+        with contextlib.suppress(OSError):
+            (self.directory / rel).unlink()
+
+    def _is_own_spill(self, prefix: str, rel: str) -> bool:
+        return rel.startswith(f"{prefix}/{self.writer_id}.spill/")
+
+    def _rec_size(self, rec: _Record) -> int:
+        if rec.spill:
+            try:
+                return (self.directory / rec.spill).stat().st_size
+            except OSError:
+                return 0
+        return len(pickle.dumps(rec.value, protocol=pickle.HIGHEST_PROTOCOL))
+
+    # ── index ─────────────────────────────────────────────────────────────────
+
+    def _current_sig(self, prefix: str) -> dict[str, int]:
+        pdir = self.directory / prefix
+        if not pdir.is_dir():
+            return {}
+        sig: dict[str, int] = {}
+        for log in pdir.glob("*.log"):
+            with contextlib.suppress(OSError):
+                sig[log.name] = log.stat().st_size
+        return sig
+
+    def _ensure_index(self, prefix: str) -> dict[str, _Record]:
+        # Throttle the on-disk freshness check: within index_ttl of the last
+        # check, reuse the in-memory index (own writes are applied to it directly,
+        # so only a peer's writes can be missed — for up to index_ttl).
+        now = time.monotonic()
+        if (
+            prefix in self._index
+            and self.index_ttl > 0
+            and now - self._checked.get(prefix, 0.0) < self.index_ttl
+        ):
+            return self._index[prefix]
+        self._checked[prefix] = now  # record the freshness check (incl. the first build)
+        sig = self._current_sig(prefix)
+        if prefix in self._index and self._sig.get(prefix) == sig:
+            return self._index[prefix]
+        index: dict[str, _Record] = {}
+        pdir = self.directory / prefix
+        if pdir.is_dir():
+            for log in sorted(pdir.glob("*.log")):
+                with contextlib.suppress(OSError):
+                    for rec in _iter_records(log):
+                        cur = index.get(rec.key)
+                        if cur is None or rec.store_time >= cur.store_time:
+                            index[rec.key] = rec
+        self._index[prefix] = index
+        self._sig[prefix] = sig
+        return index
+
+    @staticmethod
+    def _live(rec: _Record | None, now: float) -> bool:
+        return (
+            rec is not None
+            and not rec.deleted
+            and (rec.expire_time is None or rec.expire_time >= now)
+        )
+
+    # ── append / compaction ────────────────────────────────────────────────────
+
+    def _append(self, prefix: str, rec: _Record) -> int:
+        path = self._log_path(prefix)
+        with self._writer_lock(prefix):
+            with open(path, "ab") as f:
+                f.write(_frame(rec))
+            return path.stat().st_size
+
+    def compact(self, prefix: str | None = None) -> None:
+        """Rewrite this node's own log(s), dropping dead/superseded/expired records
+        and their spill files (and, with `size_limit`, oldest-stored live records).
+        Never touches a peer's files, so it stays conflict-free under sync."""
+        with self._lock:
+            if prefix is not None:
+                self._compact_prefix(prefix)
+            else:
+                for pdir in list(self.directory.iterdir()):
+                    if pdir.is_dir():
+                        self._compact_prefix(pdir.name)
+
+    def _compact_prefix(self, prefix: str) -> None:
+        path = self._log_path(prefix)
+        if not path.exists():
+            return
+        now = time.time()
+        all_spills: set[str] = set()
+        with self._writer_lock(prefix):
+            latest: dict[str, _Record] = {}
+            for rec in _iter_records(path):
+                if rec.spill:
+                    all_spills.add(rec.spill)
+                cur = latest.get(rec.key)
+                if cur is None or rec.store_time >= cur.store_time:
+                    latest[rec.key] = rec
+            keep = [r for r in latest.values() if self._live(r, now)]
+            if self.size_limit is not None:
+                keep = self._trim_to_limit(keep)
+            keep.sort(key=lambda r: r.store_time)
+            tmp = path.with_name(path.name + ".compact.tmp")
+            with open(tmp, "wb") as out:
+                for rec in keep:
+                    out.write(_frame(rec))
+            os.replace(tmp, path)
+        kept_spills = {r.spill for r in keep if r.spill}
+        for spill in all_spills - kept_spills:  # dropped records' values (all ours)
+            self._spill_delete(spill)
+        self._index.pop(prefix, None)  # force rebuild
+        self._sig.pop(prefix, None)
+
+    def _trim_to_limit(self, records: list[_Record]) -> list[_Record]:
+        """Best-effort size bound over THIS node's live records for one prefix."""
+        assert self.size_limit is not None
+        if sum(self._rec_size(r) for r in records) <= self.size_limit:
+            return records
+        kept: list[_Record] = []
+        running = 0
+        for rec in sorted(records, key=lambda r: r.store_time, reverse=True):  # newest first
+            running += self._rec_size(rec)
+            if running > self.size_limit:
+                break
+            kept.append(rec)
+        return kept
+
+    # ── core API ────────────────────────────────────────────────────────────
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        now = time.time()
+        prefix = self._prefix(key)
+        with self._lock:
+            rec = self._ensure_index(prefix).get(str(key))
+        if rec is None or not self._live(rec, now):
+            return default
+        if rec.spill:
+            try:
+                return self._spill_read(rec.spill)
+            except OSError:
+                return default  # spill not present yet (e.g. log synced before it) -> miss
+        return rec.value
+
+    def set(self, key: Any, value: Any, expire: float | None = None, **_kwargs: Any) -> bool:
+        now = time.time()
+        prefix = self._prefix(key)
+        expire_time = now + expire if expire else None
+        blob = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        if len(blob) >= self.min_file_size:
+            rec = _Record(str(key), None, expire_time, now, False, self._spill_write(prefix, blob))
+        else:
+            rec = _Record(str(key), value, expire_time, now, False, None)
+        with self._lock:
+            index = self._ensure_index(prefix)
+            old = index.get(rec.key)
+            try:
+                log_size = self._append(prefix, rec)
+            except BaseException:
+                if rec.spill:
+                    self._spill_delete(rec.spill)  # don't orphan the new spill
+                raise
+            index[rec.key] = rec
+            self._sig.setdefault(prefix, {})[self._log_path(prefix).name] = log_size
+            if old is not None and old.spill and self._is_own_spill(prefix, old.spill):
+                self._spill_delete(old.spill)  # our superseded large value
+            if log_size > self.max_log_bytes:
+                self._compact_prefix(prefix)
+        return True
+
+    def delete(self, key: Any) -> bool:
+        now = time.time()
+        prefix = self._prefix(key)
+        with self._lock:
+            index = self._ensure_index(prefix)
+            old = index.get(str(key))
+            if not self._live(old, now):
+                return False
+            tombstone = _Record(str(key), None, None, now, True, None)
+            log_size = self._append(prefix, tombstone)
+            index[tombstone.key] = tombstone
+            self._sig.setdefault(prefix, {})[self._log_path(prefix).name] = log_size
+            if old is not None and old.spill and self._is_own_spill(prefix, old.spill):
+                self._spill_delete(old.spill)
+        return True
+
+    def clear(self) -> int:
+        """Drop this node's view of the cache (removes local files). Peers' files
+        re-appear via sync — clear is node-local for a replicated cache."""
+        with self._lock:
+            n = sum(1 for _ in self._iter_live())
+            for pdir in list(self.directory.iterdir()):
+                if pdir.is_dir():
+                    shutil.rmtree(pdir, ignore_errors=True)
+            self._index.clear()
+            self._sig.clear()
+        return n
+
+    def volume(self) -> int:
+        """Total bytes of the live value payloads (across all writers)."""
+        with self._lock:
+            return sum(self._rec_size(rec) for rec in self._iter_live())
+
+    def _iter_live(self) -> Iterator[_Record]:
+        now = time.time()
+        for pdir in self.directory.iterdir():
+            if not pdir.is_dir():
+                continue
+            for rec in self._ensure_index(pdir.name).values():
+                if self._live(rec, now):
+                    yield rec
+
+    def __len__(self) -> int:
+        with self._lock:
+            return sum(1 for _ in self._iter_live())
+
+    def __iter__(self) -> Iterator[str]:
+        with self._lock:
+            keys = [rec.key for rec in self._iter_live()]
+        return iter(keys)
+
+    iterkeys = __iter__
+
+    def __contains__(self, key: Any) -> bool:
+        return self.get(key, _MISSING) is not _MISSING
+
+    def __getitem__(self, key: Any) -> Any:
+        value = self.get(key, _MISSING)
+        if value is _MISSING:
+            raise KeyError(key)
+        return value
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        self.set(key, value)
+
+    def __delitem__(self, key: Any) -> None:
+        if not self.delete(key):
+            raise KeyError(key)
+
+    def __enter__(self) -> LogCache:
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        pass
+
+    def close(self) -> None:
+        pass

@@ -2,26 +2,28 @@
 
 **O**n-**D**isk **I**nput-keyed **C**ache — disk-backed memoization with pydantic-aware encoding.
 
-Version: 0.2.0
+Version: 0.5.0
 
 ```bash
-pip install emboss              # core (just diskcache)
+pip install emboss              # core — zero runtime dependencies (stdlib only)
 pip install emboss[pydantic]    # + pydantic v2 BaseModel support
+pip install emboss[diskcache]   # + use diskcache.Cache as a backend (now optional)
 ```
 
 ## Why
 
-`functools.lru_cache` is per-process. `diskcache` survives invocations but pickles values as-is — which breaks the moment your cached return type is a pydantic `BaseModel` defined in `__main__` (the new process can't unpickle `__main__.MyModel`). `emboss` fixes that by detecting BaseModel return annotations and converting to/from plain dicts at the cache boundary.
+`functools.lru_cache` is per-process. A disk cache survives invocations but pickling values as-is breaks the moment your cached return type is a pydantic `BaseModel` defined in `__main__` (the new process can't unpickle `__main__.MyModel`). `emboss` fixes that by detecting BaseModel return annotations and converting to/from plain dicts at the cache boundary.
+
+It ships its own dependency-free backends (`SqliteCache`, `FileCache`) — `diskcache` is no longer required, but stays a drop-in option.
 
 Plus: a `None`-aware sentinel so functions returning `None` actually cache instead of re-running every call.
 
 ## Quick start
 
 ```python
-import diskcache
-from emboss import cached
+from emboss import cached, SqliteCache
 
-cache = diskcache.Cache("/tmp/my-cache")
+cache = SqliteCache("/tmp/my-cache")
 
 @cached(cache)
 def fetch(url: str) -> dict:
@@ -34,7 +36,7 @@ fetch("https://api.example.com/users/1")  # cached, no network
 
 ## Default cache directory
 
-Passing a `diskcache.Cache` is optional. With `@cached()` (no cache argument), emboss creates one at the directory named by the `EMBOSS_CACHE_DIR` environment variable; if unset, `diskcache` falls back to a temporary directory.
+Passing a cache is optional. With `@cached()` (no cache argument), emboss creates a default `SqliteCache` at the directory named by the `EMBOSS_CACHE_DIR` environment variable; if unset, it falls back to a fresh temporary directory.
 
 ```bash
 EMBOSS_CACHE_DIR=.data/cache python my_script.py
@@ -156,36 +158,117 @@ def summarise(text: str) -> str:
 
 **Warning: this disables emboss's invalidate-on-edit safety net.** Editing the body no longer invalidates the cache, so stale results are served until *you* bump the key (`"v1"` → `"v2"`). Use it only when you accept that responsibility — e.g. a hot cache you must not re-bill for cosmetic-but-not-quite-canonical churn. `also_accept` works alongside it, e.g. to migrate source-keyed entries into a manual-key identity.
 
-## Pluggable backends (`Cache` protocol)
+## Backends (`Cache` protocol)
 
-`cached` accepts any object satisfying the runtime-checkable `Cache` protocol:
+`cached` accepts any object satisfying the runtime-checkable `Cache` protocol — `.get(key, default=...)` and `.set(key, value)`. Structural typing, no inheritance:
 
 ```python
-from typing import Any, Protocol, runtime_checkable
-
 @runtime_checkable
 class Cache(Protocol):
     def get(self, key: str, default: Any = None) -> Any: ...
     def set(self, key: str, value: Any) -> Any: ...
 ```
 
-Structural typing — no inheritance required. `diskcache.Cache`, `emboss.FileCache`, and any custom Redis / in-memory adapter you write all work out of the box.
+emboss ships three dependency-free backends; `diskcache.Cache` still works if you `pip install emboss[diskcache]`.
 
-## `FileCache` backend — NFS-safe alternative to diskcache
+| backend | storage | bounded? | shared across hosts? | use when |
+|---|---|---|---|---|
+| `SqliteCache` *(default)* | one SQLite DB | ✅ `size_limit` + eviction + TTL | ❌ SQLite locking breaks on NFS | a bounded **local** cache (multi-process-safe) |
+| `FanoutCache` | N sharded SQLite DBs | ✅ | ❌ | a local cache under **heavy concurrent writes** |
+| `FileCache` | one file per key | ✅ optional `size_limit` + LRU | ✅ atomic rename, syncable | a cache on a **network mount / replicated** across machines |
+| `LogCache` | per-writer append logs | best-effort | ✅ conflict-free, **few inodes** | **many small entries** on a shared/synced mount |
+| `diskcache.Cache` | SQLite (+ tags, stats) | ✅ | ❌ | you want diskcache's richer feature set |
+
+Throughput (local SSD, 512-byte values, order of magnitude — `python scripts/bench.py`):
+
+| backend | set | get |
+|---|---|---|
+| `SqliteCache` | ~10⁴/s | ~10⁵/s |
+| `FileCache` | ~10⁴/s | ~10⁴/s |
+| `LogCache` | ~10⁴/s | ~10⁵/s (warm index) |
+
+`SqliteCache` is multi-process-safe (SQLite `busy_timeout` + `BEGIN IMMEDIATE` + a "database is locked" retry), keeps `size`/`count` accurate via DB triggers (so `size_limit` holds across processes and `len()`/`volume()` are O(1)), spills values ≥ 32 KB to side files to keep the DB small, and runs `auto_vacuum=FULL` so the DB shrinks as entries are evicted.
+
+### `SqliteCache` — bounded, dependency-free (the default)
 
 ```python
-from emboss import FileCache, cached
+from emboss import SqliteCache, cached
 
-cache = FileCache(".data/cache")
+cache = SqliteCache(".data/cache", size_limit=2**30)  # 1 GiB, LRU-evicted
 
 @cached(cache)
 def expensive(x: int) -> dict:
     ...
 ```
 
-`diskcache` stores entries in SQLite, and SQLite over NFS has broken file-locking — two cluster nodes hitting the same `.data/cache` mount on VAST get `sqlite3.OperationalError: locking protocol`. `FileCache` writes one file per key via `tempfile + os.replace` (atomic rename, NFS-safe), with `(key, value)` pickled. Concurrent writers race on the same file path but POSIX rename is atomic and the winning version is by construction equally correct (cache values are pure functions of the key).
+One SQLite DB; `size_limit` bytes (default 1 GiB) with eviction, plus optional per-entry TTL (`cache.set(key, value, expire=3600)`) and an `expire()` sweep. Stdlib only — this is what replaced the `diskcache` dependency.
 
-Drop-in for the subset of `diskcache.Cache` API `@cached` uses (`get`, `set`, `__contains__`, `__getitem__`, `__setitem__`, `__delitem__`, `delete`, `clear`, `close`, context-manager). Extra diskcache kwargs (`timeout`, `size_limit`, `eviction_policy`) are accepted and ignored so call sites switch with no code changes.
+**Eviction policy** (`eviction_policy=`): `least-recently-stored` (default) orders victims by store time and needs **no write on read**; `least-recently-used` refreshes recency on read but, when reads land > 60 s apart, each read becomes a write transaction — benchmarks at **~8–9× slower reads** in that worst case (≈ equal to LRS in steady state, where a 60 s throttle suppresses the rewrites). Default to LRS unless you specifically need recency-aware eviction.
+
+### `FanoutCache` — sharded for write concurrency
+
+```python
+from emboss import FanoutCache, cached
+
+cache = FanoutCache(".data/cache", shards=8)  # 8 independent SQLite DBs
+
+@cached(cache)
+def expensive(x: int) -> dict:
+    ...
+```
+
+A single SQLite DB serialises writers on one lock. `FanoutCache` spreads entries across `shards` independent `SqliteCache` databases (each with its own lock), so writes to different keys mostly proceed in parallel — useful for a process pool or async fleet hammering one cache. Routing uses a **stable** md5 hash of the key (not Python's salted `hash()`), so every process/node agrees on the shard. `size_limit` is split evenly across shards; `len()`/`volume()`/`clear()`/iteration aggregate.
+
+### `FileCache` — NFS-safe / replication-safe
+
+```python
+from emboss import FileCache, cached
+
+cache = FileCache(".data/cache")                     # unbounded
+cache = FileCache(".data/cache", size_limit=2**30)   # bounded + LRU
+
+@cached(cache)
+def expensive(x: int) -> dict:
+    ...
+```
+
+A single-file cache can't be shared across hosts: SQLite file-locking breaks over NFS — two nodes on the same VAST mount get `sqlite3.OperationalError: locking protocol` — and one growing DB can't be replicated by a file syncer (Syncthing, rsync) without torn-read corruption. `FileCache` writes one file per key via `tempfile + os.replace` (atomic, NFS-safe), so each entry is independent and syncs cleanly. The cost is one inode per key; for a bounded *local* cache prefer `SqliteCache`.
+
+`size_limit` (bytes) is optional — `None` (default) is unbounded; when set, least-recently-used entries (by file mtime, bumped on read) are evicted past the limit. Eviction is a full-directory scan (best-effort, amortized), and across a syncing fleet it's per-node with deletions propagating.
+
+### `LogCache` — replication-safe with few inodes
+
+```python
+from emboss import LogCache, cached
+
+cache = LogCache(".data/cache")  # writer_id defaults to the hostname
+
+@cached(cache)
+def expensive(x: int) -> dict:
+    ...
+```
+
+`FileCache` is sync-safe but writes **one file per key** — millions of inodes for a big cache, and slow `du`/`rsync`/Syncthing scans. The naive fix (bundle keys into one file per prefix) makes sync *worse*: two nodes rewriting the same bundle means a syncer's last-write-wins drops a whole node's chunk of entries.
+
+`LogCache` gets few inodes **and** conflict-free sync by giving every writer its own files. Entries are sharded into 256 prefixes; within each, a node appends to `directory/<prefix>/<writer_id>.log`. Because **no file is ever written by two nodes**, a syncer just ships each node's logs around — last-write-wins never fires, so a conflict can't lose data. Reads merge a prefix's logs (cached in memory; rebuilt when a peer's log grows); deletes append tombstones; compaction (auto past `max_log_bytes`, or `compact()`) rewrites *this node's own* log dropping dead records. Same-node processes are serialised by a per-writer lock file.
+
+In the benchmark, **20,000 entries used 512 files (vs `FileCache`'s 20,000)** — the inode count is capped at #prefixes × #writers, independent of entry count. Reads are an in-memory index lookup: with the default `index_ttl=1.0s` (which throttles the freshness re-`stat` for peers' appends) LogCache benches as the **fastest backend (~380k get/s)**; the trade is up to `index_ttl` of staleness on cross-process/node writes (own writes are immediate, and 1 s is well under Syncthing's latency).
+
+**Large values spill to side files** (`min_file_size`, default 32 KB), keeping the append log small — verified on touchstone's real cache, where a **185 MB** value spilled to a side file and the log stayed at **120 bytes**. Spill files live under the writer's own namespace (so they sync conflict-free) and are removed on overwrite / delete / compaction.
+
+Tunables (`python scripts/bench.py` picked the defaults): `index_ttl` (1.0 s), `prefix_width` (2 → 256 shards; use 3 above ~2M entries), `max_log_bytes` (4 MB), `min_file_size` (32 KB). `writer_id` **must be unique per node** (defaults to the hostname); `prefix_width` must match across writers of a directory.
+
+### Migrating between backends — `transfer`
+
+```python
+from emboss import transfer, SqliteCache, LogCache
+
+transfer(SqliteCache(".old"), LogCache(".new"))   # returns the count copied
+```
+
+`transfer(source, destination, *, clear_source=False)` copies every entry **verbatim** (the stored encoding), so a cache written by `@cached` stays readable by `@cached` on the destination. Use it to switch backends (`diskcache` → `SqliteCache`), re-shard a `FanoutCache`, or consolidate logs. The source must be iterable — every emboss backend (`SqliteCache`, `FanoutCache`, `LogCache`, `FileCache`) and `diskcache.Cache` is. (`FileCache` stores each entry's key alongside its value so keys are recoverable; entries written by older versions held only the value and are skipped.)
+
+All backends implement the `diskcache.Cache` subset `@cached` uses (`get`, `set`, `__contains__`, `__getitem__`, `__setitem__`, `__delitem__`, `delete`, `clear`, `close`, context-manager) and accept-and-ignore extra diskcache kwargs (`timeout`, ...) so call sites switch with no code changes.
 
 ## Async support
 
@@ -200,12 +283,12 @@ Cache hits return a fresh awaitable wrapping the cached value, so the call site 
 
 ## Daily-rolling caches
 
-The `diskcache.Cache` instance you pass is yours to manage. A common pattern for "expire daily" without thinking about it:
+The cache instance you pass is yours to manage. For per-entry expiry use `SqliteCache`'s TTL (`cache.set(key, value, expire=86400)`). For a coarser "fresh every day", point the directory at today's date:
 
 ```python
 from datetime import date
-import diskcache
-cache = diskcache.Cache(f"/tmp/my-cache-{date.today()}")
+from emboss import SqliteCache
+cache = SqliteCache(f"/tmp/my-cache-{date.today()}")
 ```
 
 Each new day → new dir → effectively fresh cache. Old dirs land in `/tmp` and get reaped by the OS.
