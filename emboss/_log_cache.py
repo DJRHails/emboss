@@ -28,11 +28,22 @@ lock file. Inodes are bounded by ~(#prefixes x #writers), not entry count.
   record holds a filename reference instead of the value, keeping the log small
   (so a 100 MB value doesn't balloon the append log). Spill files live under the
   writer's own namespace, so they sync conflict-free too, and are removed on
-  overwrite / delete / compaction.
+  overwrite / delete / compaction / consolidation.
 - **Deletes** append a tombstone.
 - **Compaction** rewrites *this node's own* log (under its lock, atomic rename),
   dropping superseded / tombstoned / expired records and their spill files. It
   never touches a peer's files. Auto-runs past `max_log_bytes`; also `compact()`.
+- **Consolidation / GC** merges *all* writers' logs in a prefix into THIS node's
+  single log, dropping dead records and pruning the now-redundant peer logs (and
+  their spill files) — the missing cross-writer GC. Without it, file count is
+  ~(#prefixes x #writers) and grows forever as nodes come and go (decommissioned
+  hosts, one-shot bulk-import writers, containers that fell back to a random
+  hostname). Sync-safe: it snapshots each peer log's `(size, mtime)` first and
+  re-stats before delete, so a peer/local append that lands DURING consolidation
+  is never deleted (its newer records win on read; the next pass collects it).
+  Foreign spilled values are re-spilled into our namespace byte-for-byte so the
+  result is self-contained. Auto-runs past `max_writers_per_prefix`; also
+  `consolidate()`.
 
 Tunables (defaults chosen via `python scripts/bench.py`):
 - `index_ttl` (1.0 s) — index reuse before re-stat'ing for peers' appends; the
@@ -43,6 +54,9 @@ Tunables (defaults chosen via `python scripts/bench.py`):
   dir then holds 65k+ subdirs — the cliff). Must match across a directory.
 - `min_file_size` (32 KB) — values this big or larger spill to side files.
 - `max_log_bytes` (4 MB) — per-log size that triggers compaction.
+- `max_writers_per_prefix` (8) — distinct logs in a prefix before a write
+  auto-consolidates them into one (bounds inode growth as writers accumulate).
+  `0` disables auto-consolidation (still callable explicitly via `consolidate()`).
 
 Benchmark (local SSD, 512-byte values), order of magnitude:
     set ~10^4 ops/s     get ~10^5 ops/s (index_ttl=1.0; ~10^4/s if index_ttl=0)
@@ -65,7 +79,7 @@ import struct
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Set as AbstractSet
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -75,6 +89,7 @@ _DEFAULT_MAX_LOG_BYTES = 4 * 2**20  # compact a node's per-prefix log past 4 MB
 _DEFAULT_PREFIX_WIDTH = 2  # 2 hex chars -> 256 shard dirs
 _DEFAULT_INDEX_TTL = 1.0  # seconds a per-prefix index is reused before re-stat'ing
 _DEFAULT_MIN_FILE_SIZE = 2**15  # 32 KB — values this big or larger spill to files
+_DEFAULT_MAX_WRITERS_PER_PREFIX = 8  # logs in a prefix before auto-consolidation
 
 
 class _Record(NamedTuple):
@@ -134,6 +149,7 @@ class LogCache:
         prefix_width: int = _DEFAULT_PREFIX_WIDTH,
         index_ttl: float = _DEFAULT_INDEX_TTL,
         min_file_size: int = _DEFAULT_MIN_FILE_SIZE,
+        max_writers_per_prefix: int = _DEFAULT_MAX_WRITERS_PER_PREFIX,
         **_kwargs: Any,
     ) -> None:
         self.directory = Path(directory)
@@ -143,6 +159,7 @@ class LogCache:
         self.prefix_width = prefix_width
         self.index_ttl = index_ttl
         self.min_file_size = min_file_size
+        self.max_writers_per_prefix = max_writers_per_prefix
         self.writer_id = _sanitize(writer_id or socket.gethostname())
         self._lock = threading.Lock()  # serialise this process's threads
         self._index: dict[str, dict[str, _Record]] = {}
@@ -237,7 +254,9 @@ class LogCache:
             and now - self._checked.get(prefix, 0.0) < self.index_ttl
         ):
             return self._index[prefix]
-        self._checked[prefix] = now  # record the freshness check (incl. the first build)
+        self._checked[prefix] = (
+            now  # record the freshness check (incl. the first build)
+        )
         sig = self._current_sig(prefix)
         if prefix in self._index and self._sig.get(prefix) == sig:
             return self._index[prefix]
@@ -312,6 +331,167 @@ class LogCache:
         self._index.pop(prefix, None)  # force rebuild
         self._sig.pop(prefix, None)
 
+    # ── consolidation (cross-writer GC) ────────────────────────────────────────
+
+    def consolidate(self, prefix: str | None = None) -> None:
+        """Merge EVERY writer's log in a prefix into this node's single log,
+        dropping dead/superseded/expired records, then prune the now-redundant
+        peer logs (and their spills) — the cross-writer GC `compact()` lacks.
+
+        Sync-safe: a peer/local append that lands during the merge is detected by
+        a `(size, mtime)` re-stat and left intact (its newer records win on read;
+        the next pass collects it), so a concurrent write is never lost. Foreign
+        spilled values are copied into our namespace byte-for-byte, so the
+        consolidated log is self-contained even after the peers are gone — except
+        a foreign spill not yet on disk (sync lag), whose record is dropped (a
+        cache miss that recomputes) rather than left dangling."""
+        with self._lock:
+            if prefix is not None:
+                self._consolidate_prefix(prefix)
+            else:
+                for pdir in list(self.directory.iterdir()):
+                    if pdir.is_dir():
+                        self._consolidate_prefix(pdir.name)
+
+    def _consolidate_prefix(self, prefix: str) -> None:
+        pdir = self.directory / prefix
+        if not pdir.is_dir():
+            return
+        now = time.time()
+        target = self._log_path(prefix)  # our log — the consolidation destination
+        with self._writer_lock(prefix):  # serialise same-node writes to our log
+            # Snapshot every source log's identity BEFORE the merge. A peer (or a
+            # same-node process holding a different writer_id) may append to its
+            # own log concurrently; we compare this snapshot to a re-stat before
+            # deleting, so a write that lands mid-consolidation is never lost.
+            snapshot: dict[str, tuple[int, int]] = {}
+            for log in pdir.glob("*.log"):
+                with contextlib.suppress(OSError):
+                    st = log.stat()
+                    snapshot[log.name] = (st.st_size, st.st_mtime_ns)
+            keep, own_spills, unread = self._collect_live_across_logs(
+                pdir, snapshot, now
+            )
+            consolidated = self._respill_foreign(prefix, keep)
+            self._write_consolidated(target, consolidated)
+            self._drop_superseded_own_spills(own_spills, consolidated)
+            self._prune_consolidated_sources(pdir, snapshot, target.name, unread)
+        self._index.pop(prefix, None)  # force rebuild
+        self._sig.pop(prefix, None)
+        self._checked.pop(prefix, None)
+
+    def _collect_live_across_logs(
+        self, pdir: Path, sources: dict[str, tuple[int, int]], now: float
+    ) -> tuple[list[_Record], AbstractSet[str], AbstractSet[str]]:
+        """Merge all source logs into the live set: latest `store_time` wins per
+        key (a newer overwrite/tombstone under ANY writer beats an older one).
+        `sorted(sources)` makes the merge order deterministic for tie handling.
+
+        Returns `(keep, own_spills, unread)`: the records to keep, the set of OUR
+        spill refs seen across the sources (so superseded ones can be dropped by
+        reference, mirroring `compact()`, without globbing the spill dir), and the
+        names of source logs that could NOT be fully read — a transient read error
+        must not make a log prunable, or its unmerged records would be lost."""
+        latest: dict[str, _Record] = {}
+        own_spills: set[str] = set()
+        unread: set[str] = set()
+        prefix = pdir.name
+        for name in sorted(sources):
+            try:
+                for rec in _iter_records(pdir / name):
+                    if rec.spill and self._is_own_spill(prefix, rec.spill):
+                        own_spills.add(rec.spill)
+                    cur = latest.get(rec.key)
+                    if cur is None or rec.store_time >= cur.store_time:
+                        latest[rec.key] = rec
+            except OSError:
+                unread.add(name)  # partial read → never prune this source
+        keep = [r for r in latest.values() if self._live(r, now)]
+        if self.size_limit is not None:
+            keep = self._trim_to_limit(keep)
+        keep.sort(key=lambda r: r.store_time)
+        return keep, own_spills, unread
+
+    def _respill_foreign(self, prefix: str, keep: list[_Record]) -> list[_Record]:
+        """Make the kept set self-contained under OUR namespace. A foreign spill
+        (another writer's side file) is copied byte-for-byte into our spill dir
+        and the record repointed; our own spills are kept by reference. The raw
+        bytes are already pickled — copy them verbatim, never unpickle/repickle.
+        A foreign spill missing on disk (sync lag) → drop the record rather than
+        write a dangling reference; it recomputes on next read."""
+        consolidated: list[_Record] = []
+        for rec in keep:
+            if not rec.spill or self._is_own_spill(prefix, rec.spill):
+                consolidated.append(rec)
+                continue
+            try:
+                blob = (self.directory / rec.spill).read_bytes()
+            except OSError:
+                continue  # foreign spill absent → drop, never dangle a spill ref
+            new_rel = self._spill_write(prefix, blob)
+            consolidated.append(rec._replace(spill=new_rel, value=None))
+        return consolidated
+
+    @staticmethod
+    def _write_consolidated(target: Path, consolidated: list[_Record]) -> None:
+        """Write the merged records to our log atomically (fsync + rename). An
+        empty result means nothing live remains → drop our log entirely rather
+        than leave a zero-record file lying around."""
+        if not consolidated:
+            target.unlink(missing_ok=True)
+            return
+        tmp = target.with_name(target.name + ".consolidate.tmp")
+        with open(tmp, "wb") as out:
+            for rec in consolidated:
+                out.write(_frame(rec))
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, target)
+
+    def _drop_superseded_own_spills(
+        self, own_spills: AbstractSet[str], consolidated: list[_Record]
+    ) -> None:
+        """Delete OUR spill files for large values the merge superseded — the
+        consolidate-time analogue of the overwrite cleanup in `set()`. Mirrors
+        `compact()`: only spills that were referenced by a source log (`own_spills`)
+        and are no longer referenced by the consolidated log are removed. Globbing
+        the spill dir instead would also delete an in-flight spill from a concurrent
+        `set()` (written before its record is appended, outside `self._lock`),
+        leaving that imminent record dangling. Peers' spills go with their logs in
+        the prune step."""
+        kept = {r.spill for r in consolidated if r.spill}
+        for rel in own_spills - kept:
+            self._spill_delete(rel)
+
+    def _prune_consolidated_sources(
+        self,
+        pdir: Path,
+        snapshot: dict[str, tuple[int, int]],
+        target_name: str,
+        unread: AbstractSet[str],
+    ) -> None:
+        """Delete each source log (and its spill dir + lock) now fully represented
+        in our consolidated log — but ONLY if it is byte-identical to the snapshot.
+        A changed `(size, mtime)` means it was appended to during the merge: those
+        newer records aren't in our log, so we leave it (they win on read; the
+        next pass folds them in). This is the sync-safety guarantee. A source we
+        could not fully read (`unread`) is likewise kept — its unmerged records
+        aren't in our log, so deleting it would lose them."""
+        for name, (size, mtime) in snapshot.items():
+            if name == target_name or name in unread:
+                continue  # our own log is the destination / a partial read → keep
+            src = pdir / name
+            try:
+                st = src.stat()
+            except OSError:
+                continue  # already gone (e.g. a peer compacted/cleared it)
+            if (st.st_size, st.st_mtime_ns) != (size, mtime):
+                continue  # appended-to mid-consolidation → keep; never lose a write
+            writer = name[:-4]  # strip ".log"
+            src.unlink(missing_ok=True)
+            shutil.rmtree(pdir / f"{writer}.spill", ignore_errors=True)
+            (pdir / f"{writer}.lock").unlink(missing_ok=True)
+
     def _trim_to_limit(self, records: list[_Record]) -> list[_Record]:
         """Best-effort size bound over THIS node's live records for one prefix."""
         assert self.size_limit is not None
@@ -319,7 +499,9 @@ class LogCache:
             return records
         kept: list[_Record] = []
         running = 0
-        for rec in sorted(records, key=lambda r: r.store_time, reverse=True):  # newest first
+        for rec in sorted(
+            records, key=lambda r: r.store_time, reverse=True
+        ):  # newest first
             running += self._rec_size(rec)
             if running > self.size_limit:
                 break
@@ -339,16 +521,22 @@ class LogCache:
             try:
                 return self._spill_read(rec.spill)
             except OSError:
-                return default  # spill not present yet (e.g. log synced before it) -> miss
+                return (
+                    default  # spill not present yet (e.g. log synced before it) -> miss
+                )
         return rec.value
 
-    def set(self, key: Any, value: Any, expire: float | None = None, **_kwargs: Any) -> bool:
+    def set(
+        self, key: Any, value: Any, expire: float | None = None, **_kwargs: Any
+    ) -> bool:
         now = time.time()
         prefix = self._prefix(key)
         expire_time = now + expire if expire else None
         blob = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
         if len(blob) >= self.min_file_size:
-            rec = _Record(str(key), None, expire_time, now, False, self._spill_write(prefix, blob))
+            rec = _Record(
+                str(key), None, expire_time, now, False, self._spill_write(prefix, blob)
+            )
         else:
             rec = _Record(str(key), value, expire_time, now, False, None)
         with self._lock:
@@ -366,6 +554,15 @@ class LogCache:
                 self._spill_delete(old.spill)  # our superseded large value
             if log_size > self.max_log_bytes:
                 self._compact_prefix(prefix)
+            elif self.max_writers_per_prefix and (
+                len(self._sig.get(prefix, {})) > self.max_writers_per_prefix
+            ):
+                # Cheap GC trigger: `self._sig[prefix]` is the per-prefix
+                # `{logname: size}` already maintained for the index, so its
+                # length counts distinct writer logs without a fresh glob on the
+                # hot write path. Past the bound, fold every writer's log into
+                # ours and prune the redundant peers (sync-safe).
+                self._consolidate_prefix(prefix)
         return True
 
     def delete(self, key: Any) -> bool:
