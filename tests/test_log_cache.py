@@ -91,10 +91,21 @@ def test_two_writers_use_separate_files(tmp_path):
 
 
 def test_reader_picks_up_peer_writes(tmp_path):
-    reader = LogCache(tmp_path / "c", writer_id="R")
+    reader = LogCache(tmp_path / "c", writer_id="R", index_ttl=0)  # always re-check
     assert reader.get("k") is None  # builds an (empty) index for the prefix
     LogCache(tmp_path / "c", writer_id="W").set("k", "v")  # a peer appends its log
     assert reader.get("k") == "v"  # reader notices the log grew, rebuilds, finds it
+
+
+def test_index_ttl_defers_peer_visibility(tmp_path):
+    """With index_ttl > 0, a peer's write is visible only after the TTL — the
+    read-speed/staleness trade. Own writes are always immediate."""
+    reader = LogCache(tmp_path / "c", writer_id="R", index_ttl=10.0)
+    assert reader.get("k") is None  # caches the (empty) index for ~10s
+    LogCache(tmp_path / "c", writer_id="W").set("k", "v")
+    assert reader.get("k") is None  # still stale within the TTL
+    reader.index_ttl = 0  # force a re-check
+    assert reader.get("k") == "v"
 
 
 def test_same_key_two_writers_latest_wins(tmp_path):

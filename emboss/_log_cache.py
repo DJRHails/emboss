@@ -35,11 +35,21 @@ an append racing a compaction's atomic rename). Inodes are bounded by
 Use `LogCache` for **many small entries on a shared/synced mount**, where
 `FileCache`'s inode count hurts. For a bounded local cache use `SqliteCache`.
 
-Benchmark (local SSD, `python scripts/bench.py`), order of magnitude:
-    set ~10^3-10^4 ops/s     get ~10^4 ops/s
-(get re-stats the prefix's logs to notice a peer's appends, so it trails
-`SqliteCache`'s indexed read.) The win is inodes: ~256 files for *any* number of
-entries — 20k entries used 512 files here, vs `FileCache`'s 20,000.
+Tunables (defaults chosen via `python scripts/bench.py`):
+- `index_ttl` (1.0 s) — how long a per-prefix index is reused before re-stat'ing
+  the logs for peers' appends. This is the dominant read lever: the throttle
+  lifts reads from ~10^4/s (always-fresh, `index_ttl=0`) to ~10^5/s, at the cost
+  of up to `index_ttl` of staleness on cross-process/node writes (own writes are
+  immediate). 1 s is well under Syncthing's propagation latency.
+- `prefix_width` (2 -> 256 shards) — balances inode count against per-log size;
+  width 1 is fewest inodes, width 3 over-shards (8k files). Must match across all
+  writers/readers of a directory.
+- `max_log_bytes` (4 MB) — per-log size that triggers compaction.
+
+Benchmark (local SSD, 512-byte values), order of magnitude:
+    set ~10^4 ops/s     get ~10^5 ops/s (index_ttl=1.0; ~10^4/s if index_ttl=0)
+The headline win is inodes: ~256 files for *any* number of entries — 20k entries
+used 512 files here, vs `FileCache`'s 20,000.
 
 `writer_id` defaults to the hostname and **must be unique per node** (override it
 if two nodes could share a hostname). Implements the `Cache` protocol subset
@@ -64,7 +74,8 @@ from typing import Any, NamedTuple
 _MISSING = object()
 _HEADER = struct.Struct(">I")  # 4-byte big-endian record length
 _DEFAULT_MAX_LOG_BYTES = 4 * 2**20  # compact a node's per-prefix log past 4 MB
-_PREFIX_WIDTH = 2  # 2 hex chars -> 256 shard dirs
+_DEFAULT_PREFIX_WIDTH = 2  # 2 hex chars -> 256 shard dirs
+_DEFAULT_INDEX_TTL = 1.0  # seconds a per-prefix index is reused before re-stat'ing
 
 
 class _Record(NamedTuple):
@@ -120,23 +131,34 @@ class LogCache:
         size_limit: int | None = None,
         writer_id: str | None = None,
         max_log_bytes: int = _DEFAULT_MAX_LOG_BYTES,
+        prefix_width: int = _DEFAULT_PREFIX_WIDTH,
+        index_ttl: float = _DEFAULT_INDEX_TTL,
         **_kwargs: Any,
     ) -> None:
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.size_limit = size_limit
         self.max_log_bytes = max_log_bytes
+        # prefix_width fixes the shard layout; it MUST be the same for every
+        # writer/reader of a directory (a key's prefix is derived from it).
+        self.prefix_width = prefix_width
+        # How long a per-prefix index may be reused before re-checking the logs
+        # on disk for a peer's appends. 0 = always fresh (every get re-stats);
+        # higher = faster reads at the cost of up to `index_ttl`s of staleness on
+        # cross-process/node writes (own writes are always visible immediately).
+        self.index_ttl = index_ttl
         self.writer_id = _sanitize(writer_id or socket.gethostname())
         self._lock = threading.Lock()  # serialise this process's threads
         # Per-prefix: {prefix: {key: _Record}} + the per-log sizes the index was
         # built from, so we rebuild only when a log changed (incl. a peer's).
         self._index: dict[str, dict[str, _Record]] = {}
         self._sig: dict[str, dict[str, int]] = {}
+        self._checked: dict[str, float] = {}  # monotonic time of last freshness check
 
     # ── layout ────────────────────────────────────────────────────────────────
 
     def _prefix(self, key: Any) -> str:
-        return hashlib.md5(str(key).encode()).hexdigest()[:_PREFIX_WIDTH]
+        return hashlib.md5(str(key).encode()).hexdigest()[: self.prefix_width]
 
     def _log_path(self, prefix: str) -> Path:
         return self.directory / prefix / f"{self.writer_id}.log"
@@ -176,6 +198,17 @@ class LogCache:
         return sig
 
     def _ensure_index(self, prefix: str) -> dict[str, _Record]:
+        # Throttle the on-disk freshness check: within index_ttl of the last
+        # check, reuse the in-memory index (own writes are applied to it directly,
+        # so only a peer's writes can be missed — for up to index_ttl).
+        now = time.monotonic()
+        if (
+            prefix in self._index
+            and self.index_ttl > 0
+            and now - self._checked.get(prefix, 0.0) < self.index_ttl
+        ):
+            return self._index[prefix]
+        self._checked[prefix] = now  # record the freshness check (incl. the first build)
         sig = self._current_sig(prefix)
         if prefix in self._index and self._sig.get(prefix) == sig:
             return self._index[prefix]

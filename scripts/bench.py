@@ -86,6 +86,42 @@ def _bench_policy(policy: str, stale: bool) -> float:
     return 5000 / dt
 
 
+def _tune_logcache() -> None:
+    """Simple sweep over LogCache's tunables to pick sane defaults."""
+    value = b"x" * 512
+    n = 5000
+    keys = [f"key-{random.randrange(n):05d}" for _ in range(5000)]
+
+    print("\n[LogCache index_ttl -> get throughput (read freshness throttle)]")
+    for ttl in (0.0, 0.5, 1.0):
+        c = LogCache(tempfile.mkdtemp(prefix="emboss-bench-"), writer_id="b", index_ttl=ttl)
+        for i in range(n):
+            c.set(f"key-{i:05d}", value)
+        t0 = time.perf_counter()
+        for k in keys:
+            c.get(k)
+        print(f"  index_ttl={ttl:<4} get {len(keys) / (time.perf_counter() - t0):>9,.0f}/s")
+
+    print("\n[LogCache prefix_width -> set/get/inodes (20000 tiny entries)]")
+    for width in (1, 2, 3):
+        d = Path(tempfile.mkdtemp(prefix="emboss-bench-"))
+        c = LogCache(str(d), writer_id="b", prefix_width=width)
+        t0 = time.perf_counter()
+        for i in range(20000):
+            c.set(f"key-{i:06d}", b"x" * 64)
+        sets = 20000 / (time.perf_counter() - t0)
+        files = sum(1 for _ in d.rglob("*") if _.is_file())
+        print(f"  prefix_width={width} ({16**width:>4} shards)  set {sets:>8,.0f}/s   files {files:>5}")
+
+    print("\n[LogCache max_log_bytes -> set throughput (overwrite-heavy: 5000x one key)]")
+    for mlb in (2**20, 4 * 2**20, 16 * 2**20):
+        c = LogCache(tempfile.mkdtemp(prefix="emboss-bench-"), writer_id="b", max_log_bytes=mlb)
+        t0 = time.perf_counter()
+        for _ in range(5000):
+            c.set("hot", b"x" * 512)
+        print(f"  max_log_bytes={mlb // 2**20:>2}MB  set {5000 / (time.perf_counter() - t0):>9,.0f}/s")
+
+
 def main() -> None:
     for label, size, n in DOMAINS:
         print(f"\n[{label}]")
@@ -97,6 +133,7 @@ def main() -> None:
     print(f"  least-recently-stored          get {_bench_policy('least-recently-stored', False):>9,.0f}/s")
     print(f"  least-recently-used (warm)     get {_bench_policy('least-recently-used', False):>9,.0f}/s")
     print(f"  least-recently-used (rewrites) get {_bench_policy('least-recently-used', True):>9,.0f}/s")
+    _tune_logcache()
 
 
 if __name__ == "__main__":

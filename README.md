@@ -185,6 +185,7 @@ Throughput (local SSD, 512-byte values, order of magnitude — `python scripts/b
 |---|---|---|
 | `SqliteCache` | ~10⁴/s | ~10⁵/s |
 | `FileCache` | ~10⁴/s | ~10⁴/s |
+| `LogCache` | ~10⁴/s | ~10⁵/s (warm index) |
 
 `SqliteCache` is multi-process-safe (SQLite `busy_timeout` + `BEGIN IMMEDIATE` + a "database is locked" retry), keeps `size`/`count` accurate via DB triggers (so `size_limit` holds across processes and `len()`/`volume()` are O(1)), spills values ≥ 32 KB to side files to keep the DB small, and runs `auto_vacuum=FULL` so the DB shrinks as entries are evicted.
 
@@ -251,7 +252,7 @@ def expensive(x: int) -> dict:
 
 `LogCache` gets few inodes **and** conflict-free sync by giving every writer its own files. Entries are sharded into 256 prefixes; within each, a node appends to `directory/<prefix>/<writer_id>.log`. Because **no file is ever written by two nodes**, a syncer just ships each node's logs around — last-write-wins never fires, so a conflict can't lose data. Reads merge a prefix's logs (cached in memory; rebuilt when a peer's log grows); deletes append tombstones; compaction (auto past `max_log_bytes`, or `compact()`) rewrites *this node's own* log dropping dead records. Same-node processes are serialised by a per-writer lock file.
 
-In the benchmark, **20,000 entries used 512 files (vs `FileCache`'s 20,000)** — the inode count is capped at #prefixes × #writers, independent of entry count. The trade is slower reads (~10⁴/s; a per-get `stat` to notice peers' appends) and eventual cross-node consistency. `writer_id` **must be unique per node** (defaults to the hostname).
+In the benchmark, **20,000 entries used 512 files (vs `FileCache`'s 20,000)** — the inode count is capped at #prefixes × #writers, independent of entry count. Reads are an in-memory index lookup: with the default `index_ttl=1.0s` (which throttles the freshness re-`stat` for peers' appends) LogCache benches as the **fastest backend (~380k get/s)**; the trade is up to `index_ttl` of staleness on cross-process/node writes (own writes are immediate, and 1 s is well under Syncthing's latency). Tunables (`python scripts/bench.py` picked the defaults): `index_ttl` (1.0 s), `prefix_width` (2 → 256 shards), `max_log_bytes` (4 MB). `writer_id` **must be unique per node** (defaults to the hostname); `prefix_width` must match across writers of a directory.
 
 ### Migrating between backends — `transfer`
 
