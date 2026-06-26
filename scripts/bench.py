@@ -39,6 +39,24 @@ def _bench(make_cache, name: str) -> None:
         close()
 
 
+def _bench_policy_reads(policy: str, stale: bool) -> float:
+    """get throughput for a SqliteCache eviction policy. `stale=True` ages every
+    entry past the LRU access-time resolution so each get triggers a rewrite —
+    the worst case for least-recently-used reads."""
+    d = tempfile.mkdtemp(prefix="emboss-bench-")
+    cache = SqliteCache(d, size_limit=None, eviction_policy=policy)
+    for i in range(N_SET):
+        cache.set(f"key-{i:05d}", VALUE)
+    if stale:
+        cache._conn.execute("UPDATE Cache SET access_time = 0")
+    t0 = time.perf_counter()
+    for k in GET_KEYS:
+        cache.get(k)
+    get_s = time.perf_counter() - t0
+    cache.close()
+    return N_GET / get_s
+
+
 def main() -> None:
     print(f"[backend throughput, {len(VALUE)}-byte values, local disk]")
     _bench(lambda d: SqliteCache(d), "SqliteCache")
@@ -49,6 +67,11 @@ def main() -> None:
         _bench(lambda d: diskcache.Cache(d), "diskcache (optional)")
     except ImportError:
         print("  diskcache             not installed (pip install emboss[diskcache])")
+
+    print("\n[SqliteCache eviction-policy read throughput]")
+    print(f"  least-recently-stored          get {_bench_policy_reads('least-recently-stored', False):>9,.0f}/s")
+    print(f"  least-recently-used (warm)     get {_bench_policy_reads('least-recently-used', False):>9,.0f}/s")
+    print(f"  least-recently-used (rewrites) get {_bench_policy_reads('least-recently-used', True):>9,.0f}/s")
 
 
 if __name__ == "__main__":

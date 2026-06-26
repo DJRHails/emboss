@@ -86,34 +86,49 @@ def test_expire_ttl(cache):
     assert "k" not in cache
 
 
-def test_size_limit_evicts_lru(tmp_path):
+def test_size_limit_bounds_total(tmp_path):
     val = "x" * 10_000  # ~10 KB pickled
     c = SqliteCache(tmp_path / "cache", size_limit=30_000)
     for i in range(20):
         c.set(f"key{i:02d}", val)
-    total = c._conn.execute("SELECT COALESCE(SUM(size), 0) FROM cache").fetchone()[0]
-    assert total <= 30_000  # bounded
-    n = c._conn.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
-    assert n < 20  # some evicted
-    assert c.get("key19") == val  # the most-recent survives
+    assert c.volume() <= 30_000  # bounded (trigger-maintained size)
+    assert len(c) < 20  # some evicted
+    assert c.get("key19") == val  # the most-recently-stored survives
+    c.close()
+
+
+def test_least_recently_stored_evicts_oldest(tmp_path):
+    """Default policy evicts the oldest-stored entries first."""
+    val = "x" * 10_000
+    c = SqliteCache(tmp_path / "cache", size_limit=25_000)  # ~2 fit
+    c.set("first", val)
+    c.set("second", val)
+    c.set("third", val)  # over cap -> evicts 'first' (oldest store_time)
+    assert c.get("first") is None
+    assert c.get("second") == val
+    assert c.get("third") == val
     c.close()
 
 
 def test_lru_keeps_recently_read(tmp_path):
-    """A read refreshes recency, protecting an entry from eviction."""
+    """least-recently-used: a read refreshes recency, protecting from eviction."""
     val = "x" * 10_000
-    c = SqliteCache(tmp_path / "cache", size_limit=25_000)
-    # age 'a' and 'b' into the past so 'a' is the oldest
+    c = SqliteCache(tmp_path / "cache", size_limit=25_000, eviction_policy="least-recently-used")
     c.set("a", val)
-    c._conn.execute("UPDATE cache SET atime=100 WHERE key='a'")
+    c._conn.execute("UPDATE Cache SET access_time = 100 WHERE key = 'a'")
     c.set("b", val)
-    c._conn.execute("UPDATE cache SET atime=200 WHERE key='b'")
-    c.get("a")  # refresh 'a' -> now most recent (atime bump bypasses resolution: 0 -> now)
-    c.set("c", val)  # over the cap -> evicts the LRU, which is now 'b'
+    c._conn.execute("UPDATE Cache SET access_time = 200 WHERE key = 'b'")
+    c.get("a")  # refresh 'a' (stale >60s -> access_time bumped to now)
+    c.set("c", val)  # over cap -> evicts the LRU, now 'b'
     assert c.get("b") is None
     assert c.get("a") == val
     assert c.get("c") == val
     c.close()
+
+
+def test_invalid_eviction_policy_raises(tmp_path):
+    with pytest.raises(ValueError, match="eviction_policy"):
+        SqliteCache(tmp_path / "cache", eviction_policy="nonsense")
 
 
 def test_unbounded_when_size_limit_none(tmp_path):
@@ -130,6 +145,100 @@ def test_diskcache_kwargs_ignored(tmp_path):
     c.set("k", "v")
     assert c.get("k") == "v"
     c.close()
+
+
+def test_size_and_count_triggers_stay_accurate(tmp_path):
+    c = SqliteCache(tmp_path / "cache", size_limit=None)
+    c.set("a", b"x" * 100)
+    c.set("b", b"y" * 200)
+    assert len(c) == 2
+    v = c.volume()
+    assert v > 300  # pickled sizes, both counted
+    c.set("a", b"x" * 1000)  # overwrite -> size adjusts, count unchanged
+    assert len(c) == 2
+    assert c.volume() > v
+    c.delete("b")
+    assert len(c) == 1
+    c.close()
+
+
+def test_large_values_spill_to_files(tmp_path):
+    root = tmp_path / "cache"
+    c = SqliteCache(root, min_file_size=100)
+    c.set("small", "x" * 10)  # stays inline
+    c.set("big", "y" * 5000)  # spills to a file
+    spill_files = list((root / "store").glob("**/*")) if (root / "store").exists() else []
+    spill_files = [p for p in spill_files if p.is_file()]
+    assert len(spill_files) == 1
+    assert c.get("big") == "y" * 5000  # read back from file
+    assert c.get("small") == "x" * 10
+    c.close()
+
+
+def test_spill_file_removed_on_overwrite_and_delete(tmp_path):
+    root = tmp_path / "cache"
+    c = SqliteCache(root, min_file_size=100)
+    c.set("k", "a" * 5000)
+
+    def files():
+        return [p for p in (root / "store").glob("**/*") if p.is_file()]
+
+    assert len(files()) == 1
+    c.set("k", "b" * 5000)  # overwrite -> old spill file removed, one remains
+    assert len(files()) == 1
+    assert c.get("k") == "b" * 5000
+    c.delete("k")  # delete -> spill file removed
+    assert files() == []
+    c.close()
+
+
+def test_expire_sweep(tmp_path):
+    c = SqliteCache(tmp_path / "cache")
+    c.set("keep", "v")
+    c.set("gone", "v", expire=0.01)
+    time.sleep(0.03)
+    assert c.expire() == 1  # swept one expired entry
+    assert len(c) == 1
+    assert c.get("keep") == "v"
+    c.close()
+
+
+def test_iteration_and_len(tmp_path):
+    c = SqliteCache(tmp_path / "cache")
+    for k in ("a", "b", "c"):
+        c.set(k, k)
+    assert len(c) == 3
+    assert sorted(c) == ["a", "b", "c"]  # __iter__ yields keys
+    assert list(c.iterkeys()) == ["a", "b", "c"]  # store-time order
+    c.close()
+
+
+def test_concurrent_writers_share_db_safely(tmp_path):
+    """Multiple connections (≈ multiple processes) writing the same DB must not
+    raise 'database is locked' and must agree on the shared count/size."""
+    import threading
+
+    root = tmp_path / "cache"
+    errors: list[Exception] = []
+
+    def worker(wid: int) -> None:
+        try:
+            c = SqliteCache(root, size_limit=None)
+            for i in range(50):
+                c.set(f"w{wid}-k{i}", i)
+            c.close()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(w,)) for w in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    final = SqliteCache(root, size_limit=None)
+    assert len(final) == 4 * 50  # trigger-maintained count is correct across writers
+    final.close()
 
 
 def test_works_with_cached_decorator(tmp_path):

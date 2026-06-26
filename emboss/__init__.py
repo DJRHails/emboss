@@ -37,6 +37,7 @@ See README.md for the full feature list.
 from importlib.metadata import PackageNotFoundError, version
 
 from emboss._cached import cache_id, cached, safe_jsonable_encoder
+from emboss._fanout_cache import FanoutCache
 from emboss._file_cache import FileCache
 from emboss._protocol import Cache
 from emboss._sqlite_cache import SqliteCache
@@ -50,6 +51,7 @@ except PackageNotFoundError:  # running from a source tree that isn't installed
     __version__ = "0+unknown"
 __all__ = [
     "Cache",
+    "FanoutCache",
     "FileCache",
     "SqliteCache",
     "cache_id",

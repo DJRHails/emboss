@@ -169,11 +169,12 @@ class Cache(Protocol):
     def set(self, key: str, value: Any) -> Any: ...
 ```
 
-emboss ships two dependency-free backends; `diskcache.Cache` still works if you `pip install emboss[diskcache]`.
+emboss ships three dependency-free backends; `diskcache.Cache` still works if you `pip install emboss[diskcache]`.
 
 | backend | storage | bounded? | shared across hosts? | use when |
 |---|---|---|---|---|
-| `SqliteCache` *(default)* | one SQLite file | ✅ `size_limit` + LRU + TTL | ❌ SQLite locking breaks on NFS | a bounded **local** cache |
+| `SqliteCache` *(default)* | one SQLite DB | ✅ `size_limit` + eviction + TTL | ❌ SQLite locking breaks on NFS | a bounded **local** cache (multi-process-safe) |
+| `FanoutCache` | N sharded SQLite DBs | ✅ | ❌ | a local cache under **heavy concurrent writes** |
 | `FileCache` | one file per key | ✅ optional `size_limit` + LRU | ✅ atomic rename, syncable | a cache on a **network mount / replicated** across machines |
 | `diskcache.Cache` | SQLite (+ tags, stats) | ✅ | ❌ | you want diskcache's richer feature set |
 
@@ -183,6 +184,8 @@ Throughput (local SSD, 512-byte values, order of magnitude — `python scripts/b
 |---|---|---|
 | `SqliteCache` | ~10⁴/s | ~10⁵/s |
 | `FileCache` | ~10⁴/s | ~10⁴/s |
+
+`SqliteCache` is multi-process-safe (SQLite `busy_timeout` + `BEGIN IMMEDIATE` + a "database is locked" retry), keeps `size`/`count` accurate via DB triggers (so `size_limit` holds across processes and `len()`/`volume()` are O(1)), spills values ≥ 32 KB to side files to keep the DB small, and runs `auto_vacuum=FULL` so the DB shrinks as entries are evicted.
 
 ### `SqliteCache` — bounded, dependency-free (the default)
 
@@ -196,7 +199,23 @@ def expensive(x: int) -> dict:
     ...
 ```
 
-One SQLite file; `size_limit` bytes (default 1 GiB) with least-recently-used eviction, plus optional per-entry TTL (`cache.set(key, value, expire=3600)`). Stdlib only — this is what replaced the `diskcache` dependency.
+One SQLite DB; `size_limit` bytes (default 1 GiB) with eviction, plus optional per-entry TTL (`cache.set(key, value, expire=3600)`) and an `expire()` sweep. Stdlib only — this is what replaced the `diskcache` dependency.
+
+**Eviction policy** (`eviction_policy=`): `least-recently-stored` (default) orders victims by store time and needs **no write on read**; `least-recently-used` refreshes recency on read but, when reads land > 60 s apart, each read becomes a write transaction — benchmarks at **~8–9× slower reads** in that worst case (≈ equal to LRS in steady state, where a 60 s throttle suppresses the rewrites). Default to LRS unless you specifically need recency-aware eviction.
+
+### `FanoutCache` — sharded for write concurrency
+
+```python
+from emboss import FanoutCache, cached
+
+cache = FanoutCache(".data/cache", shards=8)  # 8 independent SQLite DBs
+
+@cached(cache)
+def expensive(x: int) -> dict:
+    ...
+```
+
+A single SQLite DB serialises writers on one lock. `FanoutCache` spreads entries across `shards` independent `SqliteCache` databases (each with its own lock), so writes to different keys mostly proceed in parallel — useful for a process pool or async fleet hammering one cache. Routing uses a **stable** md5 hash of the key (not Python's salted `hash()`), so every process/node agrees on the shard. `size_limit` is split evenly across shards; `len()`/`volume()`/`clear()`/iteration aggregate.
 
 ### `FileCache` — NFS-safe / replication-safe
 
