@@ -28,7 +28,7 @@ lock file. Inodes are bounded by ~(#prefixes x #writers), not entry count.
   record holds a filename reference instead of the value, keeping the log small
   (so a 100 MB value doesn't balloon the append log). Spill files live under the
   writer's own namespace, so they sync conflict-free too, and are removed on
-  overwrite / delete / compaction.
+  overwrite / delete / compaction / consolidation.
 - **Deletes** append a tombstone.
 - **Compaction** rewrites *this node's own* log (under its lock, atomic rename),
   dropping superseded / tombstoned / expired records and their spill files. It
@@ -79,7 +79,7 @@ import struct
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Set as AbstractSet
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -254,7 +254,9 @@ class LogCache:
             and now - self._checked.get(prefix, 0.0) < self.index_ttl
         ):
             return self._index[prefix]
-        self._checked[prefix] = now  # record the freshness check (incl. the first build)
+        self._checked[prefix] = (
+            now  # record the freshness check (incl. the first build)
+        )
         sig = self._current_sig(prefix)
         if prefix in self._index and self._sig.get(prefix) == sig:
             return self._index[prefix]
@@ -340,7 +342,9 @@ class LogCache:
         a `(size, mtime)` re-stat and left intact (its newer records win on read;
         the next pass collects it), so a concurrent write is never lost. Foreign
         spilled values are copied into our namespace byte-for-byte, so the
-        consolidated log is self-contained even after the peers are gone."""
+        consolidated log is self-contained even after the peers are gone — except
+        a foreign spill not yet on disk (sync lag), whose record is dropped (a
+        cache miss that recomputes) rather than left dangling."""
         with self._lock:
             if prefix is not None:
                 self._consolidate_prefix(prefix)
@@ -365,33 +369,48 @@ class LogCache:
                 with contextlib.suppress(OSError):
                     st = log.stat()
                     snapshot[log.name] = (st.st_size, st.st_mtime_ns)
-            keep = self._collect_live_across_logs(pdir, snapshot, now)
+            keep, own_spills, unread = self._collect_live_across_logs(
+                pdir, snapshot, now
+            )
             consolidated = self._respill_foreign(prefix, keep)
             self._write_consolidated(target, consolidated)
-            self._drop_own_orphan_spills(prefix, pdir, consolidated)
-            self._prune_consolidated_sources(pdir, snapshot, target.name)
+            self._drop_superseded_own_spills(own_spills, consolidated)
+            self._prune_consolidated_sources(pdir, snapshot, target.name, unread)
         self._index.pop(prefix, None)  # force rebuild
         self._sig.pop(prefix, None)
         self._checked.pop(prefix, None)
 
     def _collect_live_across_logs(
         self, pdir: Path, sources: dict[str, tuple[int, int]], now: float
-    ) -> list[_Record]:
+    ) -> tuple[list[_Record], AbstractSet[str], AbstractSet[str]]:
         """Merge all source logs into the live set: latest `store_time` wins per
         key (a newer overwrite/tombstone under ANY writer beats an older one).
-        `sorted(sources)` makes the merge order deterministic for tie handling."""
+        `sorted(sources)` makes the merge order deterministic for tie handling.
+
+        Returns `(keep, own_spills, unread)`: the records to keep, the set of OUR
+        spill refs seen across the sources (so superseded ones can be dropped by
+        reference, mirroring `compact()`, without globbing the spill dir), and the
+        names of source logs that could NOT be fully read — a transient read error
+        must not make a log prunable, or its unmerged records would be lost."""
         latest: dict[str, _Record] = {}
+        own_spills: set[str] = set()
+        unread: set[str] = set()
+        prefix = pdir.name
         for name in sorted(sources):
-            with contextlib.suppress(OSError):
+            try:
                 for rec in _iter_records(pdir / name):
+                    if rec.spill and self._is_own_spill(prefix, rec.spill):
+                        own_spills.add(rec.spill)
                     cur = latest.get(rec.key)
                     if cur is None or rec.store_time >= cur.store_time:
                         latest[rec.key] = rec
+            except OSError:
+                unread.add(name)  # partial read → never prune this source
         keep = [r for r in latest.values() if self._live(r, now)]
         if self.size_limit is not None:
             keep = self._trim_to_limit(keep)
         keep.sort(key=lambda r: r.store_time)
-        return keep
+        return keep, own_spills, unread
 
     def _respill_foreign(self, prefix: str, keep: list[_Record]) -> list[_Record]:
         """Make the kept set self-contained under OUR namespace. A foreign spill
@@ -429,33 +448,38 @@ class LogCache:
             os.fsync(out.fileno())
         os.replace(tmp, target)
 
-    def _drop_own_orphan_spills(
-        self, prefix: str, pdir: Path, consolidated: list[_Record]
+    def _drop_superseded_own_spills(
+        self, own_spills: AbstractSet[str], consolidated: list[_Record]
     ) -> None:
-        """Delete our spill files no longer referenced by the consolidated log
-        (superseded large values, plus any foreign spill we just re-spilled then
-        dropped). Only ever touches OUR spill dir — peers' spills go with their
-        logs in the prune step."""
-        kept_spills = {r.spill for r in consolidated if r.spill}
-        own_spill_dir = pdir / f"{self.writer_id}.spill"
-        if not own_spill_dir.is_dir():
-            return
-        for val in own_spill_dir.glob("*.val"):
-            rel = f"{prefix}/{self.writer_id}.spill/{val.name}"
-            if rel not in kept_spills:
-                self._spill_delete(rel)
+        """Delete OUR spill files for large values the merge superseded — the
+        consolidate-time analogue of the overwrite cleanup in `set()`. Mirrors
+        `compact()`: only spills that were referenced by a source log (`own_spills`)
+        and are no longer referenced by the consolidated log are removed. Globbing
+        the spill dir instead would also delete an in-flight spill from a concurrent
+        `set()` (written before its record is appended, outside `self._lock`),
+        leaving that imminent record dangling. Peers' spills go with their logs in
+        the prune step."""
+        kept = {r.spill for r in consolidated if r.spill}
+        for rel in own_spills - kept:
+            self._spill_delete(rel)
 
     def _prune_consolidated_sources(
-        self, pdir: Path, snapshot: dict[str, tuple[int, int]], target_name: str
+        self,
+        pdir: Path,
+        snapshot: dict[str, tuple[int, int]],
+        target_name: str,
+        unread: AbstractSet[str],
     ) -> None:
         """Delete each source log (and its spill dir + lock) now fully represented
         in our consolidated log — but ONLY if it is byte-identical to the snapshot.
         A changed `(size, mtime)` means it was appended to during the merge: those
         newer records aren't in our log, so we leave it (they win on read; the
-        next pass folds them in). This is the sync-safety guarantee."""
+        next pass folds them in). This is the sync-safety guarantee. A source we
+        could not fully read (`unread`) is likewise kept — its unmerged records
+        aren't in our log, so deleting it would lose them."""
         for name, (size, mtime) in snapshot.items():
-            if name == target_name:
-                continue  # our own log is the destination, never a prune target
+            if name == target_name or name in unread:
+                continue  # our own log is the destination / a partial read → keep
             src = pdir / name
             try:
                 st = src.stat()
@@ -475,7 +499,9 @@ class LogCache:
             return records
         kept: list[_Record] = []
         running = 0
-        for rec in sorted(records, key=lambda r: r.store_time, reverse=True):  # newest first
+        for rec in sorted(
+            records, key=lambda r: r.store_time, reverse=True
+        ):  # newest first
             running += self._rec_size(rec)
             if running > self.size_limit:
                 break
@@ -495,16 +521,22 @@ class LogCache:
             try:
                 return self._spill_read(rec.spill)
             except OSError:
-                return default  # spill not present yet (e.g. log synced before it) -> miss
+                return (
+                    default  # spill not present yet (e.g. log synced before it) -> miss
+                )
         return rec.value
 
-    def set(self, key: Any, value: Any, expire: float | None = None, **_kwargs: Any) -> bool:
+    def set(
+        self, key: Any, value: Any, expire: float | None = None, **_kwargs: Any
+    ) -> bool:
         now = time.time()
         prefix = self._prefix(key)
         expire_time = now + expire if expire else None
         blob = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
         if len(blob) >= self.min_file_size:
-            rec = _Record(str(key), None, expire_time, now, False, self._spill_write(prefix, blob))
+            rec = _Record(
+                str(key), None, expire_time, now, False, self._spill_write(prefix, blob)
+            )
         else:
             rec = _Record(str(key), value, expire_time, now, False, None)
         with self._lock:

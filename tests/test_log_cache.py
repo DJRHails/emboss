@@ -148,7 +148,9 @@ def test_compaction_shrinks_and_keeps_latest(tmp_path):
 def test_auto_compaction_on_large_log(tmp_path):
     c = LogCache(tmp_path / "c", writer_id="A", max_log_bytes=2000)
     for i in range(500):
-        c.set("k", "x" * 50)  # repeatedly overwrite -> log would grow without compaction
+        c.set(
+            "k", "x" * 50
+        )  # repeatedly overwrite -> log would grow without compaction
     log = c._log_path(c._prefix("k"))
     assert log.stat().st_size < 10_000  # auto-compaction kept it small
     assert c.get("k") == "x" * 50
@@ -313,12 +315,14 @@ def test_consolidate_keeps_changed_peer_log(tmp_path):
     # peer append lands AFTER the snapshot was taken but BEFORE the prune runs.
     real_prune = LogCache._prune_consolidated_sources
 
-    def append_then_prune(self, pdir, snapshot, target_name):
+    def append_then_prune(self, pdir, snapshot, target_name, unread):
         peer.set(k_p2, 2)  # a concurrent peer append lands mid-consolidation
-        return real_prune(self, pdir, snapshot, target_name)
+        return real_prune(self, pdir, snapshot, target_name, unread)
 
     monkey = LogCache(root, writer_id="A", prefix_width=1)
-    object.__setattr__(monkey, "_prune_consolidated_sources", append_then_prune.__get__(monkey))
+    object.__setattr__(
+        monkey, "_prune_consolidated_sources", append_then_prune.__get__(monkey)
+    )
     monkey.consolidate(prefix)
 
     assert peer_log.exists()  # changed peer log was NOT deleted (no lost write)
@@ -347,7 +351,7 @@ def test_prune_stat_decision_unchanged_vs_changed(tmp_path):
     time.sleep(0.01)
     changed.write_bytes(b"xy")
 
-    gc._prune_consolidated_sources(pdir, snapshot, "GC.log")
+    gc._prune_consolidated_sources(pdir, snapshot, "GC.log", set())
     assert not stable.exists()  # unchanged → fully represented → deleted
     assert changed.exists()  # changed since snapshot → kept (sync-safe)
 
@@ -415,16 +419,124 @@ def test_auto_consolidate_on_writer_count(tmp_path):
     root = tmp_path / "c"
     # 3 peer writers each leave a log in the shared prefix (same key → same prefix)
     for w in ("w0", "w1", "w2"):
-        LogCache(root, writer_id=w, prefix_width=1, max_writers_per_prefix=0).set("k", w)
+        LogCache(root, writer_id=w, prefix_width=1, max_writers_per_prefix=0).set(
+            "k", w
+        )
     prefix = LogCache(root, prefix_width=1)._prefix("k")
     assert len({p.name for p in (root / prefix).glob("*.log")}) == 3
 
     # our writer with a small bound: its set sees 3 peers + itself > 2 → consolidate
-    writer = LogCache(root, writer_id="ME", prefix_width=1, max_writers_per_prefix=2, index_ttl=0)
+    writer = LogCache(
+        root, writer_id="ME", prefix_width=1, max_writers_per_prefix=2, index_ttl=0
+    )
     writer.get("k")  # build the index so _sig[prefix] is populated with peer logs
     writer.set("k", "ME")  # this write trips the auto-consolidation
     assert {p.name for p in (root / prefix).glob("*.log")} == {"ME.log"}  # back to one
     assert LogCache(root, writer_id="R", prefix_width=1, index_ttl=0).get("k") == "ME"
+
+
+def test_consolidate_drops_superseded_own_spill(tmp_path):
+    """A peer overwrites our spilled key with a newer value. consolidate must
+    delete OUR now-superseded spill — set() can't, since A never saw B win."""
+    root = tmp_path / "c"
+    a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
+    a.set("d", "x" * 5000)  # A's spill for "d"
+    prefix = a._prefix("d")
+    own_spill = root / prefix / "A.spill"
+    sA = next(p.name for p in own_spill.glob("*.val"))
+    time.sleep(0.01)
+    LogCache(root, writer_id="B", prefix_width=1, min_file_size=100).set(
+        "d", "y" * 5000
+    )  # newer
+
+    LogCache(root, writer_id="A", prefix_width=1, min_file_size=100).consolidate(prefix)
+
+    assert (
+        LogCache(root, writer_id="R", prefix_width=1, index_ttl=0).get("d")
+        == "y" * 5000
+    )
+    remaining = {p.name for p in own_spill.glob("*.val")}
+    assert sA not in remaining  # superseded own spill deleted (not leaked)
+    assert len(remaining) == 1  # only the re-spilled winning value remains
+
+
+def test_consolidate_keeps_unreferenced_own_spill(tmp_path):
+    """An OWN spill not yet referenced by any log (a concurrent set() wrote it
+    before appending its record, outside the lock) must survive consolidate —
+    a glob-and-delete GC would orphan the imminent record."""
+    root = tmp_path / "c"
+    a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
+    a.set("d", "v" * 5000)  # a real spilled record so the log is non-empty
+    prefix = a._prefix("d")
+    inflight = root / prefix / "A.spill" / "inflight.val"
+    inflight.write_bytes(b"not-yet-logged")  # simulate an in-flight concurrent spill
+
+    a.consolidate(prefix)
+
+    assert inflight.exists()  # only logged-and-superseded spills are GC'd
+    assert a.get("d") == "v" * 5000
+
+
+def test_consolidate_keeps_unreadable_source(tmp_path, monkeypatch):
+    """A source log that errors mid-read is never pruned — its unmerged records
+    would otherwise be lost when its (size, mtime) still matches the snapshot."""
+    import emboss._log_cache as m
+
+    root = tmp_path / "c"
+    LogCache(root, writer_id="A", prefix_width=1).set("d", 1)
+    LogCache(root, writer_id="PEER", prefix_width=1).set("f", 2)
+    prefix = LogCache(root, prefix_width=1)._prefix("d")
+    peer_log = root / prefix / "PEER.log"
+    real_iter = m._iter_records
+
+    def flaky(path):
+        if path.name == "PEER.log":
+            raise OSError("transient read failure")
+        return real_iter(path)
+
+    monkeypatch.setattr(m, "_iter_records", flaky)
+    LogCache(root, writer_id="A", prefix_width=1).consolidate(prefix)
+    monkeypatch.undo()
+
+    assert peer_log.exists()  # unreadable source kept, not pruned
+    reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
+    assert reader.get("f") == 2  # its records survive (read from the kept log)
+    assert reader.get("d") == 1
+
+
+def test_consolidate_drops_expired(tmp_path):
+    """consolidate honours TTL: an expired record is dropped from the merge."""
+    root = tmp_path / "c"
+    gone, keep = _SAME_PREFIX_KEYS[:2]
+    LogCache(root, writer_id="A", prefix_width=1).set(gone, 1, expire=0.01)
+    LogCache(root, writer_id="B", prefix_width=1).set(keep, 2)
+    prefix = LogCache(root, prefix_width=1)._prefix(gone)
+    time.sleep(0.03)
+
+    LogCache(root, writer_id="A", prefix_width=1).consolidate(prefix)
+
+    keys = [r.key for r in _iter_records(root / prefix / "A.log")]
+    assert gone not in keys  # expired entry dropped
+    assert keep in keys
+
+
+def test_auto_consolidate_disabled_with_zero_bound(tmp_path):
+    """max_writers_per_prefix=0 disables the auto-GC trigger: peer logs accumulate
+    untouched no matter how many appear."""
+    root = tmp_path / "c"
+    for w in ("w0", "w1", "w2", "w3"):
+        LogCache(root, writer_id=w, prefix_width=1, max_writers_per_prefix=0).set(
+            "k", w
+        )
+    prefix = LogCache(root, prefix_width=1)._prefix("k")
+    me = LogCache(
+        root, writer_id="ME", prefix_width=1, max_writers_per_prefix=0, index_ttl=0
+    )
+    me.get("k")  # populate _sig with every peer log
+    me.set("k", "ME")  # would trip auto-consolidation if it were enabled
+
+    logs = {p.name for p in (root / prefix).glob("*.log")}
+    assert logs == {"w0.log", "w1.log", "w2.log", "w3.log", "ME.log"}  # nothing folded
 
 
 def test_consolidate_then_cached_and_transfer(tmp_path):
@@ -448,5 +560,7 @@ def test_consolidate_then_cached_and_transfer(tmp_path):
 
     dst = SqliteCache(tmp_path / "dst")
     assert transfer(cache, dst) >= 1
-    assert dst.get("blob") == "q" * 5000  # spilled value survives transfer post-consolidate
+    assert (
+        dst.get("blob") == "q" * 5000
+    )  # spilled value survives transfer post-consolidate
     dst.close()
