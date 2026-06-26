@@ -163,6 +163,63 @@ def test_size_limit_best_effort_per_log(tmp_path):
         assert log.stat().st_size <= 5000 + 1500  # per-log bound + framing slack
 
 
+def _spills(root):
+    return list(root.glob("**/*.spill/*.val"))
+
+
+def test_large_value_spills_to_file(tmp_path):
+    root = tmp_path / "c"
+    c = LogCache(root, writer_id="A", min_file_size=100)
+    c.set("big", "x" * 5000)
+    assert len(_spills(root)) == 1
+    log = c._log_path(c._prefix("big"))
+    assert log.stat().st_size < 500  # the log holds a reference, not the 5 KB value
+    assert c.get("big") == "x" * 5000  # read back from the spill file
+    c.set("small", "y")  # stays inline
+    assert len(_spills(root)) == 1
+
+
+def test_spill_removed_on_overwrite(tmp_path):
+    root = tmp_path / "c"
+    c = LogCache(root, writer_id="A", min_file_size=100)
+    c.set("k", "a" * 5000)
+    assert len(_spills(root)) == 1
+    c.set("k", "b" * 5000)  # supersedes -> old spill removed, new written
+    assert len(_spills(root)) == 1
+    assert c.get("k") == "b" * 5000
+
+
+def test_spill_removed_on_delete(tmp_path):
+    root = tmp_path / "c"
+    c = LogCache(root, writer_id="A", min_file_size=100)
+    c.set("k", "a" * 5000)
+    c.delete("k")
+    assert _spills(root) == []
+
+
+def test_compaction_removes_expired_spills(tmp_path):
+    root = tmp_path / "c"
+    c = LogCache(root, writer_id="A", min_file_size=100)
+    c.set("gone", "x" * 5000, expire=0.01)
+    c.set("keep", "y" * 5000)
+    time.sleep(0.03)
+    assert len(_spills(root)) == 2  # expiry is lazy — both spill files still present
+    c.compact()
+    assert len(_spills(root)) == 1  # compaction dropped the expired one's spill
+    assert c.get("keep") == "y" * 5000
+
+
+def test_spilled_value_transfers(tmp_path):
+    from emboss import SqliteCache, transfer
+
+    src = LogCache(tmp_path / "src", writer_id="A", min_file_size=100)
+    src.set("big", "z" * 5000)
+    dst = SqliteCache(tmp_path / "dst")
+    assert transfer(src, dst) == 1
+    assert dst.get("big") == "z" * 5000  # large value survives a cross-backend transfer
+    dst.close()
+
+
 def test_works_with_cached_decorator(tmp_path):
     cache = LogCache(tmp_path / "c", writer_id="A")
     calls = {"n": 0}

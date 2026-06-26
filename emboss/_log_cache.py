@@ -7,53 +7,50 @@ rewriting the same `<prefix>` file means a syncer's last-write-wins discards a
 whole bundle of one node's entries.
 
 `LogCache` gets few inodes AND conflict-free sync by giving every writer its own
-files. Entries are sharded by a stable hash of the key into 256 prefixes; within
-a prefix each node appends to **its own** log:
+files. Entries are sharded by a stable hash of the key into prefixes; within a
+prefix each node appends to **its own** log:
 
-    directory/<prefix>/<writer_id>.log     # written by exactly ONE node
-    directory/<prefix>/<writer_id>.lock    # flock; mutually excludes append/compact
+    directory/<prefix>/<writer_id>.log       # written by exactly ONE node
+    directory/<prefix>/<writer_id>.lock      # flock; excludes append/compact races
+    directory/<prefix>/<writer_id>.spill/*   # large values, one file each
 
-Because no file is ever written by two nodes, a file syncer (Syncthing, rsync)
-just ships each node's logs around — last-write-wins never fires, so a sync
-conflict can't lose data. Same-node processes sharing a node-log are serialised
-by the per-writer lock file (a stable inode, never replaced, so it still excludes
-an append racing a compaction's atomic rename). Inodes are bounded by
-(#prefixes x #writers), not entry count.
+Because no file is ever written by two nodes, a file syncer just ships each
+node's logs around — last-write-wins never fires, so a sync conflict can't lose
+data. Same-node processes sharing a node-log are serialised by the per-writer
+lock file. Inodes are bounded by ~(#prefixes x #writers), not entry count.
 
 - **Reads** consult a per-prefix in-memory index (built by scanning that
-  prefix's logs once; rebuilt when a log's size changes, e.g. a peer's appends
-  arrived via sync). A miss just recomputes — safe under eventual consistency.
+  prefix's logs once; rebuilt when a log's size changes — a peer's appends). The
+  freshness check is throttled by `index_ttl`, so warm reads are an in-memory
+  lookup. A miss just recomputes — safe under eventual consistency.
 - **Writes** append a length-framed record; a torn tail from a crash is ignored.
+- **Large values spill to side files** (`min_file_size`, default 32 KB): the
+  record holds a filename reference instead of the value, keeping the log small
+  (so a 100 MB value doesn't balloon the append log). Spill files live under the
+  writer's own namespace, so they sync conflict-free too, and are removed on
+  overwrite / delete / compaction.
 - **Deletes** append a tombstone.
 - **Compaction** rewrites *this node's own* log (under its lock, atomic rename),
-  dropping superseded / tombstoned / expired records; it never touches a peer's
-  log, so it stays conflict-free. Auto-runs when a log passes `max_log_bytes`;
-  also exposed as `compact()`. `size_limit` is a best-effort bound on each
-  (prefix, writer) log's live bytes, applied at compaction (per-log, like
-  `FanoutCache`'s per-shard split — not a single global cap).
-
-Use `LogCache` for **many small entries on a shared/synced mount**, where
-`FileCache`'s inode count hurts. For a bounded local cache use `SqliteCache`.
+  dropping superseded / tombstoned / expired records and their spill files. It
+  never touches a peer's files. Auto-runs past `max_log_bytes`; also `compact()`.
 
 Tunables (defaults chosen via `python scripts/bench.py`):
-- `index_ttl` (1.0 s) — how long a per-prefix index is reused before re-stat'ing
-  the logs for peers' appends. This is the dominant read lever: the throttle
-  lifts reads from ~10^4/s (always-fresh, `index_ttl=0`) to ~10^5/s, at the cost
-  of up to `index_ttl` of staleness on cross-process/node writes (own writes are
-  immediate). 1 s is well under Syncthing's propagation latency.
-- `prefix_width` (2 -> 256 shards) — balances inode count against per-log size;
-  width 1 is fewest inodes, width 3 over-shards (8k files). Must match across all
-  writers/readers of a directory.
+- `index_ttl` (1.0 s) — index reuse before re-stat'ing for peers' appends; the
+  dominant read lever (~10^4/s always-fresh -> ~10^5/s throttled), at the cost of
+  up to `index_ttl` of staleness on cross-node writes (own writes immediate).
+- `prefix_width` (2 -> 256 shards) — inodes vs per-log size. Aim ~1k entries per
+  prefix: width 1 (<~10k entries), 2 (~10k-2M), 3 (>~2M); avoid >=4 (the parent
+  dir then holds 65k+ subdirs — the cliff). Must match across a directory.
+- `min_file_size` (32 KB) — values this big or larger spill to side files.
 - `max_log_bytes` (4 MB) — per-log size that triggers compaction.
 
 Benchmark (local SSD, 512-byte values), order of magnitude:
     set ~10^4 ops/s     get ~10^5 ops/s (index_ttl=1.0; ~10^4/s if index_ttl=0)
-The headline win is inodes: ~256 files for *any* number of entries — 20k entries
-used 512 files here, vs `FileCache`'s 20,000.
+The headline win is inodes: ~256 files for *any* number of small entries.
 
-`writer_id` defaults to the hostname and **must be unique per node** (override it
-if two nodes could share a hostname). Implements the `Cache` protocol subset
-`@cached` needs plus dunders, `len()`, iteration, and `volume()`.
+`writer_id` defaults to the hostname and **must be unique per node**. Implements
+the `Cache` protocol subset `@cached` needs plus dunders, `len()`, iteration,
+`volume()`.
 """
 
 from __future__ import annotations
@@ -67,6 +64,7 @@ import socket
 import struct
 import threading
 import time
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -76,14 +74,16 @@ _HEADER = struct.Struct(">I")  # 4-byte big-endian record length
 _DEFAULT_MAX_LOG_BYTES = 4 * 2**20  # compact a node's per-prefix log past 4 MB
 _DEFAULT_PREFIX_WIDTH = 2  # 2 hex chars -> 256 shard dirs
 _DEFAULT_INDEX_TTL = 1.0  # seconds a per-prefix index is reused before re-stat'ing
+_DEFAULT_MIN_FILE_SIZE = 2**15  # 32 KB — values this big or larger spill to files
 
 
 class _Record(NamedTuple):
     key: str
-    value: Any
+    value: Any  # the value (inline) or None when spilled
     expire_time: float | None
     store_time: float
     deleted: bool
+    spill: str | None  # relative path to a side file holding the value, or None
 
 
 def _iter_records(path: Path) -> Iterator[_Record]:
@@ -123,7 +123,7 @@ def _flock(fileobj: Any, op: int) -> None:
 
 
 class LogCache:
-    """Log-structured cache: per-writer, prefix-sharded append logs."""
+    """Log-structured cache: per-writer, prefix-sharded append logs + spillover."""
 
     def __init__(
         self,
@@ -133,24 +133,18 @@ class LogCache:
         max_log_bytes: int = _DEFAULT_MAX_LOG_BYTES,
         prefix_width: int = _DEFAULT_PREFIX_WIDTH,
         index_ttl: float = _DEFAULT_INDEX_TTL,
+        min_file_size: int = _DEFAULT_MIN_FILE_SIZE,
         **_kwargs: Any,
     ) -> None:
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.size_limit = size_limit
         self.max_log_bytes = max_log_bytes
-        # prefix_width fixes the shard layout; it MUST be the same for every
-        # writer/reader of a directory (a key's prefix is derived from it).
         self.prefix_width = prefix_width
-        # How long a per-prefix index may be reused before re-checking the logs
-        # on disk for a peer's appends. 0 = always fresh (every get re-stats);
-        # higher = faster reads at the cost of up to `index_ttl`s of staleness on
-        # cross-process/node writes (own writes are always visible immediately).
         self.index_ttl = index_ttl
+        self.min_file_size = min_file_size
         self.writer_id = _sanitize(writer_id or socket.gethostname())
         self._lock = threading.Lock()  # serialise this process's threads
-        # Per-prefix: {prefix: {key: _Record}} + the per-log sizes the index was
-        # built from, so we rebuild only when a log changed (incl. a peer's).
         self._index: dict[str, dict[str, _Record]] = {}
         self._sig: dict[str, dict[str, int]] = {}
         self._checked: dict[str, float] = {}  # monotonic time of last freshness check
@@ -184,6 +178,41 @@ class LogCache:
 
                 _flock(f, fcntl.LOCK_UN)
             f.close()
+
+    # ── spillover (large values -> side files) ─────────────────────────────────
+
+    def _spill_write(self, prefix: str, blob: bytes) -> str:
+        """Write a value blob to a side file under this writer's namespace; return
+        its path relative to `directory` (so any reader can resolve it)."""
+        rel_dir = f"{prefix}/{self.writer_id}.spill"
+        full_dir = self.directory / rel_dir
+        full_dir.mkdir(parents=True, exist_ok=True)
+        name = f"{uuid.uuid4().hex}.val"
+        full = full_dir / name
+        tmp = full.with_name(name + ".tmp")
+        with open(tmp, "wb") as f:
+            f.write(blob)
+        os.replace(tmp, full)
+        return f"{rel_dir}/{name}"
+
+    def _spill_read(self, rel: str) -> Any:
+        with open(self.directory / rel, "rb") as f:
+            return pickle.load(f)
+
+    def _spill_delete(self, rel: str) -> None:
+        with contextlib.suppress(OSError):
+            (self.directory / rel).unlink()
+
+    def _is_own_spill(self, prefix: str, rel: str) -> bool:
+        return rel.startswith(f"{prefix}/{self.writer_id}.spill/")
+
+    def _rec_size(self, rec: _Record) -> int:
+        if rec.spill:
+            try:
+                return (self.directory / rec.spill).stat().st_size
+            except OSError:
+                return 0
+        return len(pickle.dumps(rec.value, protocol=pickle.HIGHEST_PROTOCOL))
 
     # ── index ─────────────────────────────────────────────────────────────────
 
@@ -244,8 +273,8 @@ class LogCache:
 
     def compact(self, prefix: str | None = None) -> None:
         """Rewrite this node's own log(s), dropping dead/superseded/expired records
-        (and, if `size_limit` is set, oldest-stored live records). Never touches a
-        peer's log, so it stays conflict-free under sync."""
+        and their spill files (and, with `size_limit`, oldest-stored live records).
+        Never touches a peer's files, so it stays conflict-free under sync."""
         with self._lock:
             if prefix is not None:
                 self._compact_prefix(prefix)
@@ -259,9 +288,12 @@ class LogCache:
         if not path.exists():
             return
         now = time.time()
+        all_spills: set[str] = set()
         with self._writer_lock(prefix):
             latest: dict[str, _Record] = {}
             for rec in _iter_records(path):
+                if rec.spill:
+                    all_spills.add(rec.spill)
                 cur = latest.get(rec.key)
                 if cur is None or rec.store_time >= cur.store_time:
                     latest[rec.key] = rec
@@ -274,22 +306,21 @@ class LogCache:
                 for rec in keep:
                     out.write(_frame(rec))
             os.replace(tmp, path)
+        kept_spills = {r.spill for r in keep if r.spill}
+        for spill in all_spills - kept_spills:  # dropped records' values (all ours)
+            self._spill_delete(spill)
         self._index.pop(prefix, None)  # force rebuild
         self._sig.pop(prefix, None)
 
     def _trim_to_limit(self, records: list[_Record]) -> list[_Record]:
         """Best-effort size bound over THIS node's live records for one prefix."""
         assert self.size_limit is not None
-
-        def vsize(rec: _Record) -> int:
-            return len(pickle.dumps(rec.value, protocol=pickle.HIGHEST_PROTOCOL))
-
-        if sum(vsize(r) for r in records) <= self.size_limit:
+        if sum(self._rec_size(r) for r in records) <= self.size_limit:
             return records
         kept: list[_Record] = []
         running = 0
         for rec in sorted(records, key=lambda r: r.store_time, reverse=True):  # newest first
-            running += vsize(rec)
+            running += self._rec_size(rec)
             if running > self.size_limit:
                 break
             kept.append(rec)
@@ -302,17 +333,37 @@ class LogCache:
         prefix = self._prefix(key)
         with self._lock:
             rec = self._ensure_index(prefix).get(str(key))
-        return rec.value if rec is not None and self._live(rec, now) else default
+        if rec is None or not self._live(rec, now):
+            return default
+        if rec.spill:
+            try:
+                return self._spill_read(rec.spill)
+            except OSError:
+                return default  # spill not present yet (e.g. log synced before it) -> miss
+        return rec.value
 
     def set(self, key: Any, value: Any, expire: float | None = None, **_kwargs: Any) -> bool:
         now = time.time()
         prefix = self._prefix(key)
-        rec = _Record(str(key), value, now + expire if expire else None, now, False)
+        expire_time = now + expire if expire else None
+        blob = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        if len(blob) >= self.min_file_size:
+            rec = _Record(str(key), None, expire_time, now, False, self._spill_write(prefix, blob))
+        else:
+            rec = _Record(str(key), value, expire_time, now, False, None)
         with self._lock:
-            log_size = self._append(prefix, rec)
             index = self._ensure_index(prefix)
+            old = index.get(rec.key)
+            try:
+                log_size = self._append(prefix, rec)
+            except BaseException:
+                if rec.spill:
+                    self._spill_delete(rec.spill)  # don't orphan the new spill
+                raise
             index[rec.key] = rec
             self._sig.setdefault(prefix, {})[self._log_path(prefix).name] = log_size
+            if old is not None and old.spill and self._is_own_spill(prefix, old.spill):
+                self._spill_delete(old.spill)  # our superseded large value
             if log_size > self.max_log_bytes:
                 self._compact_prefix(prefix)
         return True
@@ -322,16 +373,19 @@ class LogCache:
         prefix = self._prefix(key)
         with self._lock:
             index = self._ensure_index(prefix)
-            if not self._live(index.get(str(key)), now):
+            old = index.get(str(key))
+            if not self._live(old, now):
                 return False
-            tombstone = _Record(str(key), None, None, now, True)
+            tombstone = _Record(str(key), None, None, now, True, None)
             log_size = self._append(prefix, tombstone)
             index[tombstone.key] = tombstone
             self._sig.setdefault(prefix, {})[self._log_path(prefix).name] = log_size
+            if old is not None and old.spill and self._is_own_spill(prefix, old.spill):
+                self._spill_delete(old.spill)
         return True
 
     def clear(self) -> int:
-        """Drop this node's view of the cache (removes local logs). Peers' logs
+        """Drop this node's view of the cache (removes local files). Peers' files
         re-appear via sync — clear is node-local for a replicated cache."""
         with self._lock:
             n = sum(1 for _ in self._iter_live())
@@ -345,10 +399,7 @@ class LogCache:
     def volume(self) -> int:
         """Total bytes of the live value payloads (across all writers)."""
         with self._lock:
-            return sum(
-                len(pickle.dumps(rec.value, protocol=pickle.HIGHEST_PROTOCOL))
-                for rec in self._iter_live()
-            )
+            return sum(self._rec_size(rec) for rec in self._iter_live())
 
     def _iter_live(self) -> Iterator[_Record]:
         now = time.time()
