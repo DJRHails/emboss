@@ -45,10 +45,21 @@ import os
 import pickle
 import shutil
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 _MISSING = object()
+
+
+class _Entry(NamedTuple):
+    """On-disk record: the original key paired with its value, so keys are
+    recoverable for iteration / `transfer`. Files written before this format
+    held the bare value; `get` reads both (an `_Entry` -> its value; anything
+    else -> the legacy raw value)."""
+
+    key: Any
+    value: Any
 
 
 def _key_to_path(root: Path, key: Any) -> Path:
@@ -95,11 +106,12 @@ class FileCache:
                 os.utime(path)  # LRU: mark recently used (bump mtime)
         try:
             with path.open("rb") as f:
-                return pickle.load(f)
+                obj = pickle.load(f)
         except (EOFError, pickle.UnpicklingError, OSError):
             # Partial write or corrupted file; treat as a miss. Caller recomputes
             # and atomic-renames a fresh copy over it.
             return default
+        return obj.value if isinstance(obj, _Entry) else obj  # else: legacy raw value
 
     def set(self, key: Any, value: Any, **_kwargs: Any) -> bool:
         path = _key_to_path(self.directory, key)
@@ -111,7 +123,7 @@ class FileCache:
         fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
         try:
             with os.fdopen(fd, "wb") as f:
-                pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(_Entry(key, value), f, protocol=pickle.HIGHEST_PROTOCOL)
             os.replace(tmp, path)
         except Exception:
             with contextlib.suppress(OSError):
@@ -197,6 +209,33 @@ class FileCache:
         shutil.rmtree(self.directory, ignore_errors=True)
         self.directory.mkdir(parents=True, exist_ok=True)
         self._size = 0
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self.directory.glob("**/*.pkl"))
+
+    def __iter__(self) -> Iterator[Any]:
+        """Yield stored keys. Entries written before key-recovery (bare values)
+        are skipped — only `_Entry`-format files carry a recoverable key."""
+        keys = []
+        for pkl in self.directory.glob("**/*.pkl"):
+            try:
+                with pkl.open("rb") as f:
+                    obj = pickle.load(f)
+            except (EOFError, pickle.UnpicklingError, OSError):
+                continue
+            if isinstance(obj, _Entry):
+                keys.append(obj.key)
+        return iter(keys)
+
+    iterkeys = __iter__
+
+    def volume(self) -> int:
+        """Total bytes on disk across all entry files."""
+        total = 0
+        for pkl in self.directory.glob("**/*.pkl"):
+            with contextlib.suppress(OSError):
+                total += pkl.stat().st_size
+        return total
 
     def __contains__(self, key: Any) -> bool:
         return _key_to_path(self.directory, key).exists()

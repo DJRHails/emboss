@@ -167,6 +167,28 @@ def test_no_residual_tempfiles_after_set(cache, tmp_path):
     assert tmp_leftovers == []
 
 
+def test_iteration_recovers_keys(cache):
+    cache.set("alpha", 1)
+    cache.set("beta", 2)
+    cache.set(("tuple", "key"), 3)  # non-string key recovered too
+    assert len(cache) == 3
+    assert sorted(k for k in cache if isinstance(k, str)) == ["alpha", "beta"]
+    assert ("tuple", "key") in list(cache)
+    assert cache.volume() > 0
+
+
+def test_legacy_raw_value_still_readable(tmp_path):
+    """Files written before key-recovery held a bare value (no _Entry) and must
+    still read; they just don't yield a key on iteration."""
+    c = FileCache(tmp_path / "cache")
+    path = _key_to_path(c.directory, "k")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump("legacy-raw", f)  # old format
+    assert c.get("k") == "legacy-raw"  # readable
+    assert list(c) == []  # but key not recoverable from a legacy file
+
+
 def test_unbounded_by_default_keeps_everything(tmp_path):
     c = FileCache(tmp_path / "cache")  # size_limit=None
     val = b"x" * 10_000

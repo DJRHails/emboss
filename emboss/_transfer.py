@@ -6,10 +6,9 @@ another. Values are copied **verbatim** (the stored encoding), so a cache writte
 by `@cached` stays readable by `@cached` on the destination — no re-encoding, and
 the function-identity keys are preserved.
 
-The source must be **iterable over keys** (`SqliteCache`, `FanoutCache`,
-`LogCache`, and `diskcache.Cache` are; `FileCache` is not — it can't recover
-original keys from its hashed paths, so it works as a `transfer` *destination*
-but not a *source*).
+The source must be **iterable over keys** — every emboss backend (`SqliteCache`,
+`FanoutCache`, `LogCache`, `FileCache`) and `diskcache.Cache` is. (`FileCache`
+entries written before key-recovery hold only the value and are skipped.)
 """
 
 from __future__ import annotations

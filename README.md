@@ -261,7 +261,7 @@ from emboss import transfer, SqliteCache, LogCache
 transfer(SqliteCache(".old"), LogCache(".new"))   # returns the count copied
 ```
 
-`transfer(source, destination, *, clear_source=False)` copies every entry **verbatim** (the stored encoding), so a cache written by `@cached` stays readable by `@cached` on the destination. Use it to switch backends (`diskcache` → `SqliteCache`), re-shard a `FanoutCache`, or consolidate logs. The source must be iterable (`SqliteCache`, `FanoutCache`, `LogCache`, `diskcache.Cache`); `FileCache` can't be a source (it can't recover keys from hashed paths) but works as a destination.
+`transfer(source, destination, *, clear_source=False)` copies every entry **verbatim** (the stored encoding), so a cache written by `@cached` stays readable by `@cached` on the destination. Use it to switch backends (`diskcache` → `SqliteCache`), re-shard a `FanoutCache`, or consolidate logs. The source must be iterable — every emboss backend (`SqliteCache`, `FanoutCache`, `LogCache`, `FileCache`) and `diskcache.Cache` is. (`FileCache` stores each entry's key alongside its value so keys are recoverable; entries written by older versions held only the value and are skipped.)
 
 All backends implement the `diskcache.Cache` subset `@cached` uses (`get`, `set`, `__contains__`, `__getitem__`, `__setitem__`, `__delitem__`, `delete`, `clear`, `close`, context-manager) and accept-and-ignore extra diskcache kwargs (`timeout`, ...) so call sites switch with no code changes.
 

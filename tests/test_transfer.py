@@ -2,7 +2,18 @@
 
 from __future__ import annotations
 
-from emboss import FanoutCache, LogCache, SqliteCache, cached, transfer
+from emboss import FanoutCache, FileCache, LogCache, SqliteCache, cached, transfer
+
+
+def test_transfer_from_filecache(tmp_path):
+    src = FileCache(tmp_path / "src")
+    src.set("a", 1)
+    src.set("b", {"x": 2})
+    dst = SqliteCache(tmp_path / "dst")
+    assert transfer(src, dst) == 2
+    assert dst.get("a") == 1
+    assert dst.get("b") == {"x": 2}
+    dst.close()
 
 
 def test_transfer_log_to_log(tmp_path):
