@@ -176,6 +176,7 @@ emboss ships three dependency-free backends; `diskcache.Cache` still works if yo
 | `SqliteCache` *(default)* | one SQLite DB | ✅ `size_limit` + eviction + TTL | ❌ SQLite locking breaks on NFS | a bounded **local** cache (multi-process-safe) |
 | `FanoutCache` | N sharded SQLite DBs | ✅ | ❌ | a local cache under **heavy concurrent writes** |
 | `FileCache` | one file per key | ✅ optional `size_limit` + LRU | ✅ atomic rename, syncable | a cache on a **network mount / replicated** across machines |
+| `LogCache` | per-writer append logs | best-effort | ✅ conflict-free, **few inodes** | **many small entries** on a shared/synced mount |
 | `diskcache.Cache` | SQLite (+ tags, stats) | ✅ | ❌ | you want diskcache's richer feature set |
 
 Throughput (local SSD, 512-byte values, order of magnitude — `python scripts/bench.py`):
@@ -234,7 +235,35 @@ A single-file cache can't be shared across hosts: SQLite file-locking breaks ove
 
 `size_limit` (bytes) is optional — `None` (default) is unbounded; when set, least-recently-used entries (by file mtime, bumped on read) are evicted past the limit. Eviction is a full-directory scan (best-effort, amortized), and across a syncing fleet it's per-node with deletions propagating.
 
-Both backends implement the `diskcache.Cache` subset `@cached` uses (`get`, `set`, `__contains__`, `__getitem__`, `__setitem__`, `__delitem__`, `delete`, `clear`, `close`, context-manager) and accept-and-ignore extra diskcache kwargs (`timeout`, `eviction_policy`, ...) so call sites switch with no code changes.
+### `LogCache` — replication-safe with few inodes
+
+```python
+from emboss import LogCache, cached
+
+cache = LogCache(".data/cache")  # writer_id defaults to the hostname
+
+@cached(cache)
+def expensive(x: int) -> dict:
+    ...
+```
+
+`FileCache` is sync-safe but writes **one file per key** — millions of inodes for a big cache, and slow `du`/`rsync`/Syncthing scans. The naive fix (bundle keys into one file per prefix) makes sync *worse*: two nodes rewriting the same bundle means a syncer's last-write-wins drops a whole node's chunk of entries.
+
+`LogCache` gets few inodes **and** conflict-free sync by giving every writer its own files. Entries are sharded into 256 prefixes; within each, a node appends to `directory/<prefix>/<writer_id>.log`. Because **no file is ever written by two nodes**, a syncer just ships each node's logs around — last-write-wins never fires, so a conflict can't lose data. Reads merge a prefix's logs (cached in memory; rebuilt when a peer's log grows); deletes append tombstones; compaction (auto past `max_log_bytes`, or `compact()`) rewrites *this node's own* log dropping dead records. Same-node processes are serialised by a per-writer lock file.
+
+In the benchmark, **20,000 entries used 512 files (vs `FileCache`'s 20,000)** — the inode count is capped at #prefixes × #writers, independent of entry count. The trade is slower reads (~10⁴/s; a per-get `stat` to notice peers' appends) and eventual cross-node consistency. `writer_id` **must be unique per node** (defaults to the hostname).
+
+### Migrating between backends — `transfer`
+
+```python
+from emboss import transfer, SqliteCache, LogCache
+
+transfer(SqliteCache(".old"), LogCache(".new"))   # returns the count copied
+```
+
+`transfer(source, destination, *, clear_source=False)` copies every entry **verbatim** (the stored encoding), so a cache written by `@cached` stays readable by `@cached` on the destination. Use it to switch backends (`diskcache` → `SqliteCache`), re-shard a `FanoutCache`, or consolidate logs. The source must be iterable (`SqliteCache`, `FanoutCache`, `LogCache`, `diskcache.Cache`); `FileCache` can't be a source (it can't recover keys from hashed paths) but works as a destination.
+
+All backends implement the `diskcache.Cache` subset `@cached` uses (`get`, `set`, `__contains__`, `__getitem__`, `__setitem__`, `__delitem__`, `delete`, `clear`, `close`, context-manager) and accept-and-ignore extra diskcache kwargs (`timeout`, ...) so call sites switch with no code changes.
 
 ## Async support
 

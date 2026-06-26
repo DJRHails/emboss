@@ -39,8 +39,10 @@ from importlib.metadata import PackageNotFoundError, version
 from emboss._cached import cache_id, cached, safe_jsonable_encoder
 from emboss._fanout_cache import FanoutCache
 from emboss._file_cache import FileCache
+from emboss._log_cache import LogCache
 from emboss._protocol import Cache
 from emboss._sqlite_cache import SqliteCache
+from emboss._transfer import transfer
 
 # Single source of truth: the version declared in pyproject.toml, read back from
 # installed package metadata — so `__version__` can never drift from the release
@@ -53,8 +55,10 @@ __all__ = [
     "Cache",
     "FanoutCache",
     "FileCache",
+    "LogCache",
     "SqliteCache",
     "cache_id",
     "cached",
     "safe_jsonable_encoder",
+    "transfer",
 ]
