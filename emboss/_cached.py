@@ -10,6 +10,7 @@ import inspect
 import json
 import logging
 import os
+import tempfile
 import textwrap
 import types
 import typing
@@ -17,9 +18,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, TypeVar, Union
 
-import diskcache
-
 from emboss._protocol import Cache
+from emboss._sqlite_cache import SqliteCache
 
 try:
     from pydantic import BaseModel
@@ -234,9 +234,10 @@ def cached(
     """Disk-backed memoization decorator.
 
     `cache` accepts any object satisfying the `Cache` protocol
-    (`.get(key, default=...)` / `.set(key, value)`) — `diskcache.Cache`,
-    `emboss.FileCache`, or your own backend. Defaults to a fresh in-memory
-    `diskcache.Cache()`.
+    (`.get(key, default=...)` / `.set(key, value)`) — `emboss.SqliteCache`,
+    `emboss.FileCache`, `diskcache.Cache` (optional: `pip install
+    emboss[diskcache]`), or your own backend. Defaults to a fresh
+    `emboss.SqliteCache` (see below).
 
     `default` is threaded into `safe_jsonable_encoder` for cache-key
     construction (see that function for semantics). The package default
@@ -264,13 +265,15 @@ def cached(
     and stores them as dicts (rehydrated on read) so model classes defined in
     `__main__` round-trip across script invocations.
 
-    When no `cache` is passed, the default cache directory is read from the
-    `EMBOSS_CACHE_DIR` environment variable at cache-creation time; if unset,
-    `diskcache` falls back to a temporary directory as before. The cache
-    location never affects keying (keys are function identity + arguments).
+    When no `cache` is passed, a default `emboss.SqliteCache` is created at the
+    directory named by the `EMBOSS_CACHE_DIR` environment variable; if unset, it
+    falls back to a fresh temporary directory (ephemeral, like the previous
+    `diskcache` default). The cache location never affects keying (keys are
+    function identity + arguments).
     """
     if cache is None:
-        cache = diskcache.Cache(os.environ.get("EMBOSS_CACHE_DIR"))
+        cache_dir = os.environ.get("EMBOSS_CACHE_DIR") or tempfile.mkdtemp(prefix="emboss-")
+        cache = SqliteCache(cache_dir)
     if unsafe_manual_key is not None and not unsafe_manual_key:
         raise ValueError(
             "unsafe_manual_key must be a non-empty string (e.g. 'v1') — "
