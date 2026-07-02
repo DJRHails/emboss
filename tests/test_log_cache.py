@@ -133,6 +133,45 @@ def test_torn_tail_ignored(tmp_path):
     assert LogCache(tmp_path / "c", writer_id="B").get("k") == "good"
 
 
+def _tear(log) -> None:
+    """Append an ENOSPC-style torn frame: the length prefix claims 4 KB, a few bytes landed."""
+    with open(log, "ab") as f:
+        f.write(b"\x00\x00\x10\x00partial-record")
+
+
+def test_append_after_torn_frame_still_readable(tmp_path):
+    """A torn frame mid-log must not hide the records appended after it: the value written
+    post-tear is the live one, and serving the stale pre-tear record would re-bill every
+    stranded @cached entry on every run."""
+    c = LogCache(tmp_path / "c", writer_id="A")
+    c.set("k", "stale")
+    _tear(c._log_path(c._prefix("k")))
+    c.set("k", "fresh")  # lands after the tear
+    assert LogCache(tmp_path / "c", writer_id="B").get("k") == "fresh"
+
+
+def test_new_key_after_torn_frame_not_hidden(tmp_path):
+    c = LogCache(tmp_path / "c", writer_id="A")
+    c.set("k", "early")
+    other = next(f"x{i}" for i in range(10_000) if c._prefix(f"x{i}") == c._prefix("k"))
+    _tear(c._log_path(c._prefix("k")))
+    c.set(other, "late")  # same shard, appended after the tear
+    reader = LogCache(tmp_path / "c", writer_id="B")
+    assert reader.get("k") == "early"
+    assert reader.get(other) == "late"
+
+
+def test_compaction_heals_torn_log(tmp_path):
+    c = LogCache(tmp_path / "c", writer_id="A")
+    c.set("k", "stale")
+    log = c._log_path(c._prefix("k"))
+    _tear(log)
+    c.set("k", "fresh")
+    c.compact()
+    assert b"partial-record" not in log.read_bytes()  # torn bytes rewritten away
+    assert LogCache(tmp_path / "c", writer_id="B").get("k") == "fresh"
+
+
 def test_compaction_shrinks_and_keeps_latest(tmp_path):
     c = LogCache(tmp_path / "c", writer_id="A")
     for i in range(200):

@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import os
 import pickle
 import shutil
@@ -101,21 +102,65 @@ class _Record(NamedTuple):
     spill: str | None  # relative path to a side file holding the value, or None
 
 
+# Every frame blob opens with the pickle PROTO opcode (pickle.dumps at protocol >= 2),
+# which anchors the resynchronisation scan past a torn frame.
+_PICKLE_PROTO = b"\x80"
+
+
+def _parse_frame(raw: bytes, pos: int) -> tuple[_Record, int] | None:
+    """The record framed at ``pos`` and the offset just past it, or None if no frame is there.
+
+    The pickle must consume the *whole* declared blob (``tell() == length``) and decode to the
+    record shape, so a bogus length prefix over garbage can never mis-align the scan.
+    """
+    if pos + _HEADER.size > len(raw):
+        return None
+    (length,) = _HEADER.unpack(raw[pos : pos + _HEADER.size])
+    end = pos + _HEADER.size + length
+    if length == 0 or end > len(raw):
+        return None
+    blob = raw[pos + _HEADER.size : end]
+    bio = io.BytesIO(blob)
+    try:
+        fields = pickle.Unpickler(bio).load()
+    except Exception:  # noqa: BLE001 — not a frame
+        return None
+    if bio.tell() != len(blob) or not isinstance(fields, tuple) or len(fields) != len(_Record._fields):
+        return None
+    return _Record(*fields), end
+
+
+def _next_frame_start(raw: bytes, start: int) -> int:
+    """First offset ``>= start`` where a valid frame begins, anchored on the PROTO opcode at
+    frame start + header size; ``len(raw)`` when the remainder is unrecoverable."""
+    at = raw.find(_PICKLE_PROTO, start + _HEADER.size)
+    while at != -1:
+        frame_start = at - _HEADER.size
+        if frame_start >= start and _parse_frame(raw, frame_start) is not None:
+            return frame_start
+        at = raw.find(_PICKLE_PROTO, at + 1)
+    return len(raw)
+
+
 def _iter_records(path: Path) -> Iterator[_Record]:
-    """Yield records from a log, stopping at the first torn/corrupt tail."""
-    with open(path, "rb") as f:
-        while True:
-            header = f.read(_HEADER.size)
-            if len(header) < _HEADER.size:
-                return
-            (length,) = _HEADER.unpack(header)
-            blob = f.read(length)
-            if len(blob) < length:
-                return  # truncated final write (crash mid-append)
-            try:
-                yield _Record(*pickle.loads(blob))
-            except Exception:  # noqa: BLE001 — a corrupt tail ends the log
-                return
+    """Yield records from a log, resynchronising past torn frames.
+
+    A frame that fails to parse is usually a truncated final write (crash mid-append), but it
+    can also sit mid-log: a partial append on a full disk (ENOSPC) tears a frame, and later
+    appends land *after* it. Stopping at the first bad frame would hide every record behind a
+    mid-log tear — each stranded ``@cached`` entry then re-bills on every run while its
+    recomputed copies pile up invisibly. So on a bad frame, scan forward to the next parseable
+    frame and continue; compaction rewrites the log frame-aligned on its next pass.
+    """
+    raw = path.read_bytes()
+    pos = 0
+    while pos + _HEADER.size <= len(raw):
+        parsed = _parse_frame(raw, pos)
+        if parsed is None:
+            pos = _next_frame_start(raw, pos + 1)
+            continue
+        record, pos = parsed
+        yield record
 
 
 def _frame(rec: _Record) -> bytes:
