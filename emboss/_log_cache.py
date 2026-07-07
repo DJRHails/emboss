@@ -141,32 +141,37 @@ def _resync(data: bytes, after: int) -> int | None:
         search = idx + 1
 
 
-def _iter_records(path: Path) -> Iterator[_Record]:
-    """Yield records from a log, **skipping torn/corrupt frames and resyncing** to
-    the next valid frame rather than stopping at the first bad one.
+class _ScanResult(NamedTuple):
+    records: list[_Record]  # valid records in on-disk order, resynced past any tears
+    tear_at: int | None  # byte offset of the first torn/corrupt frame, or None
+    recovered: int  # valid records found *after* a tear (would be stranded by a stop-reader)
 
-    A torn frame (a crash or a concurrent container teardown mid-append) can land
-    *mid-log* with valid frames after it. The old behaviour — return at the first
-    unreadable frame — stranded every record past the tear: invisible to reads, so
-    each one silently re-executes and re-bills forever. Here a bad frame is skipped
-    (resynced via the PROTO-opcode anchor) and recovery is logged. A benign
-    truncated *final* write (the documented crash-mid-append case) recovers nothing
-    past it and stays quiet."""
-    try:
-        data = path.read_bytes()
-    except OSError:
-        return
+
+def _read_records(path: Path) -> _ScanResult:
+    """Read every valid record from a log, **skipping torn/corrupt frames and resyncing** to the
+    next valid frame rather than stopping at the first bad one.
+
+    A torn frame (a crash or a concurrent container teardown mid-append) can land *mid-log* with
+    valid frames after it. Stopping at the first bad frame — the old behaviour — stranded every
+    record past the tear: invisible to reads, so each silently re-executes and re-bills forever.
+    Here a bad frame is skipped (resynced via the PROTO-opcode anchor). A benign truncated *final*
+    write (the documented crash-mid-append case) recovers nothing past it (`recovered == 0`).
+
+    `OSError` from the read propagates — a caller that must not treat an unreadable log as empty
+    (consolidation, which would then prune it) relies on that."""
+    data = path.read_bytes()  # OSError propagates by design (see docstring)
     n = len(data)
     pos = 0
+    records: list[_Record] = []
     tear_at: int | None = None
-    recovered_past_tear = 0
+    recovered = 0
     while pos + _HEADER.size <= n:
         parsed = _parse_frame(data, pos)
         if parsed is not None:
             rec, end = parsed
             if tear_at is not None:
-                recovered_past_tear += 1
-            yield rec
+                recovered += 1
+            records.append(rec)
             pos = end
             continue
         if tear_at is None:
@@ -175,16 +180,25 @@ def _iter_records(path: Path) -> Iterator[_Record]:
         if nxt is None:
             break
         pos = nxt
-    if recovered_past_tear:
+    return _ScanResult(records, tear_at, recovered)
+
+
+def _iter_records(path: Path) -> Iterator[_Record]:
+    """Yield a log's records (resyncing past torn frames — see `_read_records`). Warns when a
+    mid-log tear stranded later records, so the silent re-bill becomes visible; a benign
+    truncated final write stays quiet. `OSError` propagates on first iteration."""
+    scan = _read_records(path)
+    if scan.recovered:
         logger.warning(
-            "emboss.LogCache: torn/corrupt frame(s) in %s starting at byte %d — "
-            "resynced past them and recovered %d later record(s) that would "
-            "otherwise be invisible (they were re-executing on every read). "
-            "Run consolidate() or compact() to rewrite the log cleanly.",
+            "emboss.LogCache: torn/corrupt frame(s) in %s starting at byte %d — resynced past "
+            "them and recovered %d later record(s) that a stop-at-first-tear reader would hide "
+            "(they were re-executing on every read). compact()/consolidate() rewrites the log to "
+            "drop the malformed frame(s) permanently.",
             path,
-            tear_at,
-            recovered_past_tear,
+            scan.tear_at,
+            scan.recovered,
         )
+    yield from scan.records
 
 
 def _frame(rec: _Record) -> bytes:
@@ -378,8 +392,9 @@ class LogCache:
         now = time.time()
         all_spills: set[str] = set()
         with self._writer_lock(prefix):
+            scan = _read_records(path)
             latest: dict[str, _Record] = {}
-            for rec in _iter_records(path):
+            for rec in scan.records:
                 if rec.spill:
                     all_spills.add(rec.spill)
                 cur = latest.get(rec.key)
@@ -394,6 +409,14 @@ class LogCache:
                 for rec in keep:
                     out.write(_frame(rec))
             os.replace(tmp, path)
+        if scan.tear_at is not None:  # the rewrite drops the malformed frame(s) from disk
+            logger.warning(
+                "emboss.LogCache: compacted %s past a torn frame at byte %d — dropped the "
+                "malformed frame(s) permanently, kept %d recovered record(s).",
+                path,
+                scan.tear_at,
+                scan.recovered,
+            )
         kept_spills = {r.spill for r in keep if r.spill}
         for spill in all_spills - kept_spills:  # dropped records' values (all ours)
             self._spill_delete(spill)
@@ -467,14 +490,25 @@ class LogCache:
         prefix = pdir.name
         for name in sorted(sources):
             try:
-                for rec in _iter_records(pdir / name):
-                    if rec.spill and self._is_own_spill(prefix, rec.spill):
-                        own_spills.add(rec.spill)
-                    cur = latest.get(rec.key)
-                    if cur is None or rec.store_time >= cur.store_time:
-                        latest[rec.key] = rec
+                scan = _read_records(pdir / name)  # OSError → unread (below), never prune
             except OSError:
-                unread.add(name)  # partial read → never prune this source
+                unread.add(name)  # transient read error → never prune this source
+                continue
+            if scan.tear_at is not None:  # the consolidated rewrite drops these permanently
+                logger.warning(
+                    "emboss.LogCache: consolidating %s past a torn frame at byte %d — merging "
+                    "%d recovered record(s) into %s and dropping the malformed frame(s).",
+                    pdir / name,
+                    scan.tear_at,
+                    scan.recovered,
+                    self.writer_id,
+                )
+            for rec in scan.records:
+                if rec.spill and self._is_own_spill(prefix, rec.spill):
+                    own_spills.add(rec.spill)
+                cur = latest.get(rec.key)
+                if cur is None or rec.store_time >= cur.store_time:
+                    latest[rec.key] = rec
         keep = [r for r in latest.values() if self._live(r, now)]
         if self.size_limit is not None:
             keep = self._trim_to_limit(keep)
