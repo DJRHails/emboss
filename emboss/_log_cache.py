@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import logging
 import os
 import pickle
@@ -105,10 +106,39 @@ class _Record(NamedTuple):
     spill: str | None  # relative path to a side file holding the value, or None
 
 
+def _record_from(obj: Any) -> _Record | None:
+    """Build a `_Record` from an unpickled value, or `None` if it is not a genuine
+    6-field record with the right field types. Arity alone (what `_Record(*obj)`
+    checks) is not enough: `_resync` probes arbitrary byte offsets, so a false
+    anchor can unpickle into any 6-element iterable (e.g. the string `"abcdef"`).
+    Admitting one would seat a poison record in the index whose mistyped
+    `store_time`/`expire_time` raises `TypeError` on the read path — the exact
+    'a corrupt log breaks reads' outcome resync exists to prevent."""
+    if not (isinstance(obj, tuple) and len(obj) == 6):
+        return None
+    key, _value, expire_time, store_time, deleted, spill = obj
+    if not isinstance(key, str):
+        return None
+    if expire_time is not None and not isinstance(expire_time, (int, float)):
+        return None
+    if not isinstance(store_time, (int, float)):
+        return None
+    if not isinstance(deleted, bool):
+        return None
+    if spill is not None and not isinstance(spill, str):
+        return None
+    return _Record(*obj)
+
+
 def _parse_frame(data: bytes, pos: int) -> tuple[_Record, int] | None:
     """Try to parse one `[length][blob]` frame at `pos`; return `(record, end)` or
-    `None` if the header is short, the blob runs past EOF, or the blob does not
-    unpickle into a 6-field record."""
+    `None` if the header is short, the blob runs past EOF, the pickle does not
+    consume exactly `length` bytes, or it does not decode into a 6-field record.
+
+    The exact-length check is what makes `_resync` trustworthy: a genuine frame's
+    blob is a single pickle with no trailing bytes, so any false anchor whose
+    `length` header overshoots the real pickle is rejected here rather than seated
+    as a spurious record."""
     if pos + _HEADER.size > len(data):
         return None
     (length,) = _HEADER.unpack(data[pos : pos + _HEADER.size])
@@ -116,10 +146,15 @@ def _parse_frame(data: bytes, pos: int) -> tuple[_Record, int] | None:
     blob_end = blob_start + length
     if blob_end > len(data):
         return None  # truncated / corrupt length field
+    reader = io.BytesIO(data[blob_start:blob_end])
     try:
-        return _Record(*pickle.loads(data[blob_start:blob_end])), blob_end
+        obj = pickle.Unpickler(reader).load()
     except Exception:  # noqa: BLE001 — torn/corrupt frame; caller resyncs
         return None
+    if reader.tell() != length:
+        return None  # trailing bytes → not a genuine frame boundary
+    rec = _record_from(obj)
+    return (rec, blob_end) if rec is not None else None
 
 
 def _resync(data: bytes, after: int) -> int | None:
@@ -151,11 +186,13 @@ def _iter_records(path: Path) -> Iterator[_Record]:
     each one silently re-executes and re-bills forever. Here a bad frame is skipped
     (resynced via the PROTO-opcode anchor) and recovery is logged. A benign
     truncated *final* write (the documented crash-mid-append case) recovers nothing
-    past it and stays quiet."""
-    try:
-        data = path.read_bytes()
-    except OSError:
-        return
+    past it and stays quiet.
+
+    A read error (`OSError`) is **not** swallowed: it propagates so callers can tell
+    "read nothing" from "could not read". `_collect_live_across_logs` needs that to
+    mark a source `unread` and refuse to prune it, and `_compact_prefix` needs it to
+    abort rather than rewrite an empty log over a real one."""
+    data = path.read_bytes()
     n = len(data)
     pos = 0
     tear_at: int | None = None
@@ -590,7 +627,9 @@ class LogCache:
             try:
                 return self._spill_read(rec.spill)
             except OSError:
-                return default  # spill not present yet (e.g. log synced before it) -> miss
+                return (
+                    default  # spill not present yet (e.g. log synced before it) -> miss
+                )
             except Exception:  # noqa: BLE001 — corrupt/unpicklable spill: warn, miss (don't crash)
                 logger.warning(
                     "emboss.LogCache: spill file %s for key %r is present but "

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import pickle
 import shutil
 import time
+from pathlib import Path
 
 import pytest
 
 from emboss import Cache, LogCache, cached
-from emboss._log_cache import _HEADER, _frame, _iter_records, _Record
+from emboss._log_cache import _HEADER, _frame, _iter_records, _parse_frame, _Record
 
 
 @pytest.fixture
@@ -224,6 +226,90 @@ def test_corrupt_spill_is_a_warned_miss(tmp_path, caplog):
     with caplog.at_level("WARNING"):
         assert fresh.get("k", "MISS") == "MISS"
     assert any("unreadable" in r.message for r in caplog.records)
+
+
+def test_iter_records_propagates_read_error(tmp_path, monkeypatch):
+    """A read error must NOT be swallowed into an empty iteration: callers rely on
+    it propagating (`_collect_live_across_logs` marks the source `unread` so prune
+    keeps it; `_compact_prefix` aborts instead of rewriting an empty log)."""
+    log = tmp_path / "00" / "test.log"
+    _write_log(log, _rec("a", "A"))
+    orig_read = Path.read_bytes
+
+    def boom(self):
+        if self == log:
+            raise OSError("simulated transient I/O error")
+        return orig_read(self)
+
+    monkeypatch.setattr(Path, "read_bytes", boom)
+    with pytest.raises(OSError, match="simulated transient"):
+        list(_iter_records(log))
+
+
+def test_unreadable_source_is_not_pruned_on_consolidate(tmp_path, monkeypatch):
+    """End-to-end guard: a peer log that errors on read during consolidate() must
+    survive — its unmerged records aren't in our log, so pruning it would lose
+    them. This is the safety the `unread` set exists to provide."""
+    reader = LogCache(tmp_path / "c", writer_id="R", max_writers_per_prefix=1)
+    peer = LogCache(tmp_path / "c", writer_id="PEER")
+    key = "k"
+    peer.set(key, "peer-value")
+    prefix = reader._prefix(key)
+    peer_log = tmp_path / "c" / prefix / "PEER.log"
+    assert peer_log.exists()
+
+    orig_read = Path.read_bytes
+
+    def boom(self):
+        if self == peer_log:
+            raise OSError("simulated transient I/O error")
+        return orig_read(self)
+
+    monkeypatch.setattr(Path, "read_bytes", boom)
+    reader.consolidate(prefix)  # the read error is caught into `unread`, not raised
+    assert peer_log.exists()  # not pruned — its record was never merged
+
+
+def test_parse_frame_rejects_non_record_pickle():
+    """A blob that unpickles cleanly but is not a 6-field record of the right types
+    must be rejected, so a false resync anchor can't seat a poison record."""
+    six_char_string = pickle.dumps("abcdef")  # a 6-element iterable, wrong shape
+    assert _parse_frame(_HEADER.pack(len(six_char_string)) + six_char_string, 0) is None
+
+    mistyped = pickle.dumps((123, None, None, "not-a-float", False, None))
+    assert _parse_frame(_HEADER.pack(len(mistyped)) + mistyped, 0) is None
+
+
+def test_parse_frame_rejects_trailing_bytes():
+    """An over-long `length` header (pickle plus trailing garbage) is not a genuine
+    frame boundary and must be rejected — the exact-length check."""
+    blob = _frame(_rec("k", "v"))[_HEADER.size :]  # just the pickle bytes
+    padded = blob + b"\x00\x00\x00\x00"  # trailing bytes the pickle won't consume
+    assert _parse_frame(_HEADER.pack(len(padded)) + padded, 0) is None
+
+
+def test_resync_skips_0x80_inside_value_blob(tmp_path):
+    """A `0x80` byte living inside a value payload is not a frame start; resync must
+    step over it and land on the real next frame."""
+    log = tmp_path / "00" / "test.log"
+    payload = b"\x80\x80 not a frame \x80\x95\x80"
+    offs = _write_log(log, _rec("torn", "t"), _rec("real", payload))
+    raw = bytearray(log.read_bytes())
+    raw[offs[0] + _HEADER.size] = 0xFF  # corrupt the first frame's blob
+    log.write_bytes(bytes(raw))
+
+    records = list(_iter_records(log))
+    assert [r.key for r in records] == ["real"]
+    assert records[0].value == payload  # recovered intact, no false anchor mid-blob
+
+
+def test_iter_records_terminates_on_all_0x80(tmp_path):
+    """A buffer that is nothing but `0x80` candidates must terminate (forward
+    progress) and yield no phantom records."""
+    log = tmp_path / "00" / "test.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_bytes(b"\x80" * 500)
+    assert list(_iter_records(log)) == []
 
 
 def test_compaction_shrinks_and_keeps_latest(tmp_path):
