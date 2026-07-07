@@ -228,6 +228,19 @@ def test_corrupt_spill_is_a_warned_miss(tmp_path, caplog):
     assert any("unreadable" in r.message for r in caplog.records)
 
 
+def test_missing_spill_is_a_quiet_miss(tmp_path, caplog):
+    """A record whose spill file isn't present yet (sync lag) misses quietly — only
+    a present-but-unreadable spill or a persistent I/O error warns."""
+    c = LogCache(tmp_path / "c", writer_id="A", min_file_size=1)
+    c.set("k", "value-that-spills")
+    rec = c._ensure_index(c._prefix("k"))["k"]
+    (c.directory / rec.spill).unlink()  # spill not synced yet
+    fresh = LogCache(tmp_path / "c", writer_id="A", min_file_size=1, index_ttl=0)
+    with caplog.at_level("WARNING"):
+        assert fresh.get("k", "MISS") == "MISS"
+    assert not caplog.records  # genuine sync-lag miss stays quiet
+
+
 def test_iter_records_propagates_read_error(tmp_path, monkeypatch):
     """A read error must NOT be swallowed into an empty iteration: callers rely on
     it propagating (`_collect_live_across_logs` marks the source `unread` so prune

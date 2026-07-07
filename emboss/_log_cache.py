@@ -626,10 +626,19 @@ class LogCache:
         if rec.spill:
             try:
                 return self._spill_read(rec.spill)
-            except OSError:
-                return (
-                    default  # spill not present yet (e.g. log synced before it) -> miss
+            except FileNotFoundError:
+                return default  # spill not present yet (log synced before it) -> miss
+            except (
+                OSError
+            ) as exc:  # persistent I/O error (EACCES/EIO): warn, don't hide
+                logger.warning(
+                    "emboss.LogCache: spill file %s for key %r could not be read "
+                    "(%s); treating as a miss.",
+                    rec.spill,
+                    key,
+                    exc,
                 )
+                return default
             except Exception:  # noqa: BLE001 — corrupt/unpicklable spill: warn, miss (don't crash)
                 logger.warning(
                     "emboss.LogCache: spill file %s for key %r is present but "
