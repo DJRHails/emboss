@@ -8,7 +8,7 @@ import time
 import pytest
 
 from emboss import Cache, LogCache, cached
-from emboss._log_cache import _HEADER, _frame, _iter_records, _Record
+from emboss._log_cache import _HEADER, _frame, _iter_records, _read_records, _Record
 
 
 @pytest.fixture
@@ -211,6 +211,34 @@ def test_truncated_final_write_stays_quiet(tmp_path, caplog):
         keys = [r.key for r in _iter_records(log)]
     assert keys == ["a"]
     assert not any("torn/corrupt frame" in r.message for r in caplog.records)
+
+
+def test_compaction_drops_torn_frame_permanently_and_warns(tmp_path, caplog):
+    """A rewrite (compaction) removes the malformed frame from disk — the healed log has no tear
+    and reads clean without resync — and logs that it did so."""
+    log = tmp_path / "00" / "A.log"
+    offs = _write_log(log, _rec("a", "A"), _rec("b", "B"), _rec("c", "C"))
+    raw = bytearray(log.read_bytes())
+    bs = offs[1] + _HEADER.size
+    raw[bs : bs + 3] = b"\xff\xff\xff"  # corrupt the middle frame
+    log.write_bytes(bytes(raw))
+
+    c = LogCache(tmp_path, writer_id="A")
+    with caplog.at_level("WARNING"):
+        c.compact("00")
+    assert any("dropped the malformed frame" in r.message for r in caplog.records)
+    # After the rewrite the log is clean: no tear, only the two good records, and reads without
+    # having to recover anything past a tear.
+    scan = _read_records(log)
+    assert scan.tear_at is None and scan.recovered == 0
+    assert {r.key for r in scan.records} == {"a", "c"}
+
+
+def test_read_records_propagates_oserror(tmp_path):
+    """`_read_records` must NOT swallow a read error into an empty result — consolidation relies
+    on the OSError to mark a source unread and never prune it."""
+    with pytest.raises(OSError):
+        _read_records(tmp_path / "does-not-exist" / "x.log")
 
 
 def test_corrupt_spill_is_a_warned_miss(tmp_path, caplog):
@@ -580,14 +608,14 @@ def test_consolidate_keeps_unreadable_source(tmp_path, monkeypatch):
     LogCache(root, writer_id="PEER", prefix_width=1).set("f", 2)
     prefix = LogCache(root, prefix_width=1)._prefix("d")
     peer_log = root / prefix / "PEER.log"
-    real_iter = m._iter_records
+    real_read = m._read_records
 
     def flaky(path):
         if path.name == "PEER.log":
             raise OSError("transient read failure")
-        return real_iter(path)
+        return real_read(path)
 
-    monkeypatch.setattr(m, "_iter_records", flaky)
+    monkeypatch.setattr(m, "_read_records", flaky)  # the parse entrypoint consolidation uses
     LogCache(root, writer_id="A", prefix_width=1).consolidate(prefix)
     monkeypatch.undo()
 
