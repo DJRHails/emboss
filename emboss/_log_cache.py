@@ -409,10 +409,10 @@ class LogCache:
                 for rec in keep:
                     out.write(_frame(rec))
             os.replace(tmp, path)
-        if scan.tear_at is not None:  # the rewrite drops the malformed frame(s) from disk
+        if scan.recovered:  # a real mid-log tear was healed; a benign final tear stays quiet
             logger.warning(
                 "emboss.LogCache: compacted %s past a torn frame at byte %d — dropped the "
-                "malformed frame(s) permanently, kept %d recovered record(s).",
+                "malformed frame(s) permanently and resynced %d later record(s).",
                 path,
                 scan.tear_at,
                 scan.recovered,
@@ -494,7 +494,7 @@ class LogCache:
             except OSError:
                 unread.add(name)  # transient read error → never prune this source
                 continue
-            if scan.tear_at is not None:  # the consolidated rewrite drops these permanently
+            if scan.recovered:  # real mid-log tear; a benign final tear is dropped quietly
                 logger.warning(
                     "emboss.LogCache: consolidating %s past a torn frame at byte %d — merging "
                     "%d recovered record(s) into %s and dropping the malformed frame(s).",
