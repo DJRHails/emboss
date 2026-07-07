@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import logging
 import os
 import pickle
 import shutil
@@ -83,8 +84,11 @@ from collections.abc import Iterator, Set as AbstractSet
 from pathlib import Path
 from typing import Any, NamedTuple
 
+logger = logging.getLogger(__name__)
+
 _MISSING = object()
 _HEADER = struct.Struct(">I")  # 4-byte big-endian record length
+_PROTO = b"\x80"  # pickle PROTO opcode: every blob (protocol >= 2) starts with it
 _DEFAULT_MAX_LOG_BYTES = 4 * 2**20  # compact a node's per-prefix log past 4 MB
 _DEFAULT_PREFIX_WIDTH = 2  # 2 hex chars -> 256 shard dirs
 _DEFAULT_INDEX_TTL = 1.0  # seconds a per-prefix index is reused before re-stat'ing
@@ -101,21 +105,86 @@ class _Record(NamedTuple):
     spill: str | None  # relative path to a side file holding the value, or None
 
 
+def _parse_frame(data: bytes, pos: int) -> tuple[_Record, int] | None:
+    """Try to parse one `[length][blob]` frame at `pos`; return `(record, end)` or
+    `None` if the header is short, the blob runs past EOF, or the blob does not
+    unpickle into a 6-field record."""
+    if pos + _HEADER.size > len(data):
+        return None
+    (length,) = _HEADER.unpack(data[pos : pos + _HEADER.size])
+    blob_start = pos + _HEADER.size
+    blob_end = blob_start + length
+    if blob_end > len(data):
+        return None  # truncated / corrupt length field
+    try:
+        return _Record(*pickle.loads(data[blob_start:blob_end])), blob_end
+    except Exception:  # noqa: BLE001 — torn/corrupt frame; caller resyncs
+        return None
+
+
+def _resync(data: bytes, after: int) -> int | None:
+    """Find the start of the next valid frame strictly after byte `after`.
+
+    Every blob begins with the pickle PROTO opcode (`0x80`), so each `0x80` in the
+    stream is a candidate blob start whose frame begins `_HEADER.size` bytes
+    earlier. Return the first such frame-start that re-parses; `None` at EOF. The
+    search begins past `after`'s header so the returned frame is strictly after the
+    torn one (guaranteeing forward progress)."""
+    search = after + _HEADER.size + 1
+    while True:
+        idx = data.find(_PROTO, search)
+        if idx < 0:
+            return None
+        frame_start = idx - _HEADER.size
+        if frame_start > after and _parse_frame(data, frame_start) is not None:
+            return frame_start
+        search = idx + 1
+
+
 def _iter_records(path: Path) -> Iterator[_Record]:
-    """Yield records from a log, stopping at the first torn/corrupt tail."""
-    with open(path, "rb") as f:
-        while True:
-            header = f.read(_HEADER.size)
-            if len(header) < _HEADER.size:
-                return
-            (length,) = _HEADER.unpack(header)
-            blob = f.read(length)
-            if len(blob) < length:
-                return  # truncated final write (crash mid-append)
-            try:
-                yield _Record(*pickle.loads(blob))
-            except Exception:  # noqa: BLE001 — a corrupt tail ends the log
-                return
+    """Yield records from a log, **skipping torn/corrupt frames and resyncing** to
+    the next valid frame rather than stopping at the first bad one.
+
+    A torn frame (a crash or a concurrent container teardown mid-append) can land
+    *mid-log* with valid frames after it. The old behaviour — return at the first
+    unreadable frame — stranded every record past the tear: invisible to reads, so
+    each one silently re-executes and re-bills forever. Here a bad frame is skipped
+    (resynced via the PROTO-opcode anchor) and recovery is logged. A benign
+    truncated *final* write (the documented crash-mid-append case) recovers nothing
+    past it and stays quiet."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return
+    n = len(data)
+    pos = 0
+    tear_at: int | None = None
+    recovered_past_tear = 0
+    while pos + _HEADER.size <= n:
+        parsed = _parse_frame(data, pos)
+        if parsed is not None:
+            rec, end = parsed
+            if tear_at is not None:
+                recovered_past_tear += 1
+            yield rec
+            pos = end
+            continue
+        if tear_at is None:
+            tear_at = pos
+        nxt = _resync(data, pos)
+        if nxt is None:
+            break
+        pos = nxt
+    if recovered_past_tear:
+        logger.warning(
+            "emboss.LogCache: torn/corrupt frame(s) in %s starting at byte %d — "
+            "resynced past them and recovered %d later record(s) that would "
+            "otherwise be invisible (they were re-executing on every read). "
+            "Run consolidate() or compact() to rewrite the log cleanly.",
+            path,
+            tear_at,
+            recovered_past_tear,
+        )
 
 
 def _frame(rec: _Record) -> bytes:
@@ -521,9 +590,15 @@ class LogCache:
             try:
                 return self._spill_read(rec.spill)
             except OSError:
-                return (
-                    default  # spill not present yet (e.g. log synced before it) -> miss
+                return default  # spill not present yet (e.g. log synced before it) -> miss
+            except Exception:  # noqa: BLE001 — corrupt/unpicklable spill: warn, miss (don't crash)
+                logger.warning(
+                    "emboss.LogCache: spill file %s for key %r is present but "
+                    "unreadable (corrupt/partial write); treating as a miss.",
+                    rec.spill,
+                    key,
                 )
+                return default
         return rec.value
 
     def set(

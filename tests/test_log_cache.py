@@ -8,7 +8,7 @@ import time
 import pytest
 
 from emboss import Cache, LogCache, cached
-from emboss._log_cache import _iter_records
+from emboss._log_cache import _HEADER, _frame, _iter_records, _Record
 
 
 @pytest.fixture
@@ -131,6 +131,99 @@ def test_torn_tail_ignored(tmp_path):
     with open(log, "ab") as f:
         f.write(b"\x00\x00\x10\x00partial-record")  # claims 4 KB, supplies a few bytes
     assert LogCache(tmp_path / "c", writer_id="B").get("k") == "good"
+
+
+def _write_log(path, *records):
+    """Write raw framed records to a fresh log; return the byte offset of each."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    offsets, buf = [], bytearray()
+    for rec in records:
+        offsets.append(len(buf))
+        buf += _frame(rec)
+    path.write_bytes(bytes(buf))
+    return offsets
+
+
+def _rec(key, value):
+    return _Record(key, value, None, time.time(), False, None)
+
+
+def test_mid_log_tear_recovers_later_records(tmp_path):
+    """The bug: a torn frame mid-log must NOT strand every record after it."""
+    log = tmp_path / "00" / "test.log"
+    before, torn, after = _rec("a", "A"), _rec("b", "B"), _rec("c", "C")
+    offs = _write_log(log, before, torn, after)
+    # Corrupt the middle frame's blob in place (keep its length header intact) so it
+    # fails to unpickle but the file stays the same size — a genuine mid-log tear.
+    raw = bytearray(log.read_bytes())
+    blob_start = offs[1] + _HEADER.size
+    raw[blob_start : blob_start + 3] = b"\xff\xff\xff"
+    log.write_bytes(bytes(raw))
+
+    keys = [r.key for r in _iter_records(log)]
+    assert keys == ["a", "c"]  # the torn "b" is skipped, "c" is recovered (not stranded)
+
+
+def test_mid_log_tear_via_cache_get(tmp_path):
+    """End-to-end: a value written after a mid-log tear stays readable."""
+    reader = LogCache(tmp_path / "c", writer_id="R", index_ttl=0)
+    # Two keys in the same prefix shard so they land in one log (the tear between).
+    prefix, first, second = None, None, None
+    seen: dict[str, str] = {}
+    for i in range(10000):
+        k = f"key{i}"
+        p = reader._prefix(k)
+        if p in seen:
+            prefix, first, second = p, seen[p], k
+            break
+        seen[p] = k
+    assert prefix is not None, "no colliding prefix found"
+    log = tmp_path / "c" / prefix / "W.log"
+    offs = _write_log(log, _rec(first, "v1"), _rec("torn", "x"), _rec(second, "v3"))
+    raw = bytearray(log.read_bytes())
+    bs = offs[1] + _HEADER.size
+    raw[bs : bs + 3] = b"\xff\xff\xff"  # corrupt the middle frame's blob in place
+    log.write_bytes(bytes(raw))
+    assert reader.get(first) == "v1"
+    assert reader.get(second) == "v3"  # None under the old stop-at-first-tear reader
+
+
+def test_mid_log_tear_warns(tmp_path, caplog):
+    log = tmp_path / "00" / "test.log"
+    offs = _write_log(log, _rec("a", "A"), _rec("b", "B"), _rec("c", "C"))
+    raw = bytearray(log.read_bytes())
+    bs = offs[1] + _HEADER.size
+    raw[bs : bs + 3] = b"\xff\xff\xff"
+    log.write_bytes(bytes(raw))
+    with caplog.at_level("WARNING"):
+        list(_iter_records(log))
+    assert any("torn/corrupt frame" in r.message for r in caplog.records)
+
+
+def test_truncated_final_write_stays_quiet(tmp_path, caplog):
+    """A truncated *final* frame recovers nothing past it — the documented benign
+    crash-mid-append case — so it must not warn."""
+    log = tmp_path / "00" / "test.log"
+    _write_log(log, _rec("a", "A"))
+    with open(log, "ab") as f:
+        f.write(_HEADER.pack(4096) + b"partial")  # claims 4 KB, supplies 7 bytes
+    with caplog.at_level("WARNING"):
+        keys = [r.key for r in _iter_records(log)]
+    assert keys == ["a"]
+    assert not any("torn/corrupt frame" in r.message for r in caplog.records)
+
+
+def test_corrupt_spill_is_a_warned_miss(tmp_path, caplog):
+    """A record whose spill file is present but unreadable must miss (recompute),
+    not crash the get()."""
+    c = LogCache(tmp_path / "c", writer_id="A", min_file_size=1)  # force every value to spill
+    c.set("k", "value-that-spills")
+    rec = c._ensure_index(c._prefix("k"))["k"]
+    (c.directory / rec.spill).write_bytes(b"\x00not-a-pickle")  # corrupt the spill
+    fresh = LogCache(tmp_path / "c", writer_id="A", min_file_size=1, index_ttl=0)
+    with caplog.at_level("WARNING"):
+        assert fresh.get("k", "MISS") == "MISS"
+    assert any("unreadable" in r.message for r in caplog.records)
 
 
 def test_compaction_shrinks_and_keeps_latest(tmp_path):
