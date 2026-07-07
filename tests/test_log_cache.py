@@ -325,6 +325,29 @@ def test_iter_records_terminates_on_all_0x80(tmp_path):
     assert list(_iter_records(log)) == []
 
 
+def test_compact_aborts_on_read_error_without_truncating(tmp_path, monkeypatch):
+    """A read error during compaction must abort — never `os.replace` an empty log
+    over the real one (the pre-fix bug: swallowed `OSError` -> `keep == []` ->
+    truncation). The record must survive intact."""
+    c = LogCache(tmp_path / "c", writer_id="A")
+    c.set("k", "v")
+    log = c._log_path(c._prefix("k"))
+    before = log.read_bytes()
+    orig_read = Path.read_bytes
+
+    def boom(self):
+        if self == log:
+            raise OSError("simulated transient I/O error")
+        return orig_read(self)
+
+    monkeypatch.setattr(Path, "read_bytes", boom)
+    with pytest.raises(OSError, match="simulated transient"):
+        c.compact(c._prefix("k"))
+    monkeypatch.undo()
+    assert log.read_bytes() == before  # real log intact, not truncated to empty
+    assert c.get("k") == "v"
+
+
 def test_compaction_shrinks_and_keeps_latest(tmp_path):
     c = LogCache(tmp_path / "c", writer_id="A")
     for i in range(200):
