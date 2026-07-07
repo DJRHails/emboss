@@ -234,6 +234,26 @@ def test_compaction_drops_torn_frame_permanently_and_warns(tmp_path, caplog):
     assert {r.key for r in scan.records} == {"a", "c"}
 
 
+def test_compaction_of_benign_final_tear_stays_quiet(tmp_path, caplog):
+    """A truncated *final* frame recovers nothing past it — the documented benign crash-mid-append
+    case. Compaction drops it while rewriting, but (like the read path) must NOT warn: nothing was
+    stranded, so a WARNING on every routine teardown tail would be noise."""
+    log = tmp_path / "00" / "A.log"
+    _write_log(log, _rec("a", "A"), _rec("b", "B"))
+    with open(log, "ab") as f:
+        f.write(_HEADER.pack(4096) + b"partial")  # torn final frame: claims 4 KB, supplies 7 bytes
+
+    c = LogCache(tmp_path, writer_id="A")
+    with caplog.at_level("WARNING"):
+        c.compact("00")
+    assert not any(
+        "torn frame" in r.message or "malformed frame" in r.message for r in caplog.records
+    )
+    scan = _read_records(log)
+    assert scan.tear_at is None and scan.recovered == 0
+    assert {r.key for r in scan.records} == {"a", "b"}
+
+
 def test_read_records_propagates_oserror(tmp_path):
     """`_read_records` must NOT swallow a read error into an empty result — consolidation relies
     on the OSError to mark a source unread and never prune it."""
