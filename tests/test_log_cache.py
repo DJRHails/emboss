@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import os
 import time
 
 import pytest
@@ -798,3 +799,28 @@ def test_default_writer_id_collapses_bare_container_hostname(monkeypatch):
     assert m._default_writer_id() == "container-orphan"
     monkeypatch.setattr(m.socket, "gethostname", lambda: "bonbon")
     assert m._default_writer_id() == "bonbon"
+
+
+def test_orphaned_legacy_namespace_is_swept(tmp_path):
+    """A legacy `<writer>.spill/` dir whose log is GONE must be collected: nothing
+    references its files, and its existence re-arms the migration flag forever."""
+    root = tmp_path / "c"
+    a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
+    a.set("d", "v" * 5000)  # a live record so the consolidated log is non-empty
+    prefix = a._prefix("d")
+    orphan = root / prefix / "ghost.spill"
+    orphan.mkdir()
+    stale = orphan / "leftover.val"
+    stale.write_bytes(b"pre-pool leftovers")
+    old = time.time() - 7200
+    os.utime(stale, (old, old))  # past the grace window
+
+    a.consolidate(prefix)
+    assert not orphan.exists()  # orphaned namespace collected
+    assert a.get("d") == "v" * 5000
+
+    young_orphan = root / prefix / "ghost2.spill"
+    young_orphan.mkdir()
+    (young_orphan / "fresh.val").write_bytes(b"maybe a pre-pool writer still runs")
+    a.consolidate(prefix)
+    assert young_orphan.exists()  # grace window postpones the sweep
