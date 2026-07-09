@@ -1,6 +1,6 @@
 [project]
 name = "emboss"
-version = "0.7.1"
+version = "0.7.2"
 authors = [
     { name="Daniel Hails", email="emboss@hails.info" },
 ]
@@ -32,7 +32,7 @@ readme = {file = ["README.md"], content-type = "text/markdown"}
 find = {}
 
 [tool.bumpver]
-current_version = "0.6.3"
+current_version = "0.7.2"
 version_pattern = "MAJOR.MINOR.PATCH"
 commit_message = "bump version {old_version} -> {new_version}"
 commit = true
@@ -44,9 +44,6 @@ push = true
     'current_version = "{version}"',
     'version = "{version}"',
 ]
-"emboss/__init__.py" = [
-    '__version__ = "{version}"',
-]
 "README.md" = [
-    "{version}",
+    "Version: {version}",
 ]

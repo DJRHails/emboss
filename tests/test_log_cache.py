@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import shutil
 import os
+import shutil
 import time
 
 import pytest
@@ -814,6 +814,7 @@ def test_orphaned_legacy_namespace_is_swept(tmp_path):
     stale.write_bytes(b"pre-pool leftovers")
     old = time.time() - 7200
     os.utime(stale, (old, old))  # past the grace window
+    os.utime(orphan, (old, old))  # the dir too — its mtime is also grace-checked
 
     a.consolidate(prefix)
     assert not orphan.exists()  # orphaned namespace collected
@@ -824,3 +825,23 @@ def test_orphaned_legacy_namespace_is_swept(tmp_path):
     (young_orphan / "fresh.val").write_bytes(b"maybe a pre-pool writer still runs")
     a.consolidate(prefix)
     assert young_orphan.exists()  # grace window postpones the sweep
+
+
+def test_young_empty_orphan_namespace_postponed(tmp_path):
+    """A just-created EMPTY orphan dir may be a syncer mid-copy (the dir lands
+    before its files) or a pre-pool writer between mkdir and its first spill
+    write — the grace window must cover the dir itself, not only its files."""
+    root = tmp_path / "c"
+    a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
+    a.set("d", "v" * 5000)
+    prefix = a._prefix("d")
+
+    young_empty = root / prefix / "ghost.spill"
+    young_empty.mkdir()  # zero files, zero seconds old — inside the grace window
+    a.consolidate(prefix)
+    assert young_empty.exists()  # postponed, not yanked out from under a writer
+
+    old = time.time() - 7200
+    os.utime(young_empty, (old, old))  # aged past the grace window
+    a.consolidate(prefix)
+    assert not young_empty.exists()  # empty orphan collected once aged

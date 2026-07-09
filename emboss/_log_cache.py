@@ -654,8 +654,14 @@ class LogCache:
         forever. Same guards as the pool sweep: skipped when any source log was
         unreadable (unknown references), skipped while any consolidated record
         still points into the dir (`_resolve_spills` repoints them, so this only
-        bites mid-migration edge cases), and postponed while any file is younger
-        than the grace window (a still-running pre-pool writer)."""
+        bites mid-migration edge cases), and postponed while the dir or any file
+        in it is younger than the grace window. The dir's own mtime matters: at
+        the empty moment — a syncer that created the dir before copying its
+        files, a pre-pool writer between mkdir and its first spill write (no log
+        exists yet on a first large `set()`) — there are no files to be young,
+        yet sweeping would yank the dir out from under the writer mid-flight. A
+        dir's mtime updates on entry creation/removal, so aged orphans (empty or
+        not) still sweep on the first pass."""
         if unread:
             return
         prefix = pdir.name
@@ -672,8 +678,8 @@ class LogCache:
                 continue
             try:
                 if any(
-                    now - entry.stat().st_mtime < self._SHARED_SPILL_GRACE_S
-                    for entry in entries
+                    now - p.stat().st_mtime < self._SHARED_SPILL_GRACE_S
+                    for p in (sdir, *entries)
                 ):
                     continue
             except OSError:
