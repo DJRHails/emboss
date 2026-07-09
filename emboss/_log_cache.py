@@ -104,7 +104,7 @@ import struct
 import threading
 import time
 import uuid
-from collections.abc import Iterator, MutableSet, Set as AbstractSet
+from collections.abc import Callable, Iterator, MutableSet, Set as AbstractSet
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -279,6 +279,14 @@ def _default_writer_id() -> str:
         hostname,
     )
     return "container-orphan"
+
+
+try:
+    import fcntl as _fcntl_probe  # noqa: F401 — availability probe; call sites import lazily
+
+    _HAS_FCNTL = True
+except ImportError:  # pragma: no cover — non-POSIX
+    _HAS_FCNTL = False
 
 
 def _flock(fileobj: Any, op: int) -> None:
@@ -631,7 +639,7 @@ class LogCache:
             return
         self._run_batch(self._consolidate_prefix)
 
-    def _run_batch(self, per_prefix: Any) -> None:
+    def _run_batch(self, per_prefix: Callable[[str], None]) -> None:
         """Run a per-prefix pass over every prefix dir, fanned across a thread pool.
 
         Deliberately NOT under `self._lock`: holding it for a whole multi-minute batch
@@ -639,22 +647,38 @@ class LogCache:
         file mutation sits under the per-(prefix, writer) flock, which also excludes this
         process's own threads (each task opens its own lock fd) — and the in-memory maps
         tolerate racing single-op mutations as bounded `index_ttl`-style staleness (a
-        just-invalidated index rebuilds on the next read). One prefix's failure doesn't
-        abort the others; the first error is re-raised once the batch completes."""
+        just-invalidated index rebuilds on the next read). Where `fcntl` is unavailable
+        the flock is a no-op and nothing would exclude a racing same-process `set()`, so
+        the batch keeps the old serial pass under `self._lock` (which, as before #16,
+        stops at the first raising prefix). On the fanned path one prefix's failure
+        doesn't abort the others; every suppressed failure is logged with its prefix and
+        the first error re-raises once the batch completes."""
         prefixes = [pdir.name for pdir in self.directory.iterdir() if pdir.is_dir()]
         if not prefixes:
             return
-        errors: list[BaseException] = []
-        with ThreadPoolExecutor(
-            max_workers=min(_BATCH_POOL_WIDTH, len(prefixes))
-        ) as pool:
-            for future in [pool.submit(per_prefix, prefix) for prefix in prefixes]:
+        if not _HAS_FCNTL:  # non-POSIX: no flock, so the batch must not race same-process ops
+            with self._lock:
+                for prefix in prefixes:
+                    per_prefix(prefix)
+            return
+        errors: list[tuple[str, BaseException]] = []
+        with ThreadPoolExecutor(max_workers=min(_BATCH_POOL_WIDTH, len(prefixes))) as pool:
+            futures = [(prefix, pool.submit(per_prefix, prefix)) for prefix in prefixes]
+            for prefix, future in futures:
                 try:
                     future.result()
                 except BaseException as err:  # noqa: BLE001 — finish the batch, raise after
-                    errors.append(err)
-        if errors:
-            raise errors[0]
+                    errors.append((prefix, err))
+        if not errors:
+            return
+        for prefix, err in errors[1:]:
+            logger.warning(
+                "emboss.LogCache: batch pass failed for prefix %s/ — suppressed in favour "
+                "of the first error, which re-raises: %r",
+                prefix,
+                err,
+            )
+        raise errors[0][1]
 
     def _consolidate_prefix(self, prefix: str) -> None:
         pdir = self.directory / prefix
