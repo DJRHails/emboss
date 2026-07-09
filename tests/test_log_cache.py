@@ -309,7 +309,13 @@ def test_size_limit_best_effort_per_log(tmp_path):
 
 
 def _spills(root):
-    return list(root.glob("**/*.spill/*.val"))
+    return list(root.glob("**/spill/*.val"))
+
+
+def _sweep_now(cache, prefix):
+    """Consolidate with the sweep grace collapsed to zero (test-only shortcut)."""
+    cache._SHARED_SPILL_GRACE_S = 0.0
+    cache.consolidate(prefix)
 
 
 def test_large_value_spills_to_file(tmp_path):
@@ -324,13 +330,19 @@ def test_large_value_spills_to_file(tmp_path):
     assert len(_spills(root)) == 1
 
 
-def test_spill_removed_on_overwrite(tmp_path):
+def test_superseded_spill_collected_by_sweep(tmp_path):
+    """An overwrite never deletes on the write path (the pool is shared across
+    writers and nodes); the superseded value's file waits for the consolidation
+    mark-and-sweep, which derives references from every log."""
     root = tmp_path / "c"
     c = LogCache(root, writer_id="A", min_file_size=100)
     c.set("k", "a" * 5000)
     assert len(_spills(root)) == 1
-    c.set("k", "b" * 5000)  # supersedes -> old spill removed, new written
-    assert len(_spills(root)) == 1
+    c.set("k", "b" * 5000)  # supersedes; the old pool file lingers until the sweep
+    assert len(_spills(root)) == 2
+    assert c.get("k") == "b" * 5000
+    _sweep_now(c, c._prefix("k"))
+    assert len(_spills(root)) == 1  # sweep collected the unreferenced value
     assert c.get("k") == "b" * 5000
 
 
@@ -339,19 +351,25 @@ def test_spill_removed_on_delete(tmp_path):
     c = LogCache(root, writer_id="A", min_file_size=100)
     c.set("k", "a" * 5000)
     c.delete("k")
+    _sweep_now(c, c._prefix("k"))
     assert _spills(root) == []
 
 
-def test_compaction_removes_expired_spills(tmp_path):
+def test_expired_spill_collected_by_sweep_not_compaction(tmp_path):
+    """Compaction rewrites only OUR log and cannot know a pool file is globally
+    unreferenced; the consolidation sweep — which reads every log — collects it."""
     root = tmp_path / "c"
-    c = LogCache(root, writer_id="A", min_file_size=100)
-    c.set("gone", "x" * 5000, expire=0.01)
-    c.set("keep", "y" * 5000)
+    keys = _SAME_PREFIX_KEYS[:2]  # one prefix, so one sweep covers both
+    c = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
+    c.set(keys[0], "x" * 5000, expire=0.01)
+    c.set(keys[1], "y" * 5000)
     time.sleep(0.03)
     assert len(_spills(root)) == 2  # expiry is lazy — both spill files still present
     c.compact()
-    assert len(_spills(root)) == 1  # compaction dropped the expired one's spill
-    assert c.get("keep") == "y" * 5000
+    assert len(_spills(root)) == 2  # compaction leaves the shared pool alone
+    _sweep_now(c, c._prefix(keys[0]))
+    assert len(_spills(root)) == 1  # the sweep dropped the expired one
+    assert c.get(keys[1]) == "y" * 5000
 
 
 def test_spilled_value_transfers(tmp_path):
@@ -503,15 +521,79 @@ def test_consolidate_foreign_spill_reread_byte_correct(tmp_path):
     b = LogCache(root, writer_id="B", prefix_width=1, min_file_size=100)
     b.set("big", big)
     prefix = b._prefix("big")
-    assert (root / prefix / "B.spill").is_dir()  # B spilled the large value
+    assert len(_spills(root)) == 1  # B spilled the large value into the shared pool
 
     a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
     a.consolidate(prefix)
 
     assert LogCache(root, writer_id="R", prefix_width=1, index_ttl=0).get("big") == big
-    assert not (root / prefix / "B.spill").exists()  # B's source spill pruned
-    assert (root / prefix / "A.spill").is_dir()  # re-spilled under our namespace
+    assert len(_spills(root)) == 1  # the pool file was never copied or moved
     assert {p.name for p in (root / prefix).glob("*.log")} == {"A.log"}
+
+
+def test_consolidate_twice_never_grows_the_pool(tmp_path):
+    """The incident regression guard: with uuid spill names every consolidation
+    pass re-copied every foreign value (45 GB -> 160 GB in a day once a syncer
+    kept resurrecting pruned peer logs). Content addressing makes passes
+    idempotent — the file count must not grow, whatever the pass count."""
+    root = tmp_path / "c"
+    for w in ("B", "C", "D"):
+        LogCache(root, writer_id=w, prefix_width=1, min_file_size=100).set(
+            f"k-{w}", w * 5000
+        )
+    a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
+    prefixes = {a._prefix(f"k-{w}") for w in ("B", "C", "D")}
+    for _ in range(3):
+        for prefix in prefixes:
+            a.consolidate(prefix)
+    assert len(_spills(root)) == 3  # one content-addressed file per distinct value
+    reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
+    assert all(reader.get(f"k-{w}") == w * 5000 for w in ("B", "C", "D"))
+
+
+def test_identical_values_share_one_pool_file(tmp_path):
+    """Cross-writer dedup at write time: the same bytes under any writer land on
+    the same content-addressed name — unified, never copied per writer."""
+    root = tmp_path / "c"
+    big = "same" * 2500
+    keys = _SAME_PREFIX_KEYS[:2]
+    LogCache(root, writer_id="A", prefix_width=1, min_file_size=100).set(keys[0], big)
+    LogCache(root, writer_id="B", prefix_width=1, min_file_size=100).set(keys[1], big)
+    assert len(_spills(root)) == 1  # two writers, two keys, ONE file
+    reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
+    assert reader.get(keys[0]) == big
+    assert reader.get(keys[1]) == big
+
+
+def test_legacy_namespace_spills_migrate_on_consolidation(tmp_path):
+    """A prefix holding the pre-pool per-writer layout is unified on sight: the
+    legacy file's bytes are adopted into the pool (hardlink — same inode), the
+    record is repointed, and the legacy namespace dies with its pruned log."""
+    root = tmp_path / "c"
+    b = LogCache(root, writer_id="B", prefix_width=1, min_file_size=100)
+    b.set("big", "z" * 5000)
+    prefix = b._prefix("big")
+    # Rebuild the legacy layout by hand: move the pool file into B's namespace
+    # and repoint B's record at it (as a pre-pool writer would have written).
+    pool_file = next((root / prefix / "spill").glob("*.val"))
+    legacy_dir = root / prefix / "B.spill"
+    legacy_dir.mkdir()
+    legacy_rel = f"{prefix}/B.spill/{pool_file.name}"
+    pool_file.rename(root / legacy_rel)
+    (root / prefix / "spill").rmdir()
+    log_path = root / prefix / "B.log"
+    recs = [r._replace(spill=legacy_rel) for r in _iter_records(log_path)]
+    log_path.write_bytes(b"".join(_frame(r) for r in recs))
+
+    a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
+    assert a.get("big") == "z" * 5000  # legacy refs still resolve pre-migration
+    a.consolidate(prefix)
+
+    assert not legacy_dir.exists()  # legacy namespace pruned with its log
+    assert len(list((root / prefix / "spill").glob("*.val"))) == 1  # adopted
+    assert LogCache(root, writer_id="R", prefix_width=1, index_ttl=0).get(
+        "big"
+    ) == "z" * 5000
 
 
 def test_consolidate_missing_foreign_spill_drops_record(tmp_path):
@@ -526,7 +608,7 @@ def test_consolidate_missing_foreign_spill_drops_record(tmp_path):
     # ref would actually be written — making this assertion able to catch it.
     LogCache(root, writer_id="B", prefix_width=1).set(keep_k, "ok")
     # simulate the spill file lagging behind the log (log synced, spill not yet)
-    shutil.rmtree(root / prefix / "B.spill")
+    shutil.rmtree(root / prefix / "spill")
 
     a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
     a.consolidate(prefix)
@@ -538,7 +620,7 @@ def test_consolidate_missing_foreign_spill_drops_record(tmp_path):
     reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
     assert reader.get(big_k) is None  # spilled value gone (recomputes on next read)
     assert reader.get(keep_k) == "ok"  # the other live entry survived
-    assert not (root / prefix / "A.spill").exists()  # we wrote no spill at all
+    assert not (root / prefix / "spill").exists()  # we wrote no spill at all
 
 
 def test_consolidate_empty_removes_log(tmp_path):
@@ -576,46 +658,46 @@ def test_auto_consolidate_on_writer_count(tmp_path):
     assert LogCache(root, writer_id="R", prefix_width=1, index_ttl=0).get("k") == "ME"
 
 
-def test_consolidate_drops_superseded_own_spill(tmp_path):
-    """A peer overwrites our spilled key with a newer value. consolidate must
-    delete OUR now-superseded spill — set() can't, since A never saw B win."""
+def test_consolidate_sweeps_superseded_value(tmp_path):
+    """A peer overwrites our spilled key with a newer value. The consolidation
+    sweep — the only pool deleter — must collect our now-unreferenced file."""
     root = tmp_path / "c"
     a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
-    a.set("d", "x" * 5000)  # A's spill for "d"
+    a.set("d", "x" * 5000)  # A's value for "d"
     prefix = a._prefix("d")
-    own_spill = root / prefix / "A.spill"
-    sA = next(p.name for p in own_spill.glob("*.val"))
     time.sleep(0.01)
     LogCache(root, writer_id="B", prefix_width=1, min_file_size=100).set(
         "d", "y" * 5000
     )  # newer
+    assert len(_spills(root)) == 2
 
-    LogCache(root, writer_id="A", prefix_width=1, min_file_size=100).consolidate(prefix)
+    gc = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
+    _sweep_now(gc, prefix)
 
     assert (
         LogCache(root, writer_id="R", prefix_width=1, index_ttl=0).get("d")
         == "y" * 5000
     )
-    remaining = {p.name for p in own_spill.glob("*.val")}
-    assert sA not in remaining  # superseded own spill deleted (not leaked)
-    assert len(remaining) == 1  # only the re-spilled winning value remains
+    assert len(_spills(root)) == 1  # superseded value swept, winner kept
 
 
-def test_consolidate_keeps_unreferenced_own_spill(tmp_path):
-    """An OWN spill not yet referenced by any log (a concurrent set() wrote it
-    before appending its record, outside the lock) must survive consolidate —
-    a glob-and-delete GC would orphan the imminent record."""
+def test_sweep_grace_protects_inflight_spill(tmp_path):
+    """A pool file not yet referenced by any log (a concurrent set() wrote it
+    before appending its record) must survive the sweep — the grace window is
+    what protects the imminent record from a glob-and-delete."""
     root = tmp_path / "c"
     a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
     a.set("d", "v" * 5000)  # a real spilled record so the log is non-empty
     prefix = a._prefix("d")
-    inflight = root / prefix / "A.spill" / "inflight.val"
+    inflight = root / prefix / "spill" / "inflight.val"
     inflight.write_bytes(b"not-yet-logged")  # simulate an in-flight concurrent spill
 
-    a.consolidate(prefix)
+    a.consolidate(prefix)  # default grace: the young unreferenced file survives
 
-    assert inflight.exists()  # only logged-and-superseded spills are GC'd
+    assert inflight.exists()
     assert a.get("d") == "v" * 5000
+    _sweep_now(a, prefix)  # grace collapsed: now it is genuinely orphaned -> swept
+    assert not inflight.exists()
 
 
 def test_consolidate_keeps_unreadable_source(tmp_path, monkeypatch):
@@ -705,3 +787,14 @@ def test_consolidate_then_cached_and_transfer(tmp_path):
         dst.get("blob") == "q" * 5000
     )  # spilled value survives transfer post-consolidate
     dst.close()
+
+
+def test_default_writer_id_collapses_bare_container_hostname(monkeypatch):
+    """A 12-hex docker hostname must not mint an ephemeral writer namespace —
+    orphaned containers share one id (flock-serialised, safe) with a warning."""
+    import emboss._log_cache as m
+
+    monkeypatch.setattr(m.socket, "gethostname", lambda: "2863d6c454a5")
+    assert m._default_writer_id() == "container-orphan"
+    monkeypatch.setattr(m.socket, "gethostname", lambda: "bonbon")
+    assert m._default_writer_id() == "bonbon"
