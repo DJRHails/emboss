@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
 import os
 import threading
@@ -828,9 +829,10 @@ def test_orphaned_legacy_namespace_is_swept(tmp_path):
 
 
 def test_batch_consolidate_parallel_equivalence(tmp_path):
-    """consolidate() with no prefix fans across a pool — the result must be exactly
-    the serial outcome: one log per touched prefix, every value readable, and a
-    concurrent same-process writer neither corrupts nor is lost (flock-serialised)."""
+    """consolidate() with no prefix fans across a pool — the outcome must match the
+    serial pass: every pre-batch value stays readable, and a concurrent same-process
+    writer's appends are neither corrupted nor lost (flock-serialised; a log appended
+    to mid-pass survives pruning via the re-stat guard)."""
     root = tmp_path / "c"
     for w in ("A", "B", "C"):
         writer = LogCache(root, writer_id=w, prefix_width=1, min_file_size=100)
@@ -839,13 +841,14 @@ def test_batch_consolidate_parallel_equivalence(tmp_path):
     gc = LogCache(root, writer_id="GC", prefix_width=1, min_file_size=100)
 
     stop = threading.Event()
+    wrote = 0
 
     def churn() -> None:  # a live writer racing the batch
+        nonlocal wrote
         live = LogCache(root, writer_id="LIVE", prefix_width=1, min_file_size=100)
-        i = 0
         while not stop.is_set():
-            live.set(f"live-{i % 4}", f"live-{i}-" + "x" * 3000)
-            i += 1
+            live.set(f"live-{wrote % 4}", f"live-{wrote}-" + "x" * 3000)
+            wrote += 1
 
     t = threading.Thread(target=churn, daemon=True)
     t.start()
@@ -859,3 +862,51 @@ def test_batch_consolidate_parallel_equivalence(tmp_path):
     for w in ("A", "B", "C"):
         for i in range(12):
             assert reader.get(f"{w}-{i}") == f"{w}-{i}-" + "v" * 3000
+    for k in range(min(wrote, 4)):  # no live append was lost or corrupted by the batch
+        got = reader.get(f"live-{k}")
+        assert got is not None
+        n = int(got.split("-")[1])
+        assert n % 4 == k and got == f"live-{n}-" + "x" * 3000
+
+
+def test_batch_pass_survives_prefix_failures(tmp_path, caplog):
+    """Failing prefixes must not abort the batch: every prefix is still attempted,
+    the first error re-raises once the batch completes, and the other failures are
+    logged rather than silently dropped."""
+    cache = LogCache(tmp_path / "c", writer_id="W", prefix_width=1)
+    for i in range(64):
+        cache.set(f"k{i}", i)
+    prefixes = sorted(p.name for p in (tmp_path / "c").iterdir() if p.is_dir())
+    assert len(prefixes) > 2
+    bad = set(prefixes[:2])
+    attempted: list[str] = []
+    real = cache._consolidate_prefix
+
+    def flaky(prefix: str) -> None:
+        attempted.append(prefix)  # list.append is atomic under the GIL
+        if prefix in bad:
+            raise RuntimeError(f"boom-{prefix}")
+        real(prefix)
+
+    cache._consolidate_prefix = flaky
+    with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match=r"boom-"):
+        cache.consolidate()
+    assert sorted(attempted) == prefixes
+    assert sum("suppressed" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_batch_falls_back_to_serial_without_fcntl(tmp_path, monkeypatch):
+    """Where fcntl is unavailable the flock is a no-op and nothing would exclude a
+    racing same-process set(), so the batch must keep the serial pass under the
+    process lock instead of fanning out."""
+    import emboss._log_cache as log_cache_module
+
+    monkeypatch.setattr(log_cache_module, "_HAS_FCNTL", False)
+    monkeypatch.setattr(log_cache_module, "ThreadPoolExecutor", None)  # fan-out would TypeError
+    cache = LogCache(tmp_path / "c", writer_id="W", prefix_width=1, min_file_size=100)
+    for i in range(24):
+        cache.set(f"k{i}", f"k{i}-" + "v" * 3000)
+    cache.consolidate()
+    reader = LogCache(tmp_path / "c", writer_id="R", prefix_width=1, index_ttl=0)
+    for i in range(24):
+        assert reader.get(f"k{i}") == f"k{i}-" + "v" * 3000
