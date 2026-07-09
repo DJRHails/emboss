@@ -588,7 +588,8 @@ class LogCache:
         tolerate racing single-op mutations as bounded `index_ttl`-style staleness (a
         just-invalidated index rebuilds on the next read). Where `fcntl` is unavailable
         the flock is a no-op and nothing would exclude a racing same-process `set()`, so
-        the batch keeps the old serial pass under `self._lock`. One prefix's failure
+        the batch keeps the old serial pass under `self._lock` (which, as before #16,
+        stops at the first raising prefix). On the fanned path one prefix's failure
         doesn't abort the others; every suppressed failure is logged with its prefix and
         the first error re-raises once the batch completes."""
         prefixes = [pdir.name for pdir in self.directory.iterdir() if pdir.is_dir()]

@@ -841,6 +841,7 @@ def test_batch_consolidate_parallel_equivalence(tmp_path):
     gc = LogCache(root, writer_id="GC", prefix_width=1, min_file_size=100)
 
     stop = threading.Event()
+    first_write = threading.Event()  # batch must not win the race outright
     wrote = 0
 
     def churn() -> None:  # a live writer racing the batch
@@ -849,10 +850,12 @@ def test_batch_consolidate_parallel_equivalence(tmp_path):
         while not stop.is_set():
             live.set(f"live-{wrote % 4}", f"live-{wrote}-" + "x" * 3000)
             wrote += 1
+            first_write.set()
 
     t = threading.Thread(target=churn, daemon=True)
     t.start()
     try:
+        assert first_write.wait(timeout=10)  # ensure the read-back below is never vacuous
         gc.consolidate()
     finally:
         stop.set()
