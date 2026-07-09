@@ -822,7 +822,10 @@ def test_default_writer_id_collapses_bare_container_hostname(monkeypatch):
 
 def test_orphaned_legacy_namespace_is_swept(tmp_path):
     """A legacy `<writer>.spill/` dir whose log is GONE must be collected: nothing
-    references its files, and its existence re-arms the migration flag forever."""
+    references its files, and its existence re-arms the migration flag forever.
+    Age counts from LOCAL arrival (`max(mtime, ctime)`): a syncer-delivered dir
+    keeps its old mtimes, and reaping it before its log can arrive would leave
+    that log's records dangling."""
     root = tmp_path / "c"
     a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
     a.set("d", "v" * 5000)  # a live record so the consolidated log is non-empty
@@ -832,17 +835,24 @@ def test_orphaned_legacy_namespace_is_swept(tmp_path):
     stale = orphan / "leftover.val"
     stale.write_bytes(b"pre-pool leftovers")
     old = time.time() - 7200
-    os.utime(stale, (old, old))  # past the grace window
-
-    a.consolidate(prefix)
-    assert not orphan.exists()  # orphaned namespace collected
-    assert a.get("d") == "v" * 5000
-
+    os.utime(stale, (old, old))  # syncer-preserved mtimes (file AND dir);
+    os.utime(orphan, (old, old))  # only ctime betrays the local arrival
     young_orphan = root / prefix / "ghost2.spill"
     young_orphan.mkdir()
     (young_orphan / "fresh.val").write_bytes(b"maybe a pre-pool writer still runs")
-    a.consolidate(prefix)
+    empty_orphan = root / prefix / "ghost3.spill"
+    empty_orphan.mkdir()  # a syncer creates the dir before copying files in
+
+    a.consolidate(prefix)  # default grace
+    assert stale.exists()  # survives: age counts from local arrival (ctime)
     assert young_orphan.exists()  # grace window postpones the sweep
+    assert empty_orphan.exists()  # the dir's own stat grants an empty one grace
+
+    _sweep_now(a, prefix)  # grace elapsed → all collected
+    assert not orphan.exists()
+    assert not young_orphan.exists()
+    assert not empty_orphan.exists()
+    assert a.get("d") == "v" * 5000
 
 
 def test_batch_consolidate_parallel_equivalence(tmp_path):
@@ -1241,6 +1251,8 @@ def test_failed_own_adoption_keeps_record_and_namespace(tmp_path, caplog):
     a.set("d", "z" * 5000)
     prefix = a._prefix("d")
     legacy_dir, legacy_file = _to_legacy(root, prefix, "A")
+    old = time.time() - 7200  # past the grace window: only the failed-adoption
+    os.utime(legacy_file, (old, old))  # skip protects the bytes from the sweep
     legacy_file.chmod(0)  # transient local fault, NOT a vanished file
 
     fresh = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
@@ -1248,13 +1260,42 @@ def test_failed_own_adoption_keeps_record_and_namespace(tmp_path, caplog):
         fresh.consolidate(prefix)
     legacy_file.chmod(0o644)
 
-    assert legacy_dir.exists()  # own namespace kept — the only copy survives
+    assert legacy_file.exists()  # own namespace kept — the only copy survives
     recs = list(_iter_records(root / prefix / "A.log"))
     assert any(r.key == "d" for r in recs)  # the rewrite did not shed the record
     assert any("could not adopt" in r.message for r in caplog.records)
     fresh.consolidate(prefix)  # fault cleared → the retry migrates and removes
     assert not legacy_dir.exists()
     assert len(list((root / prefix / "spill").glob("*.val"))) == 1  # adopted
+    assert (
+        LogCache(root, writer_id="R", prefix_width=1, index_ttl=0).get("d")
+        == "z" * 5000
+    )
+
+
+def test_failed_peer_adoption_keeps_legacy_bytes(tmp_path, caplog):
+    """A PEER namespace whose adoption failed is skipped by the legacy sweep even
+    past the grace window: its records were dropped from the merge (so the kept
+    set cannot vouch for its files), and the retry its kept log guarantees needs
+    the bytes still on disk — sweeping them would turn a transient fault into a
+    permanent loss."""
+    root = tmp_path / "c"
+    b = LogCache(root, writer_id="B", prefix_width=1, min_file_size=100)
+    b.set("d", "z" * 5000)
+    prefix = b._prefix("d")
+    legacy_dir, legacy_file = _to_legacy(root, prefix, "B")
+    legacy_file.chmod(0)  # adoption (a content hash) fails; stat still works
+
+    a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
+    with caplog.at_level("WARNING"):
+        _sweep_now(a, prefix)  # grace collapsed: only the skip protects the bytes
+    legacy_file.chmod(0o644)
+
+    assert legacy_file.exists()  # bytes survive for the retry
+    assert (root / prefix / "B.log").exists()  # with the log that references them
+    assert any("could not adopt" in r.message for r in caplog.records)
+    a.consolidate(prefix)  # fault cleared → the retry adopts and prunes
+    assert not legacy_dir.exists()
     assert (
         LogCache(root, writer_id="R", prefix_width=1, index_ttl=0).get("d")
         == "z" * 5000

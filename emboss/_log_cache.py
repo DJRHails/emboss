@@ -645,7 +645,9 @@ class LogCache:
         if not prefixes:
             return
         errors: list[BaseException] = []
-        with ThreadPoolExecutor(max_workers=min(_BATCH_POOL_WIDTH, len(prefixes))) as pool:
+        with ThreadPoolExecutor(
+            max_workers=min(_BATCH_POOL_WIDTH, len(prefixes))
+        ) as pool:
             for future in [pool.submit(per_prefix, prefix) for prefix in prefixes]:
                 try:
                     future.result()
@@ -695,7 +697,9 @@ class LogCache:
             # pool-referencing record from those same logs was merged into
             # `consolidated` — so the pool reference set is still complete.
             self._sweep_shared_spills(pdir, consolidated, unread, now)
-            self._sweep_legacy_namespaces(pdir, consolidated, unread, now)
+            self._sweep_legacy_namespaces(
+                pdir, consolidated, unread, failed_adoptions, now
+            )
             if self.writer_id not in failed_adoptions:
                 # Our own legacy namespace is never pruned with a log (our log is
                 # the destination), and only our own records ever referenced it —
@@ -709,7 +713,6 @@ class LogCache:
                         "it is removable.",
                         own_legacy,
                     )
-            self._reap_orphan_legacy_dirs(pdir, failed_adoptions, now)
         self._index.pop(prefix, None)  # force rebuild
         self._sig.pop(prefix, None)
         self._checked.pop(prefix, None)
@@ -775,6 +778,7 @@ class LogCache:
         pdir: Path,
         consolidated: list[_Record],
         unread: AbstractSet[str],
+        failed_adoptions: AbstractSet[str],
         now: float,
     ) -> None:
         """Collect legacy `<writer>.spill/` namespaces — file by file, then the dir.
@@ -787,30 +791,46 @@ class LogCache:
         after full migration), and a dir that outlived its log re-armed the
         migration flag on every index build. Same guards as the pool sweep: skipped
         when any source log was unreadable (unknown references), per-file kept-set
-        check, and a grace window per file (a still-running pre-pool writer). The
-        dir goes once it is empty, so the migration flag stops re-arming."""
+        check, and a grace window per file by `max(mtime, ctime)` — a still-running
+        pre-pool writer, or a syncer that delivered the namespace before its log
+        (old mtimes are preserved; ctime is stamped on local arrival). The dir goes
+        once it is empty — so the migration flag stops re-arming — but only when
+        the dir itself is past the grace window, giving an empty namespace (a
+        syncer creates the dir before copying files in) the same grace as its
+        files. A namespace whose adoption failed this pass is skipped outright:
+        its records were dropped from `consolidated` (so the kept set cannot
+        vouch for its files, however old), and the retry that its kept log
+        guarantees needs the legacy bytes still on disk."""
         if unread:
             return
         prefix = pdir.name
         kept = {r.spill for r in consolidated if r.spill}
         for sdir in pdir.glob("*.spill"):
+            if sdir.name.removesuffix(".spill") in failed_adoptions:
+                continue  # adoption retries next pass — its bytes must survive
             try:
+                # Stat the dir BEFORE unlinking below refreshes its timestamps.
+                dstat = sdir.stat()
                 entries = list(sdir.iterdir())
             except OSError:
                 continue
+            dir_young = (
+                now - max(dstat.st_mtime, dstat.st_ctime) < self._SHARED_SPILL_GRACE_S
+            )
             remaining = len(entries)
             for entry in entries:
                 if f"{prefix}/{sdir.name}/{entry.name}" in kept:
                     continue
                 try:
-                    if now - entry.stat().st_mtime < self._SHARED_SPILL_GRACE_S:
+                    st = entry.stat()
+                    if now - max(st.st_mtime, st.st_ctime) < self._SHARED_SPILL_GRACE_S:
                         continue
                 except OSError:
                     continue
                 with contextlib.suppress(OSError):
                     entry.unlink()
                     remaining -= 1
-            if remaining == 0:
+            if remaining == 0 and not dir_young:
                 with contextlib.suppress(OSError):
                     sdir.rmdir()
 
@@ -1015,35 +1035,6 @@ class LogCache:
             src.unlink(missing_ok=True)
             shutil.rmtree(pdir / f"{writer}.spill", ignore_errors=True)
             (pdir / f"{writer}.lock").unlink(missing_ok=True)
-
-    def _reap_orphan_legacy_dirs(
-        self, pdir: Path, failed_adoptions: AbstractSet[str], now: float
-    ) -> None:
-        """Remove legacy `<w>.spill/` dirs whose writer has no log left.
-
-        Only `<w>.log` ever references `<w>.spill/`, so a namespace without its
-        log is referenced by nothing — but left in place it re-flags the prefix
-        for migration on every index rebuild, re-running a full consolidation
-        per cooldown window forever (the loop the own-namespace removal above
-        closes, in its peer variant). Reachable via a crash between a source
-        log's unlink and its namespace's rmtree, or a syncer delivering (or
-        resurrecting) a namespace without its log. The grace window covers a
-        syncer delivering the namespace BEFORE its log (age counts from local
-        arrival via ctime); past it, a later-arriving log's records degrade to
-        a miss-and-recompute — the standing contract."""
-        for spill_dir in pdir.glob("*.spill"):
-            writer = spill_dir.name.removesuffix(".spill")
-            if writer == self.writer_id or writer in failed_adoptions:
-                continue  # own dir is handled by the migration path; failed → retry
-            if (pdir / f"{writer}.log").exists():
-                continue  # its log prunes it (or protects it) — not an orphan
-            try:
-                st = spill_dir.stat()
-            except OSError:
-                continue
-            if now - max(st.st_mtime, st.st_ctime) < self._SHARED_SPILL_GRACE_S:
-                continue
-            shutil.rmtree(spill_dir, ignore_errors=True)
 
     def _trim_to_limit(self, records: list[_Record]) -> list[_Record]:
         """Best-effort size bound over THIS node's live records for one prefix."""
