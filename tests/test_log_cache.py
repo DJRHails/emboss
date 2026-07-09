@@ -859,3 +859,25 @@ def test_batch_consolidate_parallel_equivalence(tmp_path):
     for w in ("A", "B", "C"):
         for i in range(12):
             assert reader.get(f"{w}-{i}") == f"{w}-{i}-" + "v" * 3000
+
+
+def test_live_writers_own_legacy_leftovers_are_swept(tmp_path):
+    """Pre-pool leftovers under the LIVE writer's own `<writer>.spill/` dir must be
+    collected too — prune-with-log never fires for a live log, and these were the
+    single biggest residue after full migration (~35 GB in production)."""
+    root = tmp_path / "c"
+    a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
+    a.set("d", "v" * 5000)  # live record; A.log stays alive
+    prefix = a._prefix("d")
+    own_legacy = root / prefix / "A.spill"
+    own_legacy.mkdir()
+    stale = own_legacy / "prepool.val"
+    stale.write_bytes(b"unreferenced pre-pool leftover")
+    old = time.time() - 7200
+    os.utime(stale, (old, old))
+
+    a.consolidate(prefix)
+
+    assert not own_legacy.exists()  # file swept, emptied dir removed
+    assert a.get("d") == "v" * 5000
+    assert (root / prefix / "A.log").exists()  # the live log is untouched

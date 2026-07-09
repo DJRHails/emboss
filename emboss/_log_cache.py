@@ -614,7 +614,7 @@ class LogCache:
             self._write_consolidated(target, consolidated)
             self._prune_consolidated_sources(pdir, snapshot, target.name, unread)
             self._sweep_shared_spills(pdir, consolidated, unread, now)
-            self._sweep_orphaned_namespaces(pdir, consolidated, unread, now)
+            self._sweep_legacy_namespaces(pdir, consolidated, unread, now)
         self._index.pop(prefix, None)  # force rebuild
         self._sig.pop(prefix, None)
         self._checked.pop(prefix, None)
@@ -664,48 +664,49 @@ class LogCache:
                 continue
             self._spill_delete(rel)
 
-    def _sweep_orphaned_namespaces(
+    def _sweep_legacy_namespaces(
         self,
         pdir: Path,
         consolidated: list[_Record],
         unread: AbstractSet[str],
         now: float,
     ) -> None:
-        """Collect legacy `<writer>.spill/` namespaces whose LOG is already gone.
+        """Collect legacy `<writer>.spill/` namespaces — file by file, then the dir.
 
-        Prune-with-log covers a namespace whose log this pass consolidated; a dir
-        that outlived its log (pre-pool passes, a crash between the log unlink and
-        the rmtree, a syncer copying a dir without its log) is otherwise immortal —
-        nothing references its files, yet its existence re-arms the migration flag
-        on every index build, re-triggering a pointless consolidation per cooldown
-        forever. Same guards as the pool sweep: skipped when any source log was
-        unreadable (unknown references), skipped while any consolidated record
-        still points into the dir (`_resolve_spills` repoints them, so this only
-        bites mid-migration edge cases), and postponed while any file is younger
-        than the grace window (a still-running pre-pool writer)."""
+        `_resolve_spills` has just repointed every kept record into the shared pool,
+        so a legacy file is garbage unless a kept record still names it (a
+        mid-migration edge) — regardless of whether its owning log is alive: the
+        live writer's own pre-pool leftovers were otherwise immortal (prune-with-log
+        never fires for a live log; measured ~35 GB across 4,096 `bonbon.spill` dirs
+        after full migration), and a dir that outlived its log re-armed the
+        migration flag on every index build. Same guards as the pool sweep: skipped
+        when any source log was unreadable (unknown references), per-file kept-set
+        check, and a grace window per file (a still-running pre-pool writer). The
+        dir goes once it is empty, so the migration flag stops re-arming."""
         if unread:
             return
         prefix = pdir.name
         kept = {r.spill for r in consolidated if r.spill}
         for sdir in pdir.glob("*.spill"):
-            writer = sdir.name.removesuffix(".spill")
-            if (pdir / f"{writer}.log").exists():
-                continue  # owned: the log-prune path removes them together
             try:
                 entries = list(sdir.iterdir())
             except OSError:
                 continue
-            if any(f"{prefix}/{sdir.name}/{entry.name}" in kept for entry in entries):
-                continue
-            try:
-                if any(
-                    now - entry.stat().st_mtime < self._SHARED_SPILL_GRACE_S
-                    for entry in entries
-                ):
+            remaining = len(entries)
+            for entry in entries:
+                if f"{prefix}/{sdir.name}/{entry.name}" in kept:
                     continue
-            except OSError:
-                continue
-            shutil.rmtree(sdir, ignore_errors=True)
+                try:
+                    if now - entry.stat().st_mtime < self._SHARED_SPILL_GRACE_S:
+                        continue
+                except OSError:
+                    continue
+                with contextlib.suppress(OSError):
+                    entry.unlink()
+                    remaining -= 1
+            if remaining == 0:
+                with contextlib.suppress(OSError):
+                    sdir.rmdir()
 
     def _collect_live_across_logs(
         self, pdir: Path, sources: dict[str, tuple[int, int]], now: float
