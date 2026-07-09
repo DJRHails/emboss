@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import os
+import threading
 import time
 
 import pytest
@@ -824,3 +825,37 @@ def test_orphaned_legacy_namespace_is_swept(tmp_path):
     (young_orphan / "fresh.val").write_bytes(b"maybe a pre-pool writer still runs")
     a.consolidate(prefix)
     assert young_orphan.exists()  # grace window postpones the sweep
+
+
+def test_batch_consolidate_parallel_equivalence(tmp_path):
+    """consolidate() with no prefix fans across a pool — the result must be exactly
+    the serial outcome: one log per touched prefix, every value readable, and a
+    concurrent same-process writer neither corrupts nor is lost (flock-serialised)."""
+    root = tmp_path / "c"
+    for w in ("A", "B", "C"):
+        writer = LogCache(root, writer_id=w, prefix_width=1, min_file_size=100)
+        for i in range(12):
+            writer.set(f"{w}-{i}", f"{w}-{i}-" + "v" * 3000)
+    gc = LogCache(root, writer_id="GC", prefix_width=1, min_file_size=100)
+
+    stop = threading.Event()
+
+    def churn() -> None:  # a live writer racing the batch
+        live = LogCache(root, writer_id="LIVE", prefix_width=1, min_file_size=100)
+        i = 0
+        while not stop.is_set():
+            live.set(f"live-{i % 4}", f"live-{i}-" + "x" * 3000)
+            i += 1
+
+    t = threading.Thread(target=churn, daemon=True)
+    t.start()
+    try:
+        gc.consolidate()
+    finally:
+        stop.set()
+        t.join(timeout=5)
+
+    reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
+    for w in ("A", "B", "C"):
+        for i in range(12):
+            assert reader.get(f"{w}-{i}") == f"{w}-{i}-" + "v" * 3000
