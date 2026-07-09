@@ -44,9 +44,6 @@ push = true
     'current_version = "{version}"',
     'version = "{version}"',
 ]
-"emboss/__init__.py" = [
-    '__version__ = "{version}"',
-]
 "README.md" = [
-    "{version}",
+    "Version: {version}",
 ]
