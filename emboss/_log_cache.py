@@ -12,27 +12,43 @@ prefix each node appends to **its own** log:
 
     directory/<prefix>/<writer_id>.log       # written by exactly ONE node
     directory/<prefix>/<writer_id>.lock      # flock; excludes append/compact races
-    directory/<prefix>/<writer_id>.spill/*   # large values, one file each
+    directory/<prefix>/spill/<sha256>.val    # large values — shared, content-addressed pool
+    directory/<prefix>/<writer_id>.spill/*   # legacy layout — migrated into the pool on sight
 
-Because no file is ever written by two nodes, a file syncer just ships each
-node's logs around — last-write-wins never fires, so a sync conflict can't lose
-data. Same-node processes sharing a node-log are serialised by the per-writer
-lock file. Inodes are bounded by ~(#prefixes x #writers), not entry count.
+Because no LOG is ever written by two nodes — and any two nodes writing the same
+content-addressed pool file write identical bytes — a file syncer just ships each
+node's files around: last-write-wins never loses data. Same-node processes
+sharing a node-log are serialised by the per-writer lock file. Inodes are bounded by ~(#prefixes x #writers), not entry count.
 
 - **Reads** consult a per-prefix in-memory index (built by scanning that
   prefix's logs once; rebuilt when a log's size changes — a peer's appends). The
   freshness check is throttled by `index_ttl`, so warm reads are an in-memory
   lookup. A miss just recomputes — safe under eventual consistency.
 - **Writes** append a length-framed record; a torn tail from a crash is ignored.
-- **Large values spill to side files** (`min_file_size`, default 32 KB): the
-  record holds a filename reference instead of the value, keeping the log small
-  (so a 100 MB value doesn't balloon the append log). Spill files live under the
-  writer's own namespace, so they sync conflict-free too, and are removed on
-  overwrite / delete / compaction / consolidation.
+- **Large values spill to a shared, content-addressed pool** (`min_file_size`,
+  default 32 KB): the record holds a filename reference instead of the value,
+  keeping the log small (so a 100 MB value doesn't balloon the append log). The
+  name is the blob's sha256, so identical values collapse to ONE file per prefix
+  across every writer, and re-spilling existing bytes is a no-op. Two nodes
+  "conflicting" on a pool file write identical bytes, so a syncer's
+  last-write-wins is harmless there — the no-two-writers rule only needs to hold
+  for the logs. Pool files are deleted ONLY by the consolidation mark-and-sweep:
+  the reference count that justifies a deletion is DERIVED from every log in the
+  prefix at that moment (never stored or adjusted incrementally — a maintained
+  on-disk counter would be shared mutable state a syncer could corrupt), and a
+  zero-reference file must also outlive a grace window, because an in-flight
+  `set()` spills before its record lands (a dedup hit refreshes the file's age)
+  and a not-yet-synced peer log may still reference the content (age counts from
+  `max(mtime, ctime)`, so a synced-in file gets its grace from local arrival; a
+  swept file a lagging peer references degrades to a miss-and-recompute — the
+  module's standing eventual-consistency contract).
 - **Deletes** append a tombstone.
 - **Compaction** rewrites *this node's own* log (under its lock, atomic rename),
-  dropping superseded / tombstoned / expired records and their spill files. It
-  never touches a peer's files. Auto-runs past `max_log_bytes`; also `compact()`.
+  dropping superseded / tombstoned / expired records. It never touches spill
+  files (they are shared) or a peer's files. Auto-runs past `max_log_bytes` — a
+  prefix holding ONLY this writer's log consolidates instead (cooldown-bounded,
+  compacting in between), so a lone writer's pool still gets swept; also
+  `compact()`.
 - **Consolidation / GC** merges *all* writers' logs in a prefix into THIS node's
   single log, dropping dead records and pruning the now-redundant peer logs (and
   their spill files) — the missing cross-writer GC. Without it, file count is
@@ -41,9 +57,15 @@ lock file. Inodes are bounded by ~(#prefixes x #writers), not entry count.
   hostname). Sync-safe: it snapshots each peer log's `(size, mtime)` first and
   re-stats before delete, so a peer/local append that lands DURING consolidation
   is never deleted (its newer records win on read; the next pass collects it).
-  Foreign spilled values are re-spilled into our namespace byte-for-byte so the
-  result is self-contained. Auto-runs past `max_writers_per_prefix`; also
-  `consolidate()`.
+  Consolidation is also the migration point for the legacy per-writer spill
+  layout (files adopted into the pool via hardlink, records repointed, peer
+  namespaces pruned with their logs and our own removed once repointed —
+  detected at index build, triggered on the next write) and the pool's
+  mark-and-sweep GC. With the pre-pool uuid names
+  every pass re-copied every foreign value, which (amplified by a syncer
+  resurrecting pruned peer logs) once grew a 45 GB cache to 160 GB in a day;
+  content addressing makes passes idempotent. Auto-runs past
+  `max_writers_per_prefix` (with a cooldown); also `consolidate()`.
 
 Tunables (defaults chosen via `python scripts/bench.py`):
 - `index_ttl` (1.0 s) — index reuse before re-stat'ing for peers' appends; the
@@ -56,7 +78,8 @@ Tunables (defaults chosen via `python scripts/bench.py`):
 - `max_log_bytes` (4 MB) — per-log size that triggers compaction.
 - `max_writers_per_prefix` (8) — distinct logs in a prefix before a write
   auto-consolidates them into one (bounds inode growth as writers accumulate).
-  `0` disables auto-consolidation (still callable explicitly via `consolidate()`).
+  `0` disables the writer-count trigger; legacy migration and the lone-writer
+  size-trigger sweep still run, and `consolidate()` stays callable explicitly.
 
 Benchmark (local SSD, 512-byte values), order of magnitude:
     set ~10^4 ops/s     get ~10^5 ops/s (index_ttl=1.0; ~10^4/s if index_ttl=0)
@@ -75,13 +98,15 @@ import io
 import logging
 import os
 import pickle
+import re
 import shutil
 import socket
 import struct
 import threading
 import time
 import uuid
-from collections.abc import Iterator, Set as AbstractSet
+from collections.abc import Callable, Iterator, MutableSet, Set as AbstractSet
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -95,9 +120,24 @@ _DEFAULT_PREFIX_WIDTH = 2  # 2 hex chars -> 256 shard dirs
 _DEFAULT_INDEX_TTL = 1.0  # seconds a per-prefix index is reused before re-stat'ing
 _DEFAULT_MIN_FILE_SIZE = 2**15  # 32 KB — values this big or larger spill to files
 _DEFAULT_MAX_WRITERS_PER_PREFIX = 8  # logs in a prefix before auto-consolidation
+_SHARED_SPILL_DIR = "spill"  # the per-prefix shared, content-addressed spill pool
+# Auto-consolidation cooldown per prefix: when pruning is blocked (busy peers, a syncer
+# resurrecting logs) the writer count can sit above the bound indefinitely, and without a
+# cooldown EVERY write re-triggers consolidation — a per-write O(prefix) storm. One minute
+# keeps the fold responsive while bounding the worst case to one pass per prefix per minute.
+_AUTO_CONSOLIDATE_COOLDOWN_S = 60.0
+# Batch compact/consolidate fan the prefixes across a thread pool: the work is file-I/O
+# bound (log reads, hashing and renames release the GIL), per-prefix state is independent,
+# and the per-(prefix, writer) flock — which excludes same-process threads too, each task
+# opening its own fd — already serialises same-prefix races. Not a knob: an internal
+# ceiling balancing disk queue depth against fd/flock pressure (a 4,096-prefix production
+# pass dropped from ~6 minutes serial to well under one).
+_BATCH_POOL_WIDTH = 16
 
 
 class _Record(NamedTuple):
+    # Positional on-disk format: `_frame` pickles a plain 6-tuple and `_parse_frame`
+    # rebuilds by position — never reorder or grow the fields without a migration.
     key: str
     value: Any  # the value (inline) or None when spilled
     expire_time: float | None
@@ -176,34 +216,38 @@ def _resync(data: bytes, after: int) -> int | None:
         search = idx + 1
 
 
-def _iter_records(path: Path) -> Iterator[_Record]:
-    """Yield records from a log, **skipping torn/corrupt frames and resyncing** to
-    the next valid frame rather than stopping at the first bad one.
+class _ScanResult(NamedTuple):
+    records: list[_Record]  # valid records in on-disk order, resynced past any tears
+    tear_at: int | None  # byte offset of the first torn/corrupt frame, or None
+    # valid records found *after* a tear (would be stranded by a stop-reader)
+    recovered: int
 
-    A torn frame (a crash or a concurrent container teardown mid-append) can land
-    *mid-log* with valid frames after it. The old behaviour — return at the first
-    unreadable frame — stranded every record past the tear: invisible to reads, so
-    each one silently re-executes and re-bills forever. Here a bad frame is skipped
-    (resynced via the PROTO-opcode anchor) and recovery is logged. A benign
-    truncated *final* write (the documented crash-mid-append case) recovers nothing
-    past it and stays quiet.
 
-    A read error (`OSError`) is **not** swallowed: it propagates so callers can tell
-    "read nothing" from "could not read". `_collect_live_across_logs` needs that to
-    mark a source `unread` and refuse to prune it, and `_compact_prefix` needs it to
-    abort rather than rewrite an empty log over a real one."""
-    data = path.read_bytes()
+def _read_records(path: Path) -> _ScanResult:
+    """Read every valid record from a log, **skipping torn/corrupt frames and resyncing** to the
+    next valid frame rather than stopping at the first bad one.
+
+    A torn frame (a crash or a concurrent container teardown mid-append) can land *mid-log* with
+    valid frames after it. Stopping at the first bad frame — the old behaviour — stranded every
+    record past the tear: invisible to reads, so each silently re-executes and re-bills forever.
+    Here a bad frame is skipped (resynced via the PROTO-opcode anchor). A benign truncated *final*
+    write (the documented crash-mid-append case) recovers nothing past it (`recovered == 0`).
+
+    `OSError` from the read propagates — a caller that must not treat an unreadable log as empty
+    (consolidation, which would then prune it) relies on that."""
+    data = path.read_bytes()  # OSError propagates by design (see docstring)
     n = len(data)
     pos = 0
+    records: list[_Record] = []
     tear_at: int | None = None
-    recovered_past_tear = 0
+    recovered = 0
     while pos + _HEADER.size <= n:
         parsed = _parse_frame(data, pos)
         if parsed is not None:
             rec, end = parsed
             if tear_at is not None:
-                recovered_past_tear += 1
-            yield rec
+                recovered += 1
+            records.append(rec)
             pos = end
             continue
         if tear_at is None:
@@ -212,16 +256,25 @@ def _iter_records(path: Path) -> Iterator[_Record]:
         if nxt is None:
             break
         pos = nxt
-    if recovered_past_tear:
+    return _ScanResult(records, tear_at, recovered)
+
+
+def _iter_records(path: Path) -> Iterator[_Record]:
+    """Yield a log's records (resyncing past torn frames — see `_read_records`). Warns when a
+    mid-log tear stranded later records, so the silent re-bill becomes visible; a benign
+    truncated final write stays quiet. `OSError` propagates on first iteration."""
+    scan = _read_records(path)
+    if scan.recovered:
         logger.warning(
-            "emboss.LogCache: torn/corrupt frame(s) in %s starting at byte %d — "
-            "resynced past them and recovered %d later record(s) that would "
-            "otherwise be invisible (they were re-executing on every read). "
-            "Run consolidate() or compact() to rewrite the log cleanly.",
+            "emboss.LogCache: torn/corrupt frame(s) in %s starting at byte %d — resynced past "
+            "them and recovered %d later record(s) that a stop-at-first-tear reader would hide "
+            "(they were re-executing on every read). compact()/consolidate() rewrites the log to "
+            "drop the malformed frame(s) permanently.",
             path,
-            tear_at,
-            recovered_past_tear,
+            scan.tear_at,
+            scan.recovered,
         )
+    yield from scan.records
 
 
 def _frame(rec: _Record) -> bytes:
@@ -231,6 +284,44 @@ def _frame(rec: _Record) -> bytes:
 
 def _sanitize(writer_id: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in writer_id) or "node"
+
+
+# Docker's default hostname is the 12-hex short container id — an EPHEMERAL identity.
+_CONTAINER_HOSTNAME = re.compile(r"^[0-9a-f]{12}$")
+
+
+def _default_writer_id() -> str:
+    """The hostname — unless it is a bare container id, which collapses to a shared id.
+
+    A container that inherits no explicit `writer_id` and no stable hostname would mint a
+    brand-new writer namespace per container, growing the writer-log count forever — and each
+    one crossing `max_writers_per_prefix` auto-consolidates, adopting every other writer's
+    spills before the container dies (the incident that grew a 45 GB cache to 160 GB in a day,
+    27,880 writer logs). Ephemeral containers share one 'container-orphan' writer instead.
+    On a single host that is safe — same-id writers sharing a filesystem are flock-serialised,
+    merely slower under contention. Ephemeral containers on DIFFERENT hosts whose directories
+    are joined by a file syncer would share one log across nodes, the one thing the design
+    cannot survive (the syncer's last-write-wins may discard one side's appends), so multi-host
+    container fleets MUST pass an explicit stable `writer_id` per node — the warning makes the
+    missing one visible."""
+    hostname = socket.gethostname()
+    if not _CONTAINER_HOSTNAME.match(hostname):
+        return hostname
+    logger.warning(
+        "emboss.LogCache: hostname %r looks like a bare container id and no writer_id was "
+        "given — using the shared 'container-orphan' writer id (pass an explicit stable "
+        "writer_id per node).",
+        hostname,
+    )
+    return "container-orphan"
+
+
+try:
+    import fcntl as _fcntl_probe  # noqa: F401 — availability probe; call sites import lazily
+
+    _HAS_FCNTL = True
+except ImportError:  # pragma: no cover — non-POSIX
+    _HAS_FCNTL = False
 
 
 def _flock(fileobj: Any, op: int) -> None:
@@ -266,11 +357,18 @@ class LogCache:
         self.index_ttl = index_ttl
         self.min_file_size = min_file_size
         self.max_writers_per_prefix = max_writers_per_prefix
-        self.writer_id = _sanitize(writer_id or socket.gethostname())
+        self.writer_id = _sanitize(writer_id or _default_writer_id())
         self._lock = threading.Lock()  # serialise this process's threads
         self._index: dict[str, dict[str, _Record]] = {}
         self._sig: dict[str, dict[str, int]] = {}
         self._checked: dict[str, float] = {}  # monotonic time of last freshness check
+        # per-prefix auto-consolidation cooldown (monotonic timestamps)
+        self._consolidated_at: dict[str, float] = {}
+        # Prefixes seen holding legacy per-writer `<writer>.spill/` dirs (the pre-pool
+        # layout): detection happens at index build, and the next write kicks the
+        # consolidation that migrates them into the shared pool — standard operation
+        # itself never handles the legacy layout.
+        self._needs_migration: set[str] = set()
 
     # ── layout ────────────────────────────────────────────────────────────────
 
@@ -305,18 +403,119 @@ class LogCache:
     # ── spillover (large values -> side files) ─────────────────────────────────
 
     def _spill_write(self, prefix: str, blob: bytes) -> str:
-        """Write a value blob to a side file under this writer's namespace; return
-        its path relative to `directory` (so any reader can resolve it)."""
-        rel_dir = f"{prefix}/{self.writer_id}.spill"
+        """Write a value blob to the prefix's **shared, content-addressed** spill
+        pool; return its path relative to `directory` (so any reader can resolve
+        it).
+
+        The pool is `<prefix>/spill/<sha256>.val`, shared by ALL writers — the
+        per-writer namespace existed for uuid-named files, where only the owning
+        writer knew a file's lifecycle and the no-two-writers-one-file rule kept
+        sync conflict-free. Content addressing dissolves both needs: any two
+        writers producing the same name produce identical bytes (a syncer's
+        last-write-wins between identical contents is a no-op), identical values
+        collapse to ONE file per prefix across every writer, and re-spilling
+        bytes already on disk writes no new file — which is what stops
+        consolidation from duplicating the corpus (uuid names re-copied every
+        foreign value on every pass; that grew a 45 GB cache to 160 GB in a
+        day). An existing file is trusted only when its SIZE matches the blob:
+        rename is atomic for the name, not the data, so a crash (or a
+        non-atomic syncer) can leave a truncated file under the right name — a
+        size mismatch is warned about and re-spilled (a fresh tmp, atomically
+        renamed over the poisoned name), so re-storing the value heals
+        truncation rather than trusting it forever. (Same-SIZE corruption is
+        not detected here; a corrupt spill surfaces as a warned read-time
+        miss.) A dedup hit also refreshes the
+        file's age (`os.utime`), so the sweep's grace window protects this
+        in-flight `set()` exactly as it would a fresh spill. Shared files are
+        GC'd only by the consolidation mark-and-sweep, never eagerly — several
+        records (and several nodes) may reference one file."""
+        rel_dir = f"{prefix}/{_SHARED_SPILL_DIR}"
         full_dir = self.directory / rel_dir
         full_dir.mkdir(parents=True, exist_ok=True)
-        name = f"{uuid.uuid4().hex}.val"
+        name = f"{hashlib.sha256(blob).hexdigest()}.val"
         full = full_dir / name
-        tmp = full.with_name(name + ".tmp")
+        rel = f"{rel_dir}/{name}"
+        try:
+            found = full.stat().st_size
+            if found == len(blob):
+                os.utime(full)  # grace window covers this not-yet-appended record
+                return rel
+            logger.warning(
+                "emboss.LogCache: pool file %s exists with size %d, expected %d — "
+                "rewriting it (crash artifact or non-atomic sync delivery).",
+                full,
+                found,
+                len(blob),
+            )
+        except OSError:
+            pass  # absent (or unstat-able): write it below
+        # uuid tmp suffix: two writers spilling the same content must not collide
+        # mid-write; every rename lands on the same (identical) final file.
+        tmp = full.with_name(f"{name}.{uuid.uuid4().hex}.tmp")
         with open(tmp, "wb") as f:
             f.write(blob)
+            f.flush()
+            os.fsync(f.fileno())  # rename is atomic for the name, not the data
         os.replace(tmp, full)
-        return f"{rel_dir}/{name}"
+        return rel
+
+    def _pool_adopt(self, prefix: str, legacy_rel: str) -> str | None:
+        """Bring a legacy per-writer-namespace spill into the shared pool without
+        copying bytes when possible: hardlink it to its content-addressed name
+        (same filesystem — free, and the inode survives the source namespace's
+        later prune), with a byte-copy fallback across filesystems. Returns the
+        pool rel path, or None when the source VANISHED (sync lag) — the caller
+        drops the record rather than dangle a reference. Any other `OSError`
+        (permissions, I/O, disk full) propagates: the source bytes are still on
+        disk, so the caller must keep the namespace for a retry instead of
+        treating a transient local fault as sync lag and pruning the only copy."""
+        src = self.directory / legacy_rel
+        h = hashlib.sha256()
+        size = 0
+        try:
+            with open(src, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+                    size += len(chunk)
+        except FileNotFoundError:
+            return None
+        rel_dir = f"{prefix}/{_SHARED_SPILL_DIR}"
+        full_dir = self.directory / rel_dir
+        full_dir.mkdir(parents=True, exist_ok=True)
+        name = f"{h.hexdigest()}.val"
+        full = full_dir / name
+        rel = f"{rel_dir}/{name}"
+        try:
+            found = full.stat().st_size
+            if found == size:
+                return rel
+            logger.warning(
+                "emboss.LogCache: pool file %s exists with size %d, expected %d — "
+                "re-adopting over it (crash artifact or non-atomic sync delivery).",
+                full,
+                found,
+                size,
+            )
+        except OSError:
+            pass  # absent (or unstat-able): adopt it below
+        tmp = full.with_name(f"{name}.{uuid.uuid4().hex}.tmp")
+        try:
+            os.link(src, tmp)
+        except FileNotFoundError:
+            return None  # source vanished between the hash and the link
+        except OSError:  # cross-filesystem / links unsupported → byte-copy
+            try:
+                shutil.copyfile(src, tmp)
+                with open(tmp, "rb+") as f:
+                    os.fsync(f.fileno())  # see _spill_write: durable before named
+            except FileNotFoundError:
+                Path(tmp).unlink(missing_ok=True)
+                return None
+            except OSError:
+                Path(tmp).unlink(missing_ok=True)
+                raise
+        os.replace(tmp, full)
+        return rel
 
     def _spill_read(self, rel: str) -> Any:
         with open(self.directory / rel, "rb") as f:
@@ -326,8 +525,8 @@ class LogCache:
         with contextlib.suppress(OSError):
             (self.directory / rel).unlink()
 
-    def _is_own_spill(self, prefix: str, rel: str) -> bool:
-        return rel.startswith(f"{prefix}/{self.writer_id}.spill/")
+    def _is_shared_spill(self, prefix: str, rel: str) -> bool:
+        return rel.startswith(f"{prefix}/{_SHARED_SPILL_DIR}/")
 
     def _rec_size(self, rec: _Record) -> int:
         if rec.spill:
@@ -377,6 +576,11 @@ class LogCache:
                             index[rec.key] = rec
         self._index[prefix] = index
         self._sig[prefix] = sig
+        # Legacy layout detection: a per-writer `<writer>.spill/` dir means this prefix
+        # predates the shared pool — flag it so the next write kicks the consolidation
+        # that migrates it. Detection only; no legacy handling on the read/write paths.
+        if pdir.is_dir() and any(True for _ in pdir.glob("*.spill")):
+            self._needs_migration.add(prefix)
         return index
 
     @staticmethod
@@ -398,27 +602,27 @@ class LogCache:
 
     def compact(self, prefix: str | None = None) -> None:
         """Rewrite this node's own log(s), dropping dead/superseded/expired records
-        and their spill files (and, with `size_limit`, oldest-stored live records).
-        Never touches a peer's files, so it stays conflict-free under sync."""
-        with self._lock:
-            if prefix is not None:
+        (and, with `size_limit`, oldest-stored live records). Spill files are shared
+        and left to the consolidation mark-and-sweep. Never touches a peer's files,
+        so it stays conflict-free under sync."""
+        if prefix is not None:
+            with self._lock:
                 self._compact_prefix(prefix)
-            else:
-                for pdir in list(self.directory.iterdir()):
-                    if pdir.is_dir():
-                        self._compact_prefix(pdir.name)
+            return
+        self._run_batch(self._compact_prefix)
 
     def _compact_prefix(self, prefix: str) -> None:
+        # Compaction never touches spill files: pool files are shared across writers
+        # (and nodes), so only the consolidation mark-and-sweep — which reads EVERY
+        # log — can know a file is unreferenced.
         path = self._log_path(prefix)
         if not path.exists():
             return
         now = time.time()
-        all_spills: set[str] = set()
         with self._writer_lock(prefix):
+            scan = _read_records(path)
             latest: dict[str, _Record] = {}
-            for rec in _iter_records(path):
-                if rec.spill:
-                    all_spills.add(rec.spill)
+            for rec in scan.records:
                 cur = latest.get(rec.key)
                 if cur is None or rec.store_time >= cur.store_time:
                     latest[rec.key] = rec
@@ -431,9 +635,15 @@ class LogCache:
                 for rec in keep:
                     out.write(_frame(rec))
             os.replace(tmp, path)
-        kept_spills = {r.spill for r in keep if r.spill}
-        for spill in all_spills - kept_spills:  # dropped records' values (all ours)
-            self._spill_delete(spill)
+        # a real mid-log tear was healed; a benign final tear stays quiet
+        if scan.recovered:
+            logger.warning(
+                "emboss.LogCache: compacted %s past a torn frame at byte %d — dropped the "
+                "malformed frame(s) permanently and resynced %d later record(s).",
+                path,
+                scan.tear_at,
+                scan.recovered,
+            )
         self._index.pop(prefix, None)  # force rebuild
         self._sig.pop(prefix, None)
 
@@ -446,18 +656,64 @@ class LogCache:
 
         Sync-safe: a peer/local append that lands during the merge is detected by
         a `(size, mtime)` re-stat and left intact (its newer records win on read;
-        the next pass collects it), so a concurrent write is never lost. Foreign
-        spilled values are copied into our namespace byte-for-byte, so the
-        consolidated log is self-contained even after the peers are gone — except
-        a foreign spill not yet on disk (sync lag), whose record is dropped (a
-        cache miss that recomputes) rather than left dangling."""
-        with self._lock:
-            if prefix is not None:
+        the next pass collects it), so a concurrent write is never lost. This is
+        also the **legacy-spill migration point**: a record still referencing a
+        per-writer `<writer>.spill/` file (the pre-pool layout) has its value
+        adopted into the shared pool (hardlinked when the filesystem allows) and
+        is repointed; peer legacy namespaces die with their pruned logs and our
+        own is removed once its records are repointed — so standard operation
+        never handles legacy layout. A spill not on disk (sync lag) drops its
+        record (a cache miss that recomputes) rather than dangle. Finally the
+        pool is mark-and-swept (skipped when any log was unreadable — the
+        reference set would be incomplete): every log was just read, so the
+        surviving reference set is complete, and unreferenced files past the
+        grace window are deleted."""
+        if prefix is not None:
+            with self._lock:
                 self._consolidate_prefix(prefix)
-            else:
-                for pdir in list(self.directory.iterdir()):
-                    if pdir.is_dir():
-                        self._consolidate_prefix(pdir.name)
+            return
+        self._run_batch(self._consolidate_prefix)
+
+    def _run_batch(self, per_prefix: Callable[[str], None]) -> None:
+        """Run a per-prefix pass over every prefix dir, fanned across a thread pool.
+
+        Deliberately NOT under `self._lock`: holding it for a whole multi-minute batch
+        blocks every same-process `get()`/`set()`. On-disk safety never needed it — every
+        file mutation sits under the per-(prefix, writer) flock, which also excludes this
+        process's own threads (each task opens its own lock fd) — and the in-memory maps
+        tolerate racing single-op mutations as bounded `index_ttl`-style staleness (a
+        just-invalidated index rebuilds on the next read). Where `fcntl` is unavailable
+        the flock is a no-op and nothing would exclude a racing same-process `set()`, so
+        the batch keeps the old serial pass under `self._lock` (which, as before #16,
+        stops at the first raising prefix). On the fanned path one prefix's failure
+        doesn't abort the others; every suppressed failure is logged with its prefix and
+        the first error re-raises once the batch completes."""
+        prefixes = [pdir.name for pdir in self.directory.iterdir() if pdir.is_dir()]
+        if not prefixes:
+            return
+        if not _HAS_FCNTL:  # non-POSIX: no flock, so the batch must not race same-process ops
+            with self._lock:
+                for prefix in prefixes:
+                    per_prefix(prefix)
+            return
+        errors: list[tuple[str, BaseException]] = []
+        with ThreadPoolExecutor(max_workers=min(_BATCH_POOL_WIDTH, len(prefixes))) as pool:
+            futures = [(prefix, pool.submit(per_prefix, prefix)) for prefix in prefixes]
+            for prefix, future in futures:
+                try:
+                    future.result()
+                except BaseException as err:  # noqa: BLE001 — finish the batch, raise after
+                    errors.append((prefix, err))
+        if not errors:
+            return
+        for prefix, err in errors[1:]:
+            logger.warning(
+                "emboss.LogCache: batch pass failed for prefix %s/ — suppressed in favour "
+                "of the first error, which re-raises: %r",
+                prefix,
+                err,
+            )
+        raise errors[0][1]
 
     def _consolidate_prefix(self, prefix: str) -> None:
         pdir = self.directory / prefix
@@ -475,68 +731,324 @@ class LogCache:
                 with contextlib.suppress(OSError):
                     st = log.stat()
                     snapshot[log.name] = (st.st_size, st.st_mtime_ns)
-            keep, own_spills, unread = self._collect_live_across_logs(
-                pdir, snapshot, now
-            )
-            consolidated = self._respill_foreign(prefix, keep)
+            keep, unread = self._collect_live_across_logs(pdir, snapshot, now)
+            if target.name in unread:
+                # `unread` protects sources from the prune, but the DESTINATION is
+                # rewritten unconditionally — with our own records missing from the
+                # merge, that rewrite would clobber them. Nothing has changed yet:
+                # abort the whole pass and let a later one retry.
+                self._consolidated_at[prefix] = time.monotonic()  # cooldown the retry
+                logger.warning(
+                    "emboss.LogCache: could not read our own log %s — aborting the "
+                    "consolidation pass (nothing was changed; it retries later).",
+                    target,
+                )
+                return
+            consolidated, failed_adoptions = self._resolve_spills(prefix, keep)
+            # A namespace whose adoption hit a transient fault keeps its log too:
+            # its records were dropped from the merge, so pruning the log would
+            # lose them along with the still-on-disk legacy bytes.
+            keep_sources = set(unread) | {f"{w}.log" for w in failed_adoptions}
             self._write_consolidated(target, consolidated)
-            self._drop_superseded_own_spills(own_spills, consolidated)
-            self._prune_consolidated_sources(pdir, snapshot, target.name, unread)
+            self._prune_consolidated_sources(pdir, snapshot, target.name, keep_sources)
+            # Failed adoptions do NOT blind the sweep (unlike unreadable logs):
+            # legacy references never point into the pool, and every
+            # pool-referencing record from those same logs was merged into
+            # `consolidated` — so the pool reference set is still complete.
+            self._sweep_shared_spills(pdir, consolidated, unread, now)
+            self._sweep_legacy_namespaces(
+                pdir, consolidated, unread, failed_adoptions, now
+            )
+            if self.writer_id not in failed_adoptions:
+                # Our own legacy namespace is never pruned with a log (our log is
+                # the destination), and only our own records ever referenced it —
+                # all just repointed into the pool — so it is removed here or never.
+                own_legacy = pdir / f"{self.writer_id}.spill"
+                shutil.rmtree(own_legacy, ignore_errors=True)
+                if own_legacy.exists():
+                    logger.warning(
+                        "emboss.LogCache: could not remove migrated legacy "
+                        "namespace %s — the prefix re-triggers migration until "
+                        "it is removable.",
+                        own_legacy,
+                    )
         self._index.pop(prefix, None)  # force rebuild
         self._sig.pop(prefix, None)
         self._checked.pop(prefix, None)
+        self._needs_migration.discard(prefix)
+        self._consolidated_at[prefix] = time.monotonic()
+
+    # A shared-pool file must outlive any in-flight `set()` that wrote it before its
+    # record landed, any not-yet-synced peer log that references it, and any read in
+    # progress. One hour of grace covers all three with a wide margin; an unreferenced
+    # file merely waits one more consolidation pass.
+    _SHARED_SPILL_GRACE_S = 3600.0
+
+    def _sweep_shared_spills(
+        self,
+        pdir: Path,
+        consolidated: list[_Record],
+        unread: AbstractSet[str],
+        now: float,
+    ) -> None:
+        """Mark-and-sweep GC of the prefix's shared spill pool.
+
+        Shared-pool files are never deleted eagerly (several records — and several
+        nodes — may reference one content hash), so consolidation is where they are
+        collected: it has just merged EVERY readable log, so `consolidated` is the
+        complete local reference set. The `.val` sweep is skipped when any source
+        log could not be read — its references are unknown, and deleting a file it
+        points at would turn recoverable state into misses. A file younger than the grace window is
+        kept even when unreferenced: an in-flight `set()` spills BEFORE appending its
+        record (a dedup hit refreshes the file's age for the same reason), and a
+        syncer may deliver a peer's spill before its log — age is measured from
+        `max(mtime, ctime)` because a syncer preserves the peer's (old) mtime but
+        ctime is stamped locally on arrival and cannot be backdated. A swept file
+        that a lagging peer still references degrades to a miss-and-recompute, the
+        module's standing eventual-consistency contract. Crash-orphaned `*.tmp`
+        files (a crash between write and rename) are referenced by nothing, so they
+        are reaped past the grace window even when a log was unreadable."""
+        pool = pdir / _SHARED_SPILL_DIR
+        if not pool.is_dir():
+            return
+        for leftover in pool.glob("*.tmp"):
+            with contextlib.suppress(OSError):
+                st = leftover.stat()
+                if now - max(st.st_mtime, st.st_ctime) >= self._SHARED_SPILL_GRACE_S:
+                    leftover.unlink()
+        if unread:
+            return
+        prefix = pdir.name
+        kept = {r.spill for r in consolidated if r.spill}
+        for val in pool.glob("*.val"):
+            rel = f"{prefix}/{_SHARED_SPILL_DIR}/{val.name}"
+            if rel in kept:
+                continue
+            try:
+                st = val.stat()
+                if now - max(st.st_mtime, st.st_ctime) < self._SHARED_SPILL_GRACE_S:
+                    continue
+            except OSError:
+                continue
+            self._spill_delete(rel)
+
+    def _sweep_legacy_namespaces(
+        self,
+        pdir: Path,
+        consolidated: list[_Record],
+        unread: AbstractSet[str],
+        failed_adoptions: AbstractSet[str],
+        now: float,
+    ) -> None:
+        """Collect legacy `<writer>.spill/` namespaces — file by file, then the dir.
+
+        `_resolve_spills` has just repointed every kept record into the shared pool,
+        so a legacy file is garbage unless a kept record still names it (a
+        mid-migration edge) — regardless of whether its owning log is alive: the
+        live writer's own pre-pool leftovers were otherwise immortal (prune-with-log
+        never fires for a live log; measured ~35 GB across 4,096 `bonbon.spill` dirs
+        after full migration), and a dir that outlived its log re-armed the
+        migration flag on every index build. Same guards as the pool sweep: skipped
+        when any source log was unreadable (unknown references), per-file kept-set
+        check, and a grace window per file by `max(mtime, ctime)` — a still-running
+        pre-pool writer, or a syncer that delivered the namespace before its log
+        (old mtimes are preserved; ctime is stamped on local arrival). The dir goes
+        once it is empty — so the migration flag stops re-arming — but only when
+        the dir itself is past the grace window, giving an empty namespace (a
+        syncer creates the dir before copying files in) the same grace as its
+        files. A namespace whose adoption failed this pass is skipped outright:
+        its records were dropped from `consolidated` (so the kept set cannot
+        vouch for its files, however old), and the retry that its kept log
+        guarantees needs the legacy bytes still on disk."""
+        if unread:
+            return
+        prefix = pdir.name
+        kept = {r.spill for r in consolidated if r.spill}
+        for sdir in pdir.glob("*.spill"):
+            if sdir.name.removesuffix(".spill") in failed_adoptions:
+                continue  # adoption retries next pass — its bytes must survive
+            try:
+                # Stat the dir BEFORE unlinking below refreshes its timestamps.
+                dstat = sdir.stat()
+                entries = list(sdir.iterdir())
+            except OSError:
+                continue
+            dir_young = (
+                now - max(dstat.st_mtime, dstat.st_ctime) < self._SHARED_SPILL_GRACE_S
+            )
+            remaining = len(entries)
+            for entry in entries:
+                if f"{prefix}/{sdir.name}/{entry.name}" in kept:
+                    continue
+                try:
+                    st = entry.stat()
+                    if now - max(st.st_mtime, st.st_ctime) < self._SHARED_SPILL_GRACE_S:
+                        continue
+                except OSError:
+                    continue
+                with contextlib.suppress(OSError):
+                    entry.unlink()
+                    remaining -= 1
+            if remaining == 0 and not dir_young:
+                with contextlib.suppress(OSError):
+                    sdir.rmdir()
 
     def _collect_live_across_logs(
         self, pdir: Path, sources: dict[str, tuple[int, int]], now: float
-    ) -> tuple[list[_Record], AbstractSet[str], AbstractSet[str]]:
+    ) -> tuple[list[_Record], AbstractSet[str]]:
         """Merge all source logs into the live set: latest `store_time` wins per
         key (a newer overwrite/tombstone under ANY writer beats an older one).
         `sorted(sources)` makes the merge order deterministic for tie handling.
 
-        Returns `(keep, own_spills, unread)`: the records to keep, the set of OUR
-        spill refs seen across the sources (so superseded ones can be dropped by
-        reference, mirroring `compact()`, without globbing the spill dir), and the
-        names of source logs that could NOT be fully read — a transient read error
-        must not make a log prunable, or its unmerged records would be lost."""
+        Returns `(keep, unread)`: the records to keep, and the names of source
+        logs that could NOT be fully read — a transient read error must not make
+        a log prunable, or its unmerged records would be lost."""
         latest: dict[str, _Record] = {}
-        own_spills: set[str] = set()
         unread: set[str] = set()
-        prefix = pdir.name
         for name in sorted(sources):
             try:
-                for rec in _iter_records(pdir / name):
-                    if rec.spill and self._is_own_spill(prefix, rec.spill):
-                        own_spills.add(rec.spill)
-                    cur = latest.get(rec.key)
-                    if cur is None or rec.store_time >= cur.store_time:
-                        latest[rec.key] = rec
-            except OSError:
-                unread.add(name)  # partial read → never prune this source
+                # OSError → unread (below), never prune
+                scan = _read_records(pdir / name)
+            except OSError as exc:
+                unread.add(name)  # transient read error → never prune this source
+                logger.warning(
+                    "emboss.LogCache: could not read source log %s during "
+                    "consolidation (%s) — keeping it, and skipping the pool's "
+                    ".val sweep, until it reads cleanly.",
+                    pdir / name,
+                    exc,
+                )
+                continue
+            # real mid-log tear; a benign final tear is dropped quietly
+            if scan.recovered:
+                logger.warning(
+                    "emboss.LogCache: consolidating %s past a torn frame at byte %d — merging "
+                    "%d recovered record(s) into %s and dropping the malformed frame(s).",
+                    pdir / name,
+                    scan.tear_at,
+                    scan.recovered,
+                    self.writer_id,
+                )
+            for rec in scan.records:
+                cur = latest.get(rec.key)
+                if cur is None or rec.store_time >= cur.store_time:
+                    latest[rec.key] = rec
         keep = [r for r in latest.values() if self._live(r, now)]
         if self.size_limit is not None:
             keep = self._trim_to_limit(keep)
         keep.sort(key=lambda r: r.store_time)
-        return keep, own_spills, unread
+        return keep, unread
 
-    def _respill_foreign(self, prefix: str, keep: list[_Record]) -> list[_Record]:
-        """Make the kept set self-contained under OUR namespace. A foreign spill
-        (another writer's side file) is copied byte-for-byte into our spill dir
-        and the record repointed; our own spills are kept by reference. The raw
-        bytes are already pickled — copy them verbatim, never unpickle/repickle.
-        A foreign spill missing on disk (sync lag) → drop the record rather than
-        write a dangling reference; it recomputes on next read."""
+    def _resolve_spills(
+        self, prefix: str, keep: list[_Record]
+    ) -> tuple[list[_Record], AbstractSet[str]]:
+        """Make every kept spill reference point at an existing pool file.
+
+        A pool reference is kept when its file exists and dropped when it does
+        not (sync lag: the log arrived before the value; the record recomputes
+        on next read rather than dangle) — but a transient stat FAULT is not
+        absence: the record is kept, so a local blip can never cascade into
+        pruned logs and swept files. A **legacy** per-writer reference (the
+        pre-pool layout) is migrated: its bytes are adopted into the pool under
+        their content hash — hardlinked when the filesystem allows, so migration
+        moves no bytes and the inode survives the legacy namespace's prune — and
+        the record repointed. Content addressing makes all of this idempotent:
+        re-consolidating (e.g. against a syncer that resurrects pruned peer
+        logs) can never duplicate the corpus. The raw bytes are already pickled
+        and are never unpickled/repickled.
+
+        Returns `(consolidated, failed_adoptions)`: the resolved records, and
+        the writer namespaces whose adoption hit a TRANSIENT fault (permissions,
+        I/O — not sync lag): their legacy bytes are still on disk, so the caller
+        must keep those namespaces (and their logs) for a retry — see
+        `_defer_failed_adoption` for how the log is recovered from the spill
+        path and how own/out-of-contract references are kept instead."""
         consolidated: list[_Record] = []
+        failed: set[str] = set()
+        migrated = 0
+        dropped = 0
         for rec in keep:
-            if not rec.spill or self._is_own_spill(prefix, rec.spill):
+            if not rec.spill:
                 consolidated.append(rec)
                 continue
+            if self._is_shared_spill(prefix, rec.spill):
+                try:
+                    (self.directory / rec.spill).stat()
+                except FileNotFoundError:
+                    dropped += 1  # pool file absent (sync lag) → drop, never dangle
+                except OSError as exc:
+                    # A transient stat fault is NOT absence: keep the record
+                    # (its path also keeps the file out of the sweep); reads
+                    # degrade to a miss until the fault clears.
+                    logger.warning(
+                        "emboss.LogCache: could not stat pool spill %s (%s) — "
+                        "keeping its record; reads miss until it is reachable.",
+                        rec.spill,
+                        exc,
+                    )
+                    consolidated.append(rec)
+                else:
+                    consolidated.append(rec)
+                continue
             try:
-                blob = (self.directory / rec.spill).read_bytes()
-            except OSError:
-                continue  # foreign spill absent → drop, never dangle a spill ref
-            new_rel = self._spill_write(prefix, blob)
+                new_rel = self._pool_adopt(prefix, rec.spill)
+            except OSError as exc:
+                self._defer_failed_adoption(rec, exc, consolidated, failed)
+                continue
+            if new_rel is None:
+                dropped += 1  # legacy spill absent (sync lag) → drop, never dangle
+                continue
+            migrated += 1
             consolidated.append(rec._replace(spill=new_rel, value=None))
-        return consolidated
+        if migrated:
+            logger.info(
+                "emboss.LogCache: migrated %d legacy per-writer spill(s) in %s/ into the "
+                "shared pool.",
+                migrated,
+                prefix,
+            )
+        if dropped:
+            logger.info(
+                "emboss.LogCache: dropped %d record(s) in %s/ whose spill files were "
+                "absent (sync lag or swept); they recompute on next read.",
+                dropped,
+                prefix,
+            )
+        return consolidated, failed
+
+    def _defer_failed_adoption(
+        self,
+        rec: _Record,
+        exc: OSError,
+        consolidated: list[_Record],
+        failed: MutableSet[str],
+    ) -> None:
+        """Bookkeeping for a legacy adoption that hit a transient fault.
+
+        The log to protect is recovered from the spill path via the layout
+        invariant that a record referencing `<w>.spill/…` is stored only in
+        `<w>.log` (writers spill exclusively into their own namespace): a peer
+        namespace is deferred through `failed`, which keeps it and its log from
+        the prune. Our OWN record — or one whose reference does not parse as
+        `<prefix>/<w>.spill/…` at all, where the holding log is unknown — is
+        instead carried into our rewritten log un-repointed: the rewrite must
+        never shed a record whose bytes may still be on disk, and an
+        unreachable spill already degrades to a read-time miss."""
+        assert rec.spill is not None
+        namespace = rec.spill.split("/")[1] if "/" in rec.spill else ""
+        if namespace.endswith(".spill"):
+            failed.add(namespace.removesuffix(".spill"))
+        if namespace.endswith(".spill") and namespace != f"{self.writer_id}.spill":
+            action = "keeping its namespace and log for a retry on a later pass"
+        else:
+            consolidated.append(rec)  # our rewrite must not shed the record
+            action = "keeping its record un-repointed for a retry on a later pass"
+        logger.warning(
+            "emboss.LogCache: could not adopt legacy spill %s into the pool (%s) — %s.",
+            rec.spill,
+            exc,
+            action,
+        )
 
     @staticmethod
     def _write_consolidated(target: Path, consolidated: list[_Record]) -> None:
@@ -553,21 +1065,6 @@ class LogCache:
             out.flush()
             os.fsync(out.fileno())
         os.replace(tmp, target)
-
-    def _drop_superseded_own_spills(
-        self, own_spills: AbstractSet[str], consolidated: list[_Record]
-    ) -> None:
-        """Delete OUR spill files for large values the merge superseded — the
-        consolidate-time analogue of the overwrite cleanup in `set()`. Mirrors
-        `compact()`: only spills that were referenced by a source log (`own_spills`)
-        and are no longer referenced by the consolidated log are removed. Globbing
-        the spill dir instead would also delete an in-flight spill from a concurrent
-        `set()` (written before its record is appended, outside `self._lock`),
-        leaving that imminent record dangling. Peers' spills go with their logs in
-        the prune step."""
-        kept = {r.spill for r in consolidated if r.spill}
-        for rel in own_spills - kept:
-            self._spill_delete(rel)
 
     def _prune_consolidated_sources(
         self,
@@ -664,27 +1161,50 @@ class LogCache:
             rec = _Record(str(key), value, expire_time, now, False, None)
         with self._lock:
             index = self._ensure_index(prefix)
-            old = index.get(rec.key)
-            try:
-                log_size = self._append(prefix, rec)
-            except BaseException:
-                if rec.spill:
-                    self._spill_delete(rec.spill)  # don't orphan the new spill
-                raise
+            # Spill lifecycle is entirely the consolidation sweep's job: pool files
+            # are shared across writers and nodes, so no write path may delete one
+            # (a superseded value's file lingers until the next consolidation —
+            # guaranteed for a lone-writer prefix by the size trigger below and
+            # for a crowded one by the writer-count trigger; a stable in-between
+            # prefix sweeps only via an explicit consolidate(). A spill orphaned
+            # by an append failure below likewise waits for a sweep).
+            log_size = self._append(prefix, rec)
             index[rec.key] = rec
             self._sig.setdefault(prefix, {})[self._log_path(prefix).name] = log_size
-            if old is not None and old.spill and self._is_own_spill(prefix, old.spill):
-                self._spill_delete(old.spill)  # our superseded large value
+            last_pass = self._consolidated_at.get(prefix)
+            cooled_down = (
+                last_pass is None
+                or time.monotonic() - last_pass > _AUTO_CONSOLIDATE_COOLDOWN_S
+            )
             if log_size > self.max_log_bytes:
-                self._compact_prefix(prefix)
-            elif self.max_writers_per_prefix and (
-                len(self._sig.get(prefix, {})) > self.max_writers_per_prefix
-            ):
+                if len(self._sig.get(prefix, {})) <= 1 and cooled_down:
+                    # A lone-writer prefix never crosses the writer bound, so this
+                    # size trigger is its only sweep: with a single log,
+                    # consolidation degenerates to compaction plus the pool GC.
+                    # (`_sig` may be stale; a hidden peer just makes this a normal
+                    # consolidation.) The cooldown bounds the pathological case —
+                    # a live set that cannot shrink below `max_log_bytes` — to one
+                    # full pass per window, compacting in between.
+                    self._consolidate_prefix(prefix)
+                else:
+                    self._compact_prefix(prefix)
+            elif (
+                prefix in self._needs_migration  # migrate-on-sight, whatever the bound
+                or (
+                    self.max_writers_per_prefix
+                    and len(self._sig.get(prefix, {})) > self.max_writers_per_prefix
+                )
+            ) and cooled_down:
                 # Cheap GC trigger: `self._sig[prefix]` is the per-prefix
                 # `{logname: size}` already maintained for the index, so its
                 # length counts distinct writer logs without a fresh glob on the
-                # hot write path. Past the bound, fold every writer's log into
-                # ours and prune the redundant peers (sync-safe).
+                # hot write path. Past the bound — or when the prefix still holds
+                # the legacy per-writer spill layout — fold every writer's log
+                # into ours, migrate legacy spills into the pool, and prune the
+                # redundant peers (sync-safe). The cooldown stops the trigger
+                # from storming when pruning is blocked (busy peers / a syncer
+                # resurrecting logs keep the count above the bound), which used
+                # to cost a full consolidation on EVERY write.
                 self._consolidate_prefix(prefix)
         return True
 
@@ -700,8 +1220,8 @@ class LogCache:
             log_size = self._append(prefix, tombstone)
             index[tombstone.key] = tombstone
             self._sig.setdefault(prefix, {})[self._log_path(prefix).name] = log_size
-            if old is not None and old.spill and self._is_own_spill(prefix, old.spill):
-                self._spill_delete(old.spill)
+            # The tombstoned value's pool file is collected by the consolidation
+            # sweep once nothing references it — never deleted on the write path.
         return True
 
     def clear(self) -> int:
