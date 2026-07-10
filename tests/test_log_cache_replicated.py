@@ -515,6 +515,138 @@ def test_pool_file_referenced_only_by_fresh_foreign_log_survives(tmp_path):
     assert _reader(root).get("f") == "foreign-value"
 
 
+# ── the unread guard (issue #22, from the local side) ─────────────────────────
+
+
+def test_replicated_own_log_unreadable_aborts_pass(tmp_path, monkeypatch, caplog):
+    """If our OWN log is transiently unreadable, a replicated pass must NOT write
+    the peer-only merge over it (silently destroying this node's records) — it
+    aborts, leaving our log and the stale peer log intact."""
+    import emboss._log_cache as m
+
+    root = tmp_path / "cache"
+    LogCache(root, writer_id="alpha", **_WIDTH1).set("d", "mine")
+    (root / ".replicated").touch()
+    prefix = LogCache(root, prefix_width=1)._prefix("d")
+    stale = root / prefix / "beta.log"
+    _write_log(stale, _rec("f", "from-beta"))
+    _age(stale, 13 * 3600)  # stale → fold-eligible, so it would be pruned but for the abort
+    real_read = m._read_records
+
+    def flaky(path):
+        if path.name == "alpha.log":  # our own log fails transiently
+            raise OSError("transient read failure on our own log")
+        return real_read(path)
+
+    monkeypatch.setattr(m, "_read_records", flaky)
+    with caplog.at_level("WARNING"):
+        LogCache(root, writer_id="alpha", **_WIDTH1).consolidate(prefix)
+    monkeypatch.undo()
+
+    assert (root / prefix / "alpha.log").exists()  # never overwritten
+    assert stale.exists()  # stale peer not pruned under the abort
+    reader = _reader(root)
+    assert reader.get("d") == "mine"  # our own record survived
+    assert reader.get("f") == "from-beta"
+    assert any("could not be read" in r.message for r in caplog.records)
+
+
+def test_replicated_unread_peer_suppresses_prune_and_sweeps(tmp_path, monkeypatch):
+    """An unreadable PEER source (not our target) is never pruned, and because its
+    references are unknown it also suppresses dead-record dropping and the pool
+    sweep — the module's 'never lose what we couldn't read' invariant, in
+    replicated mode."""
+    import emboss._log_cache as m
+
+    root = tmp_path / "cache"
+    cache = LogCache(root, writer_id="alpha", **_WIDTH1)
+    (root / ".replicated").touch()
+    cache.set("d", "x")
+    assert cache.delete("d") is True  # a tombstone in OUR log that a clean pass would drop
+    prefix = cache._prefix("d")
+    stale = root / prefix / "beta.log"
+    _write_log(stale, _rec("f", "from-beta"))
+    _age(stale, 13 * 3600)  # stale → fold-eligible (would be read + pruned)
+    orphan = root / prefix / "spill" / "orphan.val"
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    orphan.write_bytes(b"unreferenced")
+    _age(orphan, 25 * 3600)  # past the 24 h replicated grace → would be swept
+    real_read = m._read_records
+
+    def flaky(path):
+        if path.name == "beta.log":
+            raise OSError("transient read failure")
+        return real_read(path)
+
+    monkeypatch.setattr(m, "_read_records", flaky)
+    cache.consolidate(prefix)
+    monkeypatch.undo()
+
+    assert stale.exists()  # unread source never pruned
+    assert orphan.exists()  # sweep suppressed — references unknown while a log is unread
+    own = list(_iter_records(root / prefix / "alpha.log"))
+    assert [r.key for r in own if r.deleted] == ["d"]  # tombstone retained (any_unread)
+
+
+# ── dead-record retention: the expired arm ────────────────────────────────────
+
+
+def test_replicated_expired_retained_while_fresh_foreign_holds_older(tmp_path):
+    """The expired arm of the retention rule (mirrors the tombstone test): an
+    EXPIRED record is kept while a fresh foreign log holds an OLDER record for the
+    key — dropping it would resurrect the older value on read — and both collapse
+    once the foreign log ages out and folds."""
+    root = tmp_path / "cache"
+    cache = LogCache(root, writer_id="alpha", **_WIDTH1)
+    (root / ".replicated").touch()
+    prefix = cache._prefix("d")
+    now = time.time()
+    foreign = root / prefix / "beta.log"
+    _write_log(foreign, _Record("d", "old-foreign", None, now - 100, False, None))
+    # our own log: a NEWER record for "d" that has already expired
+    _write_log(root / prefix / "alpha.log", _Record("d", "mine", now - 1, now, False, None))
+
+    cache.consolidate(prefix)
+
+    own = list(_iter_records(root / prefix / "alpha.log"))
+    assert [(r.key, r.expire_time is not None) for r in own] == [("d", True)]  # retained
+    assert _reader(root).get("d") is None  # expired record suppresses the older foreign one
+
+    _age(foreign, 13 * 3600)  # the foreign log ages out
+    cache.consolidate(prefix)
+    assert not foreign.exists()  # folded + deleted
+    assert not (root / prefix / "alpha.log").exists()  # nothing live remains
+    assert _reader(root).get("d") is None
+
+
+# ── size_limit interaction ────────────────────────────────────────────────────
+
+
+def test_replicated_size_limit_bounds_local_without_losing_foreign(tmp_path):
+    """`size_limit` trims THIS node's own live records in a replicated merge, but
+    never touches a fresh foreign log — no foreign record is lost — and the pass
+    stays idempotent."""
+    root = tmp_path / "cache"
+    cache = LogCache(root, writer_id="alpha", size_limit=250, **_WIDTH1)
+    (root / ".replicated").touch()
+    prefix = cache._prefix("d")
+    foreign = root / prefix / "beta.log"
+    _write_log(foreign, _rec("i", "from-beta"))  # a fresh foreign record
+    foreign_before = _file_state(foreign)
+    for key in ("d", "f", "k", "p"):  # our own, oldest → newest; over the byte budget
+        cache.set(key, key * 100)
+
+    cache.consolidate(prefix)
+
+    assert _file_state(foreign) == foreign_before  # foreign never touched by trimming
+    reader = _reader(root)
+    assert reader.get("i") == "from-beta"  # foreign record never at risk
+    assert reader.get("p") == "p" * 100  # our newest survives the trim
+    before = _tree_state(root)
+    cache.consolidate(prefix)
+    assert _tree_state(root) == before  # trimmed merge is idempotent
+
+
 # ── knobs and append-path behaviour ───────────────────────────────────────────
 
 

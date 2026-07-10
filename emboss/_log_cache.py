@@ -18,7 +18,8 @@ prefix each node appends to **its own** log:
 Because no LOG is ever written by two nodes — and any two nodes writing the same
 content-addressed pool file write identical bytes — a file syncer just ships each
 node's files around: last-write-wins never loses data. Same-node processes
-sharing a node-log are serialised by the per-writer lock file. Inodes are bounded by ~(#prefixes x #writers), not entry count.
+sharing a node-log are serialised by the per-writer lock file. Inodes are bounded
+by ~(#prefixes x #writers), not entry count.
 
 - **Reads** consult a per-prefix in-memory index (built by scanning that
   prefix's logs once; rebuilt when a log's size changes — a peer's appends). The
@@ -50,9 +51,12 @@ sharing a node-log are serialised by the per-writer lock file. Inodes are bounde
   their spill files) — the missing cross-writer GC. Without it, file count is
   ~(#prefixes x #writers) and grows forever as nodes come and go (decommissioned
   hosts, one-shot bulk-import writers, containers that fell back to a random
-  hostname). Sync-safe: it snapshots each peer log's `(size, mtime)` first and
-  re-stats before delete, so a peer/local append that lands DURING consolidation
-  is never deleted (its newer records win on read; the next pass collects it).
+  hostname). Safe against concurrent *appends*: it snapshots each peer log's
+  `(size, mtime)` first and re-stats before delete, so a peer/local append that
+  lands DURING consolidation is never deleted (its newer records win on read; the
+  next pass collects it). It is NOT safe against concurrent multi-node
+  *consolidation* of a file-replicated tree — that needs the `.replicated`
+  marker below (issue #22).
   Consolidation is also the migration point for the legacy per-writer spill
   layout (files adopted into the pool via hardlink, records repointed, the
   namespaces pruned with their logs — detected at index build, triggered on the
@@ -120,7 +124,7 @@ import struct
 import threading
 import time
 import uuid
-from collections.abc import Iterator, Set as AbstractSet
+from collections.abc import Callable, Iterator, Set as AbstractSet
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -653,8 +657,10 @@ class LogCache:
         dropping dead/superseded/expired records, then prune the now-redundant
         peer logs (and their spills) — the cross-writer GC `compact()` lacks.
 
-        Sync-safe: a peer/local append that lands during the merge is detected by
-        a `(size, mtime)` re-stat and left intact (its newer records win on read;
+        Safe against concurrent *appends* (not against concurrent multi-node
+        consolidation — that needs the `.replicated` marker; see below): a
+        peer/local append that lands during the merge is detected by a
+        `(size, mtime)` re-stat and left intact (its newer records win on read;
         the next pass collects it), so a concurrent write is never lost. This is
         also the **legacy-spill migration point**: a record still referencing a
         per-writer `<writer>.spill/` file (the pre-pool layout) has its value
@@ -679,7 +685,7 @@ class LogCache:
             return
         self._run_batch(self._consolidate_prefix)
 
-    def _run_batch(self, per_prefix: Any) -> None:
+    def _run_batch(self, per_prefix: Callable[[str], None]) -> None:
         """Run a per-prefix pass over every prefix dir, fanned across a thread pool.
 
         Deliberately NOT under `self._lock`: holding it for a whole multi-minute batch
@@ -732,6 +738,13 @@ class LogCache:
         with self._writer_lock(prefix):  # serialise same-node writes to our log
             snapshot = self._snapshot_logs(pdir)
             keep, unread = self._collect_live_across_logs(pdir, snapshot, now)
+            if self._target_unfolded(target, snapshot, unread):
+                logger.warning(
+                    "emboss.LogCache: own log %s could not be read this pass — skipping "
+                    "consolidation rather than overwriting it with peer-only records.",
+                    target,
+                )
+                return
             consolidated = self._resolve_spills(prefix, keep)
             self._write_consolidated(target, consolidated)
             self._prune_consolidated_sources(pdir, snapshot, target.name, unread)
@@ -772,6 +785,13 @@ class LogCache:
             snapshot = self._snapshot_logs(pdir)
             foldable = self._fold_eligible_logs(snapshot, target.name, now)
             merged = self._merge_replicated(pdir, snapshot, foldable, now)
+            if self._target_unfolded(target, snapshot, merged.unread):
+                logger.warning(
+                    "emboss.LogCache: own log %s could not be read this pass — skipping "
+                    "consolidation rather than overwriting it with peer-only records.",
+                    target,
+                )
+                return
             consolidated = self._resolve_spills(prefix, merged.keep)
             self._write_consolidated_if_changed(target, consolidated)
             _fsync_dir(pdir)  # output rename/unlink durable before inputs go
@@ -780,6 +800,19 @@ class LogCache:
             grace = self.replicated_spill_grace
             self._sweep_shared_spills(pdir, kept, merged.unread, now, grace=grace)
             self._sweep_legacy_namespaces(pdir, kept, merged.unread, now, grace=grace)
+
+    @staticmethod
+    def _target_unfolded(
+        target: Path, snapshot: dict[str, tuple[int, int]], unread: AbstractSet[str]
+    ) -> bool:
+        """True when our OWN log exists on disk but was NOT folded into the merge
+        — its read raised `OSError` (so it landed in `unread`), or a snapshot
+        `stat` error dropped it. Writing the peer-only merge over it (or unlinking
+        it when empty) would silently destroy this node's records: issue #22's
+        loss, from the local side. The caller must abort the pass instead."""
+        return target.name in unread or (
+            target.exists() and target.name not in snapshot
+        )
 
     @staticmethod
     def _snapshot_logs(pdir: Path) -> dict[str, tuple[int, int]]:
@@ -796,7 +829,7 @@ class LogCache:
 
     def _fold_eligible_logs(
         self, snapshot: dict[str, tuple[int, int]], target_name: str, now: float
-    ) -> set[str]:
+    ) -> AbstractSet[str]:
         """The inputs a replicated pass may fold and afterwards delete: our own
         log, every sync-conflict copy (sealed by construction), and any foreign
         log idle past `replicated_stale_ttl` (mtime is the origin node's last
@@ -1211,7 +1244,10 @@ class LogCache:
                 # hot write path. Past the bound — or when the prefix still holds
                 # the legacy per-writer spill layout — fold every writer's log
                 # into ours, migrate legacy spills into the pool, and prune the
-                # redundant peers (sync-safe). The cooldown stops the trigger
+                # redundant peers. On a `.replicated` tree this routes through the
+                # replication-safe fold instead (`_consolidate_replicated`): only
+                # own/sync-conflict/stale-idle logs fold, fresh peers untouched.
+                # The cooldown stops the trigger
                 # from storming when pruning is blocked (busy peers / a syncer
                 # resurrecting logs keep the count above the bound), which used
                 # to cost a full consolidation on EVERY write.

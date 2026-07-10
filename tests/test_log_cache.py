@@ -729,6 +729,36 @@ def test_consolidate_keeps_unreadable_source(tmp_path, monkeypatch):
     assert reader.get("d") == 1
 
 
+def test_consolidate_aborts_when_own_log_unreadable(tmp_path, monkeypatch, caplog):
+    """If OUR OWN log errors mid-read, the pass must NOT write the peer-only merge
+    over it (that would silently destroy this node's records) — it aborts, leaving
+    our log intact and the peers unpruned."""
+    import emboss._log_cache as m
+
+    root = tmp_path / "c"
+    LogCache(root, writer_id="A", prefix_width=1).set("d", 1)
+    LogCache(root, writer_id="PEER", prefix_width=1).set("f", 2)
+    prefix = LogCache(root, prefix_width=1)._prefix("d")
+    own_log, peer_log = root / prefix / "A.log", root / prefix / "PEER.log"
+    real_read = m._read_records
+
+    def flaky(path):
+        if path.name == "A.log":  # our own log fails transiently
+            raise OSError("transient read failure on our own log")
+        return real_read(path)
+
+    monkeypatch.setattr(m, "_read_records", flaky)
+    with caplog.at_level("WARNING"):
+        LogCache(root, writer_id="A", prefix_width=1).consolidate(prefix)
+    monkeypatch.undo()
+
+    assert own_log.exists() and peer_log.exists()  # nothing overwritten or pruned
+    reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
+    assert reader.get("d") == 1  # our own record survived the aborted pass
+    assert reader.get("f") == 2
+    assert any("could not be read" in r.message for r in caplog.records)
+
+
 def test_consolidate_drops_expired(tmp_path):
     """consolidate honours TTL: an expired record is dropped from the merge."""
     root = tmp_path / "c"
