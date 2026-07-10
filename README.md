@@ -2,7 +2,7 @@
 
 **O**n-**D**isk **I**nput-keyed **C**ache — disk-backed memoization with pydantic-aware encoding.
 
-Version: 0.6.0
+Version: 0.8.0
 
 ```bash
 pip install emboss              # core — zero runtime dependencies (stdlib only)
@@ -252,13 +252,29 @@ def expensive(x: int) -> dict:
 
 `LogCache` gets few inodes **and** conflict-free sync by giving every writer its own files. Entries are sharded into 256 prefixes; within each, a node appends to `directory/<prefix>/<writer_id>.log`. Because **no file is ever written by two nodes**, a syncer just ships each node's logs around — last-write-wins never fires, so a conflict can't lose data. Reads merge a prefix's logs (cached in memory; rebuilt when a peer's log grows); deletes append tombstones; compaction (auto past `max_log_bytes`, or `compact()`) rewrites *this node's own* log dropping dead records. Same-node processes are serialised by a per-writer lock file.
 
-**Consolidation / GC** is the missing cross-writer collector: `consolidate()` (auto past `max_writers_per_prefix`, default 8) merges *every* writer's log in a prefix into this node's single log, drops dead records, and prunes the now-redundant peer logs — bounding the file count (≈ #prefixes × #writers) that otherwise grows forever as writers come and go (decommissioned hosts, one-shot bulk-import jobs, containers that fell back to a random hostname). It is sync-safe: it snapshots each peer log's `(size, mtime)` and re-`stat`s before deleting, so a peer/local append that lands *during* consolidation is never deleted (its newer records win on read; the next pass folds them in). Foreign spilled values are copied into this writer's namespace byte-for-byte, so the consolidated log stays self-contained after the peers are gone.
+**Consolidation / GC** is the missing cross-writer collector: `consolidate()` (auto past `max_writers_per_prefix`, default 8) merges writers' logs in a prefix into this node's single log, drops dead records, and prunes the now-redundant peer logs — bounding the file count (≈ #prefixes × #writers) that otherwise grows forever as writers come and go (decommissioned hosts, one-shot bulk-import jobs, containers that fell back to a random hostname). It is safe against concurrent *appends*: it snapshots each peer log's `(size, mtime)` and re-`stat`s before deleting, so a peer/local append that lands *during* consolidation is never deleted (its newer records win on read; the next pass folds them in). Foreign spilled values are adopted into the shared content-addressed pool (hardlinked when possible), so the consolidated log stays self-contained after the peers are gone.
 
 In the benchmark, **20,000 entries used 512 files (vs `FileCache`'s 20,000)** — the inode count is capped at #prefixes × #writers, independent of entry count. Reads are an in-memory index lookup: with the default `index_ttl=1.0s` (which throttles the freshness re-`stat` for peers' appends) LogCache benches as the **fastest backend (~380k get/s)**; the trade is up to `index_ttl` of staleness on cross-process/node writes (own writes are immediate, and 1 s is well under Syncthing's latency).
 
-**Large values spill to side files** (`min_file_size`, default 32 KB), keeping the append log small — verified on touchstone's real cache, where a **185 MB** value spilled to a side file and the log stayed at **120 bytes**. Spill files live under the writer's own namespace (so they sync conflict-free) and are removed on overwrite / delete / compaction / consolidation.
+**Large values spill to side files** (`min_file_size`, default 32 KB), keeping the append log small — verified on touchstone's real cache, where a **185 MB** value spilled to a side file and the log stayed at **120 bytes**. Spills live in a per-prefix **shared, content-addressed pool** (`<prefix>/spill/<sha256>.val`): identical values collapse to one file across writers, and two nodes "conflicting" on a pool file write identical bytes, so a syncer's last-write-wins is harmless there. Pool files are deleted only by the consolidation mark-and-sweep (references derived from every log, plus a grace window) — never on the write path.
 
-Tunables (`python scripts/bench.py` picked the defaults): `index_ttl` (1.0 s), `prefix_width` (2 → 256 shards; use 3 above ~2M entries), `max_log_bytes` (4 MB), `min_file_size` (32 KB), `max_writers_per_prefix` (8; `0` disables auto-consolidation). `writer_id` **must be unique per node** (defaults to the hostname); `prefix_width` must match across writers of a directory.
+Tunables (`python scripts/bench.py` picked the defaults): `index_ttl` (1.0 s), `prefix_width` (2 → 256 shards; use 3 above ~2M entries), `max_log_bytes` (4 MB), `min_file_size` (32 KB), `max_writers_per_prefix` (8; `0` disables auto-consolidation), and — replicated mode only — `replicated_stale_ttl` (12 h) and `replicated_spill_grace` (24 h). `writer_id` **must be unique per node** (defaults to the hostname); `prefix_width` must match across writers of a directory.
+
+#### Replicated trees — the `.replicated` marker
+
+> **WARNING — pre-0.8 consolidation must never run on a replicated tree.** It rewrites and deletes *every* writer's logs; run it on more than one node of a file-replicated fabric (Syncthing, etc.) and the same-named rewritten files diverge, the syncer resolves last-writer-wins, and records are silently lost. This caused real fleet data loss on 2026-07-10 ([#22](https://github.com/DJRHails/emboss/issues/22)): per-shard writer logs deleted or stubbed, ≥4,015 LLM calls re-billed. On a replicated tree, either upgrade every node to ≥0.8 **and** drop the marker, or don't consolidate at all.
+
+Touch a `.replicated` file at the cache root (next to the prefix dirs) and `consolidate()` — including the auto-trigger in `set()` — switches to replication-safe semantics. **Whoever operates the sync fabric owns the marker**: the orchestrator that configures the folder for replication drops it in the same breath (it replicates to every node like any other file); remove it only after the folder is permanently un-shared. The marker is checked live on every pass, no restarts needed.
+
+Replication-safe semantics — the invariants:
+
+- **Never rewrite or truncate a foreign writer's file.** The only mutations are rewrites of the node's *own* log, creation of new files, and whole-file deletion of inputs that were folded.
+- **Fold-eligible inputs**: the node's own log (sole writer — always safe); every `*.sync-conflict-*` log **regardless of age** (the syncer minted its unique name, nobody appends to it); foreign logs idle past `replicated_stale_ttl` (default 12 h; env `EMBOSS_REPLICATED_STALE_TTL`, seconds — mtime reflects the origin node's last append, which syncers preserve).
+- **Outputs before inputs**: merged records land in the node's own log exactly as in exclusive mode, fsync'd (file + directory) *before* any input file is unlinked.
+- **A fresh foreign log is invisible** — read normally on the read path, never mutated or deleted by consolidation. A *torn* fresh foreign log has its readable records recovered into the local log for durability; the file itself is never repaired in place.
+- **Pool GC** still derives references from *all* logs present, with the grace window raised to `replicated_spill_grace` (default 24 h; env `EMBOSS_REPLICATED_SPILL_GRACE`) — a spill can replicate ahead of the log that references it.
+
+These invariants make concurrent consolidation on every node **idempotent and coordination-free**: each node rewrites only its own uniquely-named file, and the deletions (stale/conflict inputs, unreferenced pool files) are whole-file unlinks that converge under sync whichever node performs them. A staleness misfire — folding a log whose owner was still appending, hidden by sync lag or clock skew — is self-healing: the delete-vs-modify race surfaces as a sync-conflict copy, which the next pass on any node folds by name. Note that `clear()` remains node-local in intent but its deletions *do* propagate through a syncer — don't run it on a replicated tree you don't mean to empty everywhere.
 
 ### Migrating between backends — `transfer`
 
