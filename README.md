@@ -2,7 +2,7 @@
 
 **O**n-**D**isk **I**nput-keyed **C**ache — disk-backed memoization with pydantic-aware encoding.
 
-Version: 0.7.5
+Version: 0.8.0
 
 ```bash
 pip install emboss              # core — zero runtime dependencies (stdlib only)
@@ -252,13 +252,13 @@ def expensive(x: int) -> dict:
 
 `LogCache` gets few inodes **and** conflict-free sync by giving every writer its own files. Entries are sharded into 256 prefixes; within each, a node appends to `directory/<prefix>/<writer_id>.log`. Because **no file is ever written by two nodes**, a syncer just ships each node's logs around — last-write-wins never fires, so a conflict can't lose data. Reads merge a prefix's logs (cached in memory; rebuilt when a peer's log grows); deletes append tombstones; compaction (auto past `max_log_bytes`, or `compact()`) rewrites *this node's own* log dropping dead records. Same-node processes are serialised by a per-writer lock file.
 
-**Consolidation / GC** is the missing cross-writer collector: `consolidate()` (auto past `max_writers_per_prefix`, default 8) merges *every* writer's log in a prefix into this node's single log, drops dead records, and prunes the now-redundant peer logs — bounding the file count (≈ #prefixes × #writers) that otherwise grows forever as writers come and go (decommissioned hosts, one-shot bulk-import jobs, containers that fell back to a random hostname). It is sync-safe: it snapshots each peer log's `(size, mtime)` and re-`stat`s before deleting, so a peer/local append that lands *during* consolidation is never deleted (its newer records win on read; the next pass folds them in). Foreign spilled values are copied into this writer's namespace byte-for-byte, so the consolidated log stays self-contained after the peers are gone.
+**Consolidation / GC** compacts this node's log against every writer's records (a record superseded under *any* writer is dropped from ours), migrates our own legacy spill layout into the shared pool, and mark-and-sweeps the pool. **It never touches a peer's log by default**: under a file syncer a peer's log here is a replica whose owner may hold an un-synced tail — locally byte-stable is not complete, and a deletion here propagates back and destroys the owner's original (the 2026-07-10 fleet-cache clobber). Cross-writer GC — folding a retired writer's log into ours and removing it, bounding the file count (≈ #prefixes × #writers) as writers come and go — is explicit-only: `consolidate(prune_writer_ids={...})` names the writers the caller asserts will never write again (decommissioned hosts, one-shot bulk-import jobs, retired container ids). Even a pruned log is snapshotted `(size, mtime)` and re-`stat`ed before deletion, so an append landing *during* the pass is never lost.
 
 In the benchmark, **20,000 entries used 512 files (vs `FileCache`'s 20,000)** — the inode count is capped at #prefixes × #writers, independent of entry count. Reads are an in-memory index lookup: with the default `index_ttl=1.0s` (which throttles the freshness re-`stat` for peers' appends) LogCache benches as the **fastest backend (~380k get/s)**; the trade is up to `index_ttl` of staleness on cross-process/node writes (own writes are immediate, and 1 s is well under Syncthing's latency).
 
 **Large values spill to side files** (`min_file_size`, default 32 KB), keeping the append log small — verified on touchstone's real cache, where a **185 MB** value spilled to a side file and the log stayed at **120 bytes**. Spill files live under the writer's own namespace (so they sync conflict-free) and are removed on overwrite / delete / compaction / consolidation.
 
-Tunables (`python scripts/bench.py` picked the defaults): `index_ttl` (1.0 s), `prefix_width` (2 → 256 shards; use 3 above ~2M entries), `max_log_bytes` (4 MB), `min_file_size` (32 KB), `max_writers_per_prefix` (8; `0` disables auto-consolidation). `writer_id` **must be unique per node** (defaults to the hostname); `prefix_width` must match across writers of a directory.
+Tunables (`python scripts/bench.py` picked the defaults): `index_ttl` (1.0 s), `prefix_width` (2 → 256 shards; use 3 above ~2M entries), `max_log_bytes` (4 MB), `min_file_size` (32 KB). `writer_id` **must be unique per node** (defaults to the hostname); `prefix_width` must match across writers of a directory.
 
 ### Migrating between backends — `transfer`
 

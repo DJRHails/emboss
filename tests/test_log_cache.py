@@ -326,10 +326,10 @@ def test_iter_records_propagates_read_error(tmp_path, monkeypatch):
 
 
 def test_unreadable_source_is_not_pruned_on_consolidate(tmp_path, monkeypatch):
-    """End-to-end guard: a peer log that errors on read during consolidate() must
-    survive — its unmerged records aren't in our log, so pruning it would lose
-    them. This is the safety the `unread` set exists to provide."""
-    reader = LogCache(tmp_path / "c", writer_id="R", max_writers_per_prefix=1)
+    """End-to-end guard: an allowlisted log that errors on read during
+    consolidate() must survive — its unmerged records aren't in our log, so
+    pruning it would lose them. This is the safety the `unread` set provides."""
+    reader = LogCache(tmp_path / "c", writer_id="R")
     peer = LogCache(tmp_path / "c", writer_id="PEER")
     key = "k"
     peer.set(key, "peer-value")
@@ -345,7 +345,9 @@ def test_unreadable_source_is_not_pruned_on_consolidate(tmp_path, monkeypatch):
         return orig_read(self)
 
     monkeypatch.setattr(Path, "read_bytes", boom)
-    reader.consolidate(prefix)  # the read error is caught into `unread`, not raised
+    # the read error is caught into `unread`, not raised — even when the caller
+    # asserted the writer dead, an unreadable log is never pruned
+    reader.consolidate(prefix, prune_writer_ids={"PEER"})
     assert peer_log.exists()  # not pruned — its record was never merged
 
 
@@ -452,10 +454,10 @@ def _spills(root):
     return list(root.glob("**/spill/*.val"))
 
 
-def _sweep_now(cache, prefix):
+def _sweep_now(cache, prefix, prune_writer_ids=None):
     """Consolidate with the sweep grace collapsed to zero (test-only shortcut)."""
     cache._SHARED_SPILL_GRACE_S = 0.0
-    cache.consolidate(prefix)
+    cache.consolidate(prefix, prune_writer_ids=prune_writer_ids)
 
 
 def test_large_value_spills_to_file(tmp_path):
@@ -547,7 +549,8 @@ _SAME_PREFIX_KEYS = ["d", "f", "i", "k", "p"]
 
 
 def test_consolidate_merges_many_writers_into_one(tmp_path):
-    """N writers in a prefix → one log after consolidate, every live entry kept."""
+    """N retired writers in a prefix → one log after an allowlisted consolidate,
+    every live entry kept."""
     root = tmp_path / "c"
     prefix = LogCache(root, prefix_width=1)._prefix(_SAME_PREFIX_KEYS[0])
     for w, k in zip("ABCDE", _SAME_PREFIX_KEYS):  # each writer sets a colliding key
@@ -556,7 +559,7 @@ def test_consolidate_merges_many_writers_into_one(tmp_path):
     assert len(before) == 5  # five writer logs piled up in the one prefix
 
     gc = LogCache(root, writer_id="GC", prefix_width=1)
-    gc.consolidate()
+    gc.consolidate(prune_writer_ids=set("ABCDE"))  # caller asserts them retired
 
     after = list((root / prefix).glob("*.log"))
     assert len(after) < len(before)  # file count dropped
@@ -567,18 +570,20 @@ def test_consolidate_merges_many_writers_into_one(tmp_path):
 
 
 def test_consolidate_cross_writer_supersede(tmp_path):
+    """Our record superseded under ANY writer is dropped from our rewrite; the
+    winning record stays in the peer log it lives in (untouched)."""
     root = tmp_path / "c"
     LogCache(root, writer_id="A").set("k", 1)  # older
     time.sleep(0.01)
     LogCache(root, writer_id="B").set("k", 2)  # newer store_time wins
-    gc = LogCache(root, writer_id="A")  # consolidate into A's existing log
+    gc = LogCache(root, writer_id="A")  # consolidate A's own log
+    prefix = gc._prefix("k")
+    b_bytes = (root / prefix / "B.log").read_bytes()
     gc.consolidate()
     assert LogCache(root, writer_id="R", index_ttl=0).get("k") == 2
-    # exactly one surviving record for the key (the latest) in our single log
-    prefix = gc._prefix("k")
-    recs = list(_iter_records(gc._log_path(prefix)))
-    assert len(recs) == 1
-    assert recs[0].value == 2
+    # A's only record was superseded → its rewritten log is empty and dropped
+    assert not gc._log_path(prefix).exists()
+    assert (root / prefix / "B.log").read_bytes() == b_bytes  # winner untouched
 
 
 def test_consolidate_tombstone_wins(tmp_path):
@@ -599,8 +604,9 @@ def test_consolidate_tombstone_wins(tmp_path):
 
 
 def test_consolidate_keeps_changed_peer_log(tmp_path):
-    """Sync-safety: a peer log appended-to AFTER the snapshot but BEFORE the prune
-    must NOT be deleted, and its new entry must survive (its newer record wins)."""
+    """Sync-safety even under the allowlist: a pruned-writer log appended-to AFTER
+    the snapshot but BEFORE the prune must NOT be deleted (the dead-writer
+    assertion was wrong), and its new entry must survive."""
     root = tmp_path / "c"
     k_a, k_p, k_p2 = _SAME_PREFIX_KEYS[:3]  # all share one prefix
     a = LogCache(root, writer_id="A", prefix_width=1)
@@ -614,15 +620,15 @@ def test_consolidate_keeps_changed_peer_log(tmp_path):
     # peer append lands AFTER the snapshot was taken but BEFORE the prune runs.
     real_prune = LogCache._prune_consolidated_sources
 
-    def append_then_prune(self, pdir, snapshot, target_name, unread):
+    def append_then_prune(self, pdir, snapshot, target_name, unread, prune_logs):
         peer.set(k_p2, 2)  # a concurrent peer append lands mid-consolidation
-        return real_prune(self, pdir, snapshot, target_name, unread)
+        return real_prune(self, pdir, snapshot, target_name, unread, prune_logs)
 
     monkey = LogCache(root, writer_id="A", prefix_width=1)
     object.__setattr__(
         monkey, "_prune_consolidated_sources", append_then_prune.__get__(monkey)
     )
-    monkey.consolidate(prefix)
+    monkey.consolidate(prefix, prune_writer_ids={"PEER"})
 
     assert peer_log.exists()  # changed peer log was NOT deleted (no lost write)
     reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
@@ -632,27 +638,32 @@ def test_consolidate_keeps_changed_peer_log(tmp_path):
 
 
 def test_prune_stat_decision_unchanged_vs_changed(tmp_path):
-    """Directly pin the prune decision: an unchanged source is deleted, a source
-    whose (size, mtime) differs from the snapshot is left intact."""
+    """Directly pin the prune decision: an unchanged ALLOWLISTED source is
+    deleted, a changed one is left intact, and a source outside the allowlist
+    is never touched however stable it is."""
     root = tmp_path / "c"
     gc = LogCache(root, writer_id="GC", prefix_width=1)
     pdir = root / "00"
     pdir.mkdir(parents=True)
     stable = pdir / "STABLE.log"
     changed = pdir / "CHANGED.log"
-    stable.write_bytes(b"x")
-    changed.write_bytes(b"x")
+    bystander = pdir / "BYSTANDER.log"
+    for log in (stable, changed, bystander):
+        log.write_bytes(b"x")
     snapshot = {}
-    for log in (stable, changed):
+    for log in (stable, changed, bystander):
         st = log.stat()
         snapshot[log.name] = (st.st_size, st.st_mtime_ns)
     # mutate CHANGED after snapshotting it
     time.sleep(0.01)
     changed.write_bytes(b"xy")
 
-    gc._prune_consolidated_sources(pdir, snapshot, "GC.log", set())
-    assert not stable.exists()  # unchanged → fully represented → deleted
+    gc._prune_consolidated_sources(
+        pdir, snapshot, "GC.log", set(), {"STABLE.log", "CHANGED.log"}
+    )
+    assert not stable.exists()  # allowlisted + unchanged → deleted
     assert changed.exists()  # changed since snapshot → kept (sync-safe)
+    assert bystander.exists()  # not allowlisted → never touched
 
 
 def test_consolidate_foreign_spill_reread_byte_correct(tmp_path):
@@ -664,7 +675,7 @@ def test_consolidate_foreign_spill_reread_byte_correct(tmp_path):
     assert len(_spills(root)) == 1  # B spilled the large value into the shared pool
 
     a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
-    a.consolidate(prefix)
+    a.consolidate(prefix, prune_writer_ids={"B"})
 
     assert LogCache(root, writer_id="R", prefix_width=1, index_ttl=0).get("big") == big
     assert len(_spills(root)) == 1  # the pool file was never copied or moved
@@ -685,7 +696,7 @@ def test_consolidate_twice_never_grows_the_pool(tmp_path):
     prefixes = {a._prefix(f"k-{w}") for w in ("B", "C", "D")}
     for _ in range(3):
         for prefix in prefixes:
-            a.consolidate(prefix)
+            a.consolidate(prefix, prune_writer_ids={"B", "C", "D"})
     assert len(_spills(root)) == 3  # one content-addressed file per distinct value
     reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
     assert all(reader.get(f"k-{w}") == w * 5000 for w in ("B", "C", "D"))
@@ -727,7 +738,7 @@ def test_legacy_namespace_spills_migrate_on_consolidation(tmp_path):
 
     a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
     assert a.get("big") == "z" * 5000  # legacy refs still resolve pre-migration
-    a.consolidate(prefix)
+    a.consolidate(prefix, prune_writer_ids={"B"})
 
     assert not legacy_dir.exists()  # legacy namespace pruned with its log
     assert len(list((root / prefix / "spill").glob("*.val"))) == 1  # adopted
@@ -752,7 +763,7 @@ def test_consolidate_missing_foreign_spill_drops_record(tmp_path):
     shutil.rmtree(root / prefix / "spill")
 
     a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
-    a.consolidate(prefix)
+    a.consolidate(prefix, prune_writer_ids={"B"})
 
     target = a._log_path(prefix)
     keys = [r.key for r in _iter_records(target)]
@@ -772,29 +783,24 @@ def test_consolidate_empty_removes_log(tmp_path):
     time.sleep(0.01)
     b.delete("k")  # newest is a tombstone → nothing live
     gc = LogCache(root, writer_id="GC", prefix_width=1)
-    gc.consolidate()
+    gc.consolidate(prune_writer_ids={"A", "B"})
     prefix = gc._prefix("k")
     assert not gc._log_path(prefix).exists()  # empty result → our log dropped
     assert len(LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)) == 0
 
 
-def test_auto_consolidate_on_writer_count(tmp_path):
-    """Past max_writers_per_prefix, the next set folds the prefix into one log."""
+def test_explicit_prune_folds_many_writers(tmp_path):
+    """The explicit allowlist is the only cross-writer fold: naming every retired
+    writer collapses the prefix to one log."""
     root = tmp_path / "c"
-    # 3 peer writers each leave a log in the shared prefix (same key → same prefix)
     for w in ("w0", "w1", "w2"):
-        LogCache(root, writer_id=w, prefix_width=1, max_writers_per_prefix=0).set(
-            "k", w
-        )
+        LogCache(root, writer_id=w, prefix_width=1).set("k", w)
     prefix = LogCache(root, prefix_width=1)._prefix("k")
     assert len({p.name for p in (root / prefix).glob("*.log")}) == 3
 
-    # our writer with a small bound: its set sees 3 peers + itself > 2 → consolidate
-    writer = LogCache(
-        root, writer_id="ME", prefix_width=1, max_writers_per_prefix=2, index_ttl=0
-    )
-    writer.get("k")  # build the index so _sig[prefix] is populated with peer logs
-    writer.set("k", "ME")  # this write trips the auto-consolidation
+    writer = LogCache(root, writer_id="ME", prefix_width=1, index_ttl=0)
+    writer.set("k", "ME")
+    writer.consolidate(prefix, prune_writer_ids={"w0", "w1", "w2"})
     assert {p.name for p in (root / prefix).glob("*.log")} == {"ME.log"}  # back to one
     assert LogCache(root, writer_id="R", prefix_width=1, index_ttl=0).get("k") == "ME"
 
@@ -871,7 +877,7 @@ def test_consolidate_keeps_unreadable_source(tmp_path, monkeypatch):
 
 
 def test_consolidate_drops_expired(tmp_path):
-    """consolidate honours TTL: an expired record is dropped from the merge."""
+    """consolidate honours TTL: an expired record is dropped from the rewrite."""
     root = tmp_path / "c"
     gone, keep = _SAME_PREFIX_KEYS[:2]
     LogCache(root, writer_id="A", prefix_width=1).set(gone, 1, expire=0.01)
@@ -881,28 +887,10 @@ def test_consolidate_drops_expired(tmp_path):
 
     LogCache(root, writer_id="A", prefix_width=1).consolidate(prefix)
 
-    keys = [r.key for r in _iter_records(root / prefix / "A.log")]
-    assert gone not in keys  # expired entry dropped
-    assert keep in keys
-
-
-def test_auto_consolidate_disabled_with_zero_bound(tmp_path):
-    """max_writers_per_prefix=0 disables the auto-GC trigger: peer logs accumulate
-    untouched no matter how many appear."""
-    root = tmp_path / "c"
-    for w in ("w0", "w1", "w2", "w3"):
-        LogCache(root, writer_id=w, prefix_width=1, max_writers_per_prefix=0).set(
-            "k", w
-        )
-    prefix = LogCache(root, prefix_width=1)._prefix("k")
-    me = LogCache(
-        root, writer_id="ME", prefix_width=1, max_writers_per_prefix=0, index_ttl=0
-    )
-    me.get("k")  # populate _sig with every peer log
-    me.set("k", "ME")  # would trip auto-consolidation if it were enabled
-
-    logs = {p.name for p in (root / prefix).glob("*.log")}
-    assert logs == {"w0.log", "w1.log", "w2.log", "w3.log", "ME.log"}  # nothing folded
+    # A's only record expired → its rewritten log is empty and dropped;
+    # B's live record stays in B's own (untouched) log.
+    assert not (root / prefix / "A.log").exists()
+    assert LogCache(root, writer_id="R", prefix_width=1, index_ttl=0).get(keep) == 2
 
 
 def test_consolidate_then_cached_and_transfer(tmp_path):
@@ -944,11 +932,12 @@ def test_default_writer_id_collapses_bare_container_hostname(monkeypatch):
 
 
 def test_orphaned_legacy_namespace_is_swept(tmp_path):
-    """A legacy `<writer>.spill/` dir whose log is GONE must be collected: nothing
-    references its files, and its existence re-arms the migration flag forever.
-    Age counts from LOCAL arrival (`max(mtime, ctime)`): a syncer-delivered dir
-    keeps its old mtimes, and reaping it before its log can arrive would leave
-    that log's records dangling."""
+    """A legacy `<writer>.spill/` dir whose log is GONE is collected once the
+    caller names its writer in the prune allowlist (nothing references its
+    files, but only the caller can assert the writer is dead). Age counts from
+    LOCAL arrival (`max(mtime, ctime)`): a syncer-delivered dir keeps its old
+    mtimes, and reaping it before its log can arrive would leave that log's
+    records dangling."""
     root = tmp_path / "c"
     a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
     a.set("d", "v" * 5000)  # a live record so the consolidated log is non-empty
@@ -966,12 +955,15 @@ def test_orphaned_legacy_namespace_is_swept(tmp_path):
     empty_orphan = root / prefix / "ghost3.spill"
     empty_orphan.mkdir()  # a syncer creates the dir before copying files in
 
-    a.consolidate(prefix)  # default grace
+    ghosts = {"ghost", "ghost2", "ghost3"}
+    a.consolidate(prefix, prune_writer_ids=ghosts)  # default grace
     assert stale.exists()  # survives: age counts from local arrival (ctime)
     assert young_orphan.exists()  # grace window postpones the sweep
     assert empty_orphan.exists()  # the dir's own stat grants an empty one grace
 
-    _sweep_now(a, prefix)  # grace elapsed → all collected
+    _sweep_now(a, prefix)  # grace collapsed but NOT allowlisted → still kept
+    assert orphan.exists()
+    _sweep_now(a, prefix, prune_writer_ids=ghosts)  # allowlisted → all collected
     assert not orphan.exists()
     assert not young_orphan.exists()
     assert not empty_orphan.exists()
@@ -1005,7 +997,9 @@ def test_batch_consolidate_parallel_equivalence(tmp_path):
     t = threading.Thread(target=churn, daemon=True)
     t.start()
     try:
-        assert first_write.wait(timeout=10)  # ensure the read-back below is never vacuous
+        assert first_write.wait(
+            timeout=10
+        )  # ensure the read-back below is never vacuous
         gc.consolidate()
     finally:
         stop.set()
@@ -1035,11 +1029,11 @@ def test_batch_pass_survives_prefix_failures(tmp_path, caplog):
     attempted: list[str] = []
     real = cache._consolidate_prefix
 
-    def flaky(prefix: str) -> None:
+    def flaky(prefix: str, prune=frozenset()) -> None:
         attempted.append(prefix)  # list.append is atomic under the GIL
         if prefix in bad:
             raise RuntimeError(f"boom-{prefix}")
-        real(prefix)
+        real(prefix, prune)
 
     cache._consolidate_prefix = flaky
     with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match=r"boom-"):
@@ -1055,7 +1049,9 @@ def test_batch_falls_back_to_serial_without_fcntl(tmp_path, monkeypatch):
     import emboss._log_cache as log_cache_module
 
     monkeypatch.setattr(log_cache_module, "_HAS_FCNTL", False)
-    monkeypatch.setattr(log_cache_module, "ThreadPoolExecutor", None)  # fan-out would TypeError
+    monkeypatch.setattr(
+        log_cache_module, "ThreadPoolExecutor", None
+    )  # fan-out would TypeError
     cache = LogCache(tmp_path / "c", writer_id="W", prefix_width=1, min_file_size=100)
     for i in range(24):
         cache.set(f"k{i}", f"k{i}-" + "v" * 3000)
@@ -1174,7 +1170,7 @@ def test_transient_adopt_error_keeps_legacy_source(tmp_path, caplog):
 
     a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
     with caplog.at_level("WARNING"):
-        a.consolidate(prefix)
+        a.consolidate(prefix, prune_writer_ids={"B"})
     legacy_file.chmod(0o644)
 
     assert legacy_dir.exists()  # namespace kept for a retry, not destroyed
@@ -1182,7 +1178,7 @@ def test_transient_adopt_error_keeps_legacy_source(tmp_path, caplog):
     assert any("could not adopt" in r.message for r in caplog.records)
     reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
     assert reader.get("d") == "z" * 5000  # value survives in the kept log
-    a.consolidate(prefix)  # fault cleared → the retry migrates and prunes
+    a.consolidate(prefix, prune_writer_ids={"B"})  # fault cleared → retry prunes
     assert not legacy_dir.exists()
     assert (
         LogCache(root, writer_id="R2", prefix_width=1, index_ttl=0).get("d")
@@ -1347,71 +1343,83 @@ def test_absent_spill_drop_is_logged(tmp_path, caplog):
 
     a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
     with caplog.at_level("INFO"):
-        a.consolidate(prefix)
+        a.consolidate(prefix, prune_writer_ids={"B"})
     assert any("dropped 1 record" in r.message for r in caplog.records)
 
 
-def test_auto_consolidate_cooldown_suppresses_storm(tmp_path, monkeypatch):
-    """When pruning is blocked and the writer count stays above the bound, the
-    cooldown must keep consolidation to one pass per window, not one per write."""
+def test_migration_trigger_cooldown_suppresses_storm(tmp_path, monkeypatch):
+    """When our legacy namespace resists removal and the migration flag stays
+    armed, the cooldown must keep consolidation to one pass per window, not one
+    per write."""
     root = tmp_path / "c"
-
-    def peers_write():
-        for w in ("w0", "w1", "w2"):
-            LogCache(root, writer_id=w, prefix_width=1, max_writers_per_prefix=0).set(
-                "k", w
-            )
-
-    peers_write()
-    me = LogCache(
-        root, writer_id="ME", prefix_width=1, max_writers_per_prefix=2, index_ttl=0
-    )
-    prefix = me._prefix("k")
+    me = LogCache(root, writer_id="ME", prefix_width=1, min_file_size=100, index_ttl=0)
+    me.set("d", "z" * 5000)
+    prefix = me._prefix("d")
+    _to_legacy(root, prefix, "ME")  # our own pre-pool layout arms the flag
     passes = {"n": 0}
-    real = LogCache._consolidate_prefix
 
-    def counting(self, p):
-        passes["n"] += 1
-        real(self, p)
-        peers_write()  # a syncer "resurrects" the pruned peers right away
+    def counting(self, p, prune=frozenset()):
+        passes["n"] += 1  # never calls the real pass, so the namespace persists
+        self._consolidated_at[p] = time.monotonic()  # the pass stamps the cooldown
 
     monkeypatch.setattr(LogCache, "_consolidate_prefix", counting)
-    me.get("k")
-    me.set("k", "ME1")  # trips the trigger → one pass
-    me.get("k")  # rebuild the sig with the resurrected peers
-    me.set("k", "ME2")  # still above the bound, but within the cooldown
-    assert passes["n"] == 1  # suppressed: no per-write storm
+    me = LogCache(root, writer_id="ME", prefix_width=1, min_file_size=100, index_ttl=0)
+    k1, k2, k3 = _SAME_PREFIX_KEYS[1:4]  # same prefix as "d"
+    me.get("d")  # index build detects our legacy namespace
+    me.set(k1, "v")  # trips the migration trigger → one pass
+    me.get("d")  # namespace still there → flag re-arms
+    me.set(k2, "v")  # within the cooldown → suppressed
+    assert passes["n"] == 1  # no per-write storm
     me._consolidated_at[prefix] = time.monotonic() - 61.0  # cooldown elapsed
-    me.set("k", "ME3")
+    me.set(k3, "v")
     assert passes["n"] == 2
 
 
 def test_write_path_triggers_legacy_migration(tmp_path):
-    """'Migrated on sight': index build detects the legacy layout and the NEXT
-    WRITE kicks the migration — no explicit consolidate() call, and it runs
-    even with the writer-count trigger disabled."""
+    """'Migrated on sight' for OUR OWN pre-pool layout: index build detects our
+    legacy namespace and the NEXT WRITE kicks the migration — no explicit
+    consolidate() call. A PEER's legacy namespace is the peer's to migrate and
+    must neither arm the flag nor be touched."""
     root = tmp_path / "c"
-    b = LogCache(root, writer_id="B", prefix_width=1, min_file_size=100)
-    b.set("d", "z" * 5000)
-    prefix = b._prefix("d")
-    legacy_dir, _ = _to_legacy(root, prefix, "B")
+    me = LogCache(root, writer_id="ME", prefix_width=1, min_file_size=100)
+    me.set("d", "z" * 5000)
+    prefix = me._prefix("d")
+    own_legacy, _ = _to_legacy(root, prefix, "ME")
 
-    me = LogCache(
-        root,
-        writer_id="ME",
-        prefix_width=1,
-        min_file_size=100,
-        max_writers_per_prefix=0,
-        index_ttl=0,
+    fresh = LogCache(
+        root, writer_id="ME", prefix_width=1, min_file_size=100, index_ttl=0
     )
-    assert me.get("d") == "z" * 5000  # index build flags the legacy layout
-    me.set("f", "small")  # the next write in the prefix kicks the migration
+    assert fresh.get("d") == "z" * 5000  # index build flags our legacy layout
+    fresh.set("f", "small")  # the next write in the prefix kicks the migration
 
-    assert not legacy_dir.exists()
+    assert not own_legacy.exists()
     assert len(list((root / prefix / "spill").glob("*.val"))) == 1  # adopted
     reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
     assert reader.get("d") == "z" * 5000
     assert reader.get("f") == "small"
+
+
+def test_peer_legacy_namespace_never_arms_migration(tmp_path):
+    """A PEER's legacy namespace must not arm the migration flag: consolidation
+    no longer touches peer files, so arming on it would re-run a full pass every
+    cooldown window forever without ever clearing the condition."""
+    root = tmp_path / "c"
+    b = LogCache(root, writer_id="B", prefix_width=1, min_file_size=100)
+    b.set("d", "z" * 5000)
+    prefix = b._prefix("d")
+    peer_legacy, peer_file = _to_legacy(root, prefix, "B")
+
+    me = LogCache(root, writer_id="ME", prefix_width=1, min_file_size=100, index_ttl=0)
+    assert me.get("d") == "z" * 5000  # index build sees the peer namespace
+    assert prefix not in me._needs_migration  # …and does not arm on it
+    me.set("f", "small")  # a write runs no migration pass
+
+    assert peer_legacy.exists()  # untouched
+    assert peer_file.exists()
+    assert (
+        LogCache(root, writer_id="R", prefix_width=1, index_ttl=0).get("d")
+        == "z" * 5000
+    )
 
 
 # ── spill-pool hardening, second review round (0.7.1 fixes) ───────────────────
@@ -1464,13 +1472,14 @@ def test_failed_peer_adoption_keeps_legacy_bytes(tmp_path, caplog):
 
     a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
     with caplog.at_level("WARNING"):
-        _sweep_now(a, prefix)  # grace collapsed: only the skip protects the bytes
+        # grace collapsed: only the failed-adoption skip protects the bytes
+        _sweep_now(a, prefix, prune_writer_ids={"B"})
     legacy_file.chmod(0o644)
 
     assert legacy_file.exists()  # bytes survive for the retry
     assert (root / prefix / "B.log").exists()  # with the log that references them
     assert any("could not adopt" in r.message for r in caplog.records)
-    a.consolidate(prefix)  # fault cleared → the retry adopts and prunes
+    a.consolidate(prefix, prune_writer_ids={"B"})  # fault cleared → retry prunes
     assert not legacy_dir.exists()
     assert (
         LogCache(root, writer_id="R", prefix_width=1, index_ttl=0).get("d")
@@ -1492,7 +1501,7 @@ def test_transient_pool_stat_fault_keeps_record(tmp_path, caplog):
 
     a = LogCache(root, writer_id="A", prefix_width=1)
     with caplog.at_level("WARNING"):
-        a.consolidate(prefix)
+        a.consolidate(prefix, prune_writer_ids={"B"})
     pool_dir.chmod(0o755)
 
     assert any("could not stat pool spill" in r.message for r in caplog.records)
@@ -1505,9 +1514,9 @@ def test_transient_pool_stat_fault_keeps_record(tmp_path, caplog):
 
 def test_orphan_peer_legacy_dir_reaped(tmp_path):
     """A peer `.spill/` dir with no matching log (a crash between a prune's
-    unlink and rmtree, or a syncer resurrecting it) must be reaped once past
-    the grace window — left in place it re-flags migration and re-runs a full
-    consolidation every cooldown window, forever."""
+    unlink and rmtree, or a syncer resurrecting it) is reaped once its writer
+    is named in the prune allowlist and the grace window has passed. Without
+    the allowlist it is left alone — and it never arms the migration flag."""
     root = tmp_path / "c"
     c = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
     c.set("d", "z" * 5000)
@@ -1516,31 +1525,29 @@ def test_orphan_peer_legacy_dir_reaped(tmp_path):
     orphan.mkdir()
     (orphan / "stranded.val").write_bytes(b"referenced by no log")
 
-    c.consolidate(prefix)  # default grace: a fresh dir may be spill-before-log
+    # default grace: a fresh dir may be spill-before-log
+    c.consolidate(prefix, prune_writer_ids={"GONE"})
     assert orphan.exists()
-    _sweep_now(c, prefix)  # grace collapsed → the orphan is reaped
+    _sweep_now(c, prefix)  # grace collapsed but not allowlisted → kept
+    assert orphan.exists()
+    _sweep_now(c, prefix, prune_writer_ids={"GONE"})  # allowlisted → reaped
     assert not orphan.exists()
     fresh = LogCache(root, writer_id="A", prefix_width=1, index_ttl=0)
     assert fresh.get("d") == "z" * 5000
-    assert prefix not in fresh._needs_migration  # the re-migration loop is closed
+    assert prefix not in fresh._needs_migration  # peer dirs never arm the flag
 
 
 def test_consolidation_abort_sets_cooldown(tmp_path, monkeypatch, caplog):
     """A persistently unreadable own log must abort once per cooldown window,
-    not once per write — the abort path stamps the cooldown."""
+    not once per write — the abort path stamps the cooldown. (Reached via the
+    migration trigger, whose within-cooldown writes skip the pass entirely.)"""
     import emboss._log_cache as m
 
     root = tmp_path / "c"
-    for w in ("w0", "w1", "w2"):
-        LogCache(root, writer_id=w, prefix_width=1, max_writers_per_prefix=0).set(
-            "k", w
-        )
-    LogCache(root, writer_id="ME", prefix_width=1, max_writers_per_prefix=0).set(
-        "k", "ME0"
-    )
-    me = LogCache(
-        root, writer_id="ME", prefix_width=1, max_writers_per_prefix=2, index_ttl=0
-    )
+    me = LogCache(root, writer_id="ME", prefix_width=1, min_file_size=100)
+    me.set("d", "z" * 5000)
+    prefix = me._prefix("d")
+    _to_legacy(root, prefix, "ME")  # our legacy namespace arms the trigger
     real_read = m._read_records
 
     def flaky(path):
@@ -1549,12 +1556,14 @@ def test_consolidation_abort_sets_cooldown(tmp_path, monkeypatch, caplog):
         return real_read(path)
 
     monkeypatch.setattr(m, "_read_records", flaky)
+    me = LogCache(root, writer_id="ME", prefix_width=1, min_file_size=100, index_ttl=0)
+    k1, k2 = _SAME_PREFIX_KEYS[1:3]  # same prefix as "d"
     with caplog.at_level("WARNING"):
-        me.set("k", "ME1")  # writer-count trigger → pass → abort + cooldown stamp
-        me.set("k", "ME2")  # within the cooldown: no second pass, no second abort
+        me.set(k1, "v")  # migration trigger → pass → abort + cooldown stamp
+        me.set(k2, "v")  # within the cooldown: no second pass, no second abort
     aborts = [r for r in caplog.records if "aborting the consolidation" in r.message]
     assert len(aborts) == 1
-    assert (root / me._prefix("k") / "w0.log").exists()  # nothing was pruned
+    assert (root / prefix / "ME.log").exists()  # never rewritten blind
 
 
 def test_cross_filesystem_adopt_falls_back_to_copy(tmp_path, monkeypatch):
@@ -1573,7 +1582,7 @@ def test_cross_filesystem_adopt_falls_back_to_copy(tmp_path, monkeypatch):
 
     monkeypatch.setattr(os, "link", no_link)
     a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
-    a.consolidate(prefix)
+    a.consolidate(prefix, prune_writer_ids={"B"})
 
     assert len(list((root / prefix / "spill").glob("*.val"))) == 1  # copied in
     assert not (root / prefix / "B.spill").exists()  # namespace pruned
@@ -1607,14 +1616,14 @@ def test_failed_copy_fallback_keeps_namespace(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(m.shutil, "copyfile", no_copy)
     a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
     with caplog.at_level("WARNING"):
-        a.consolidate(prefix)
+        a.consolidate(prefix, prune_writer_ids={"B"})
     monkeypatch.undo()
 
     assert legacy_dir.exists()  # namespace kept for a retry
     assert (root / prefix / "B.log").exists()  # its log kept too
     assert not list((root / prefix / "spill").glob("*.tmp"))  # tmp cleaned up
     assert any("could not adopt" in r.message for r in caplog.records)
-    a.consolidate(prefix)  # fault cleared → the retry migrates and prunes
+    a.consolidate(prefix, prune_writer_ids={"B"})  # fault cleared → retry prunes
     assert not legacy_dir.exists()
     assert (
         LogCache(root, writer_id="R", prefix_width=1, index_ttl=0).get("d")
@@ -1638,3 +1647,129 @@ def test_record_wire_format_pinned():
     parsed = _parse_frame(_frame(rec), 0)
     assert parsed is not None
     assert parsed[0] == rec
+
+
+# ── single-writer safety (the 2026-07-10 fleet-cache clobber) ─────────────────
+#
+# A file syncer replicates every node's logs everywhere, so "another writer's
+# log" is usually a REPLICA whose owner holds an un-synced tail. A replica can
+# be byte-stable for a whole pass and still be incomplete — no local check can
+# tell — so the only safe default is to never touch a peer's files at all.
+# Pruning is an explicit, caller-asserted decision (`prune_writer_ids`): the
+# caller names writers it KNOWS are dead/retired (a decommissioned host, a
+# one-shot bulk importer), and only those logs are folded in and removed.
+
+
+def test_consolidate_default_leaves_peer_logs_untouched(tmp_path):
+    """Default consolidation must not rewrite, repair, or delete any peer log —
+    byte-for-byte — while still compacting our own log and keeping reads whole."""
+    root = tmp_path / "c"
+    for w, k in zip("ABC", _SAME_PREFIX_KEYS):
+        LogCache(root, writer_id=w, prefix_width=1).set(k, k * 3)
+    prefix = LogCache(root, prefix_width=1)._prefix(_SAME_PREFIX_KEYS[0])
+    peer_bytes = {p.name: p.read_bytes() for p in (root / prefix).glob("*.log")}
+
+    gc = LogCache(root, writer_id="GC", prefix_width=1)
+    gc.consolidate()
+
+    for p in (root / prefix).glob("*.log"):
+        assert peer_bytes[p.name] == p.read_bytes()  # untouched, byte-for-byte
+    assert set(peer_bytes) == {p.name for p in (root / prefix).glob("*.log")}
+    reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
+    for w, k in zip("ABC", _SAME_PREFIX_KEYS):
+        assert reader.get(k) == k * 3
+
+
+def test_consolidate_default_survives_torn_peer_replica(tmp_path):
+    """The incident reproduction: a peer log that is a torn mid-sync replica must
+    not be 'repaired' into our log and deleted — the owner's complete original
+    (invisible to us) would be destroyed when the deletion syncs back."""
+    root = tmp_path / "c"
+    peer = LogCache(root, writer_id="PEER", prefix_width=1)
+    for k in _SAME_PREFIX_KEYS:
+        peer.set(k, k * 2)
+    prefix = peer._prefix(_SAME_PREFIX_KEYS[0])
+    peer_log = root / prefix / "PEER.log"
+    # Tear the replica mid-frame, as a syncer shipping a mid-append snapshot does.
+    whole = peer_log.read_bytes()
+    peer_log.write_bytes(whole[: len(whole) - len(whole) // 3])
+    torn = peer_log.read_bytes()
+
+    gc = LogCache(root, writer_id="GC", prefix_width=1)
+    gc.consolidate()
+
+    assert peer_log.exists()  # never deleted
+    assert peer_log.read_bytes() == torn  # never rewritten either
+    # our log carries none of the replica's records (nothing was folded in)
+    target = gc._log_path(prefix)
+    assert not target.exists() or all(
+        r.key not in _SAME_PREFIX_KEYS for r in _iter_records(target)
+    )
+
+
+def test_consolidate_prunes_only_allowlisted_writers(tmp_path):
+    """`prune_writer_ids` folds exactly the named (caller-asserted-dead) writers'
+    logs into ours and deletes them; every other peer stays byte-identical."""
+    root = tmp_path / "c"
+    k_dead, k_live, k_mine = _SAME_PREFIX_KEYS[:3]
+    LogCache(root, writer_id="DEAD", prefix_width=1).set(k_dead, "dead-v")
+    LogCache(root, writer_id="LIVE", prefix_width=1).set(k_live, "live-v")
+    gc = LogCache(root, writer_id="GC", prefix_width=1)
+    gc.set(k_mine, "mine-v")
+    prefix = gc._prefix(k_dead)
+    live_bytes = (root / prefix / "LIVE.log").read_bytes()
+
+    gc.consolidate(prefix, prune_writer_ids={"DEAD"})
+
+    assert not (root / prefix / "DEAD.log").exists()  # folded in and removed
+    assert (root / prefix / "LIVE.log").read_bytes() == live_bytes
+    target_keys = {r.key for r in _iter_records(gc._log_path(prefix))}
+    assert target_keys == {k_dead, k_mine}  # DEAD's record adopted, LIVE's not
+    reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
+    assert reader.get(k_dead) == "dead-v"
+    assert reader.get(k_live) == "live-v"
+    assert reader.get(k_mine) == "mine-v"
+
+
+def test_clear_removes_only_own_writer_files(tmp_path):
+    """clear() drops THIS writer's contributions; a peer's logs and their spilled
+    values must survive byte-for-byte (under sync they are replicas of files the
+    peer owns — deleting them here deletes them on the peer)."""
+    root = tmp_path / "c"
+    a = LogCache(root, writer_id="A", prefix_width=1, min_file_size=100)
+    b = LogCache(root, writer_id="B", prefix_width=1, min_file_size=100)
+    k_a, k_b, k_a2 = _SAME_PREFIX_KEYS[:3]
+    a.set(k_a, "a-small")
+    a.set(k_a2, "a" * 5000)  # spills to the shared pool
+    b.set(k_b, "b" * 5000)  # spills to the shared pool
+    prefix = a._prefix(k_a)
+    b_bytes = (root / prefix / "B.log").read_bytes()
+    b_spill = {r.spill for r in _iter_records(root / prefix / "B.log") if r.spill}
+
+    dropped = a.clear()
+
+    assert dropped == 2  # A's two live records
+    assert not (root / prefix / "A.log").exists()
+    assert (root / prefix / "B.log").read_bytes() == b_bytes
+    for rel in b_spill:
+        assert (root / rel).exists()  # B's spilled value untouched
+    reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
+    assert reader.get(k_b) == "b" * 5000
+    assert reader.get(k_a) is None
+    assert reader.get(k_a2) is None
+
+
+def test_no_auto_consolidation_on_writer_count(tmp_path):
+    """Writer-count growth must never trigger an implicit cross-writer fold —
+    the old `max_writers_per_prefix` trigger pruned replicas mid-sync. Many
+    writers accumulate; every log stays."""
+    root = tmp_path / "c"
+    writers = [f"w{i}" for i in range(9)]  # exceeds the old default bound of 8
+    for w in writers:
+        LogCache(root, writer_id=w, prefix_width=1).set("k", w)
+    prefix = LogCache(root, prefix_width=1)._prefix("k")
+    me = LogCache(root, writer_id="ME", prefix_width=1, index_ttl=0)
+    me.get("k")  # build the index so the write path sees every peer log
+    me.set("k", "ME")
+    logs = {p.name for p in (root / prefix).glob("*.log")}
+    assert logs == {f"{w}.log" for w in writers} | {"ME.log"}
