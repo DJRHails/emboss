@@ -13,8 +13,9 @@ prefix each node appends to **its own** log:
     directory/<prefix>/<writer_id>.log       # written by exactly ONE node
     directory/<prefix>/<writer_id>.lock      # flock; excludes append/compact races
     directory/<prefix>/spill/<sha256>.val    # large values — shared, content-addressed pool
-    directory/<prefix>/<writer_id>.spill/*   # legacy layout — own dir migrated on sight;
-                                             # a peer's only when its writer is pruned
+    directory/<prefix>/<writer_id>.spill/*   # legacy layout — own dir migrated on the
+                                             # next write after it's seen; a peer's
+                                             # only when its writer is pruned
 
 Because no LOG is ever written by two nodes — and any two nodes writing the same
 content-addressed pool file write identical bytes — a file syncer just ships each
@@ -765,6 +766,42 @@ class LogCache:
             )
         raise errors[0][1]
 
+    @staticmethod
+    def _snapshot_source_logs(
+        pdir: Path,
+    ) -> tuple[dict[str, tuple[int, int]], AbstractSet[str]]:
+        """Snapshot every source log's `(size, mtime_ns)` identity BEFORE the merge,
+        plus the names of logs whose `stat()` faulted (`unstat`).
+
+        A pruned writer (or a same-node process holding that writer_id) may append
+        concurrently; the caller compares this snapshot to a re-stat before deleting,
+        so a write that lands mid-consolidation is never lost. A transient stat fault
+        is NOT absence (the same asymmetry as `_read_records` / `_resolve_spills`): a
+        log missing from the snapshot would be read by nobody and land in neither
+        `keep` nor `unread`, silently disengaging every guard keyed on `unread` — the
+        own-log abort (whose rewrite would then unlink our own log as "empty"), the
+        sweeps' blindness rule, and the prune shield. It goes in `unstat` (the caller
+        folds it into `unread`) instead. `FileNotFoundError` alone is genuine absence
+        (deleted between glob and stat)."""
+        snapshot: dict[str, tuple[int, int]] = {}
+        unstat: set[str] = set()
+        for log in pdir.glob("*.log"):
+            try:
+                st = log.stat()
+            except FileNotFoundError:
+                continue  # deleted between glob and stat — genuinely absent
+            except OSError as exc:
+                unstat.add(log.name)
+                logger.warning(
+                    "emboss.LogCache: could not stat source log %s during "
+                    "consolidation (%s) — treating it as unreadable.",
+                    log,
+                    exc,
+                )
+                continue
+            snapshot[log.name] = (st.st_size, st.st_mtime_ns)
+        return snapshot, unstat
+
     def _consolidate_prefix(
         self, prefix: str, prune: AbstractSet[str] = frozenset()
     ) -> None:
@@ -775,34 +812,7 @@ class LogCache:
         target = self._log_path(prefix)  # our log — the consolidation destination
         prune_logs = {f"{w}.log" for w in prune} - {target.name}
         with self._writer_lock(prefix):  # serialise same-node writes to our log
-            # Snapshot every source log's identity BEFORE the merge. A pruned
-            # writer (or a same-node process holding that writer_id) may append
-            # concurrently; we compare this snapshot to a re-stat before
-            # deleting, so a write that lands mid-consolidation is never lost.
-            snapshot: dict[str, tuple[int, int]] = {}
-            unstat: set[str] = set()
-            for log in pdir.glob("*.log"):
-                try:
-                    st = log.stat()
-                except FileNotFoundError:
-                    continue  # deleted between glob and stat — genuinely absent
-                except OSError as exc:
-                    # A transient stat fault is NOT absence (the same asymmetry as
-                    # `_read_records` / `_resolve_spills`): a log missing from the
-                    # snapshot would be read by nobody and land in neither `keep`
-                    # nor `unread`, silently disengaging every guard keyed on
-                    # `unread` — the own-log abort below (our rewrite would then
-                    # unlink our own log as "empty"), the sweeps' blindness rule,
-                    # and the prune shield. Treat it as unreadable instead.
-                    unstat.add(log.name)
-                    logger.warning(
-                        "emboss.LogCache: could not stat source log %s during "
-                        "consolidation (%s) — treating it as unreadable.",
-                        log,
-                        exc,
-                    )
-                    continue
-                snapshot[log.name] = (st.st_size, st.st_mtime_ns)
+            snapshot, unstat = self._snapshot_source_logs(pdir)
             keep, unread = self._collect_live_across_logs(
                 pdir, snapshot, now, prune_logs
             )

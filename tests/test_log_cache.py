@@ -1848,7 +1848,9 @@ def test_prune_writer_ids_rejects_bare_string(tmp_path):
     mistake: 'bonbon' would otherwise prune writers b, o, and n."""
     c = LogCache(tmp_path / "c", writer_id="A")
     with pytest.raises(TypeError, match="bare string"):
-        c.consolidate(prune_writer_ids="bonbon")
+        # the bad type IS the test: exercise the runtime guard against the
+        # str-as-iterable mistake (ty flags the intentional misuse).
+        c.consolidate(prune_writer_ids="bonbon")  # ty: ignore[invalid-argument-type]
 
 
 def test_prune_writer_ids_are_sanitized(tmp_path):
@@ -1949,3 +1951,37 @@ def test_pruned_log_tear_is_warned(tmp_path, caplog):
     reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
     assert reader.get(k1) == "v1"  # the intact record was folded
     assert reader.get(k2) is None  # the torn one is gone — hence the warning
+
+
+def test_pruned_log_midtear_folds_recovered_records(tmp_path, caplog):
+    """A pruned log with a corrupt non-final frame plus a valid record after it:
+    the later record is resynced past, folded into our log, and the warning
+    reports a NON-ZERO recovered count — the `recovered > 0` path that
+    test_pruned_log_tear_is_warned (a final-frame tear, recovered == 0) never
+    exercises. A regression that dropped the post-tear records would pass that
+    test but fail this one."""
+    root = tmp_path / "c"
+    dead = LogCache(root, writer_id="DEAD", prefix_width=1)
+    k1, k2 = _SAME_PREFIX_KEYS[:2]
+    dead.set(k1, "v1")  # first frame — corrupted mid-blob below
+    dead.set(k2, "v2")  # second frame — must survive the resync and be folded
+    prefix = dead._prefix(k1)
+    dead_log = root / prefix / "DEAD.log"
+    raw = bytearray(dead_log.read_bytes())
+    raw[_HEADER.size] ^= 0xFF  # break the first blob's leading PROTO opcode
+    dead_log.write_bytes(bytes(raw))
+    assert _read_records(dead_log).recovered == 1  # k2 recovered past the tear
+
+    gc = LogCache(root, writer_id="GC", prefix_width=1)
+    with caplog.at_level("WARNING"):
+        gc.consolidate(prefix, prune_writer_ids={"DEAD"})
+
+    assert not dead_log.exists()  # pruned on the caller's assertion
+    assert any(
+        "pruned source log" in r.message
+        and "1 record(s) past it were recovered" in r.message
+        for r in caplog.records
+    )
+    reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
+    assert reader.get(k2) == "v2"  # the record after the tear WAS folded
+    assert reader.get(k1) is None  # the torn frame is discarded permanently
