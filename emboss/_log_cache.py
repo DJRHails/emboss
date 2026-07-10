@@ -64,7 +64,12 @@ sharing a node-log are serialised by the per-writer lock file. Inodes are bounde
   asserting they will never write again (a decommissioned host, a one-shot
   bulk importer, a retired container id). Even then the pruned log is
   snapshotted `(size, mtime)` first and re-stat'd before delete, so an append
-  landing DURING the pass is never lost. With the pre-pool uuid names every
+  landing DURING the pass is never lost. The one owner-agnostic exception is a
+  syncer-minted conflict copy (`<writer>.sync-conflict-<ts>-<device>.log`): read
+  by the `*.log` glob but appended-to by nobody, and — unlike a foreign canonical
+  log — complete, immutable and locally finalized, so consolidation folds it in
+  and deletes it on every pass (otherwise they accrete forever after a sync
+  conflict). With the pre-pool uuid names every
   pass re-copied every foreign value, which once grew a 45 GB cache to 160 GB
   in a day; content addressing makes passes idempotent. The size trigger
   auto-runs a (prune-free) pass on a lone-writer prefix, and detecting our own
@@ -284,6 +289,33 @@ def _frame(rec: _Record) -> bytes:
 
 def _sanitize(writer_id: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in writer_id) or "node"
+
+
+# A file syncer mints a conflict copy when two nodes diverge on a file:
+# `<name>.sync-conflict-<YYYYMMDD>-<HHMMSS>-<device>.<ext>` (Syncthing). For a
+# node log that is `<writer>.sync-conflict-20260710-200058-ABCDEFG.log`. It
+# matches the `*.log` glob (so its records are already read into the index) but
+# nothing ever appends to it — the syncer-minted name is unique and the file is
+# finalized. Unlike a foreign CANONICAL log (a live replica whose owner may hold
+# an un-synced tail — never safe to fold), a conflict copy is complete,
+# immutable and locally present, so it IS foldable. The date-time-device
+# structure is the guard against a false positive: matching a live writer's log
+# here would fold and delete it. `writer_id`s are hostnames, which never carry
+# that structure, so the strict anchor keeps the match Syncthing-only.
+_SYNC_CONFLICT_LOG = re.compile(
+    r"""(?x)                 # verbose
+    \.sync-conflict-         # the conflict-copy infix
+    \d{8}-\d{6}              # -<date:YYYYMMDD>-<time:HHMMSS>
+    -[A-Za-z0-9]+            # -<device-id prefix>
+    \.log$                   # ends the *.log glob-matched name
+    """
+)
+
+
+def _is_conflict_log(name: str) -> bool:
+    """True if `name` is a syncer-minted conflict copy of a node log — a
+    complete, immutable, fold-eligible file (see `_SYNC_CONFLICT_LOG`)."""
+    return _SYNC_CONFLICT_LOG.search(name) is not None
 
 
 # Docker's default hostname is the 12-hex short container id — an EPHEMERAL identity.
@@ -696,6 +728,17 @@ class LogCache:
         pass (the assertion being wrong) is never lost — the log is kept and
         the next pass retries.
 
+        Syncer-minted conflict copies (`<writer>.sync-conflict-<ts>-<device>.log`)
+        are folded and deleted on EVERY pass, without an allowlist entry. They
+        are read by the `*.log` glob but nothing ever appends to them, and —
+        unlike a foreign canonical log, which may be an incomplete replica — a
+        conflict copy is complete, immutable and locally finalized, so folding
+        its winners into our log and deleting it loses nothing: the records
+        replicate in our log, the deletion replicates, and a concurrent fold on
+        another node produces duplicates that per-key latest-wins dedups. This
+        is the one owner-agnostic fold inside the never-touch-peer-files rule.
+        The same `(size, mtime)` re-stat guards the delete.
+
         Legacy-spill migration: a kept record referencing a per-writer
         `<writer>.spill/` file (the pre-pool layout) has its value adopted into
         the shared pool (hardlinked when the filesystem allows) and is
@@ -773,7 +816,7 @@ class LogCache:
             return
         now = time.time()
         target = self._log_path(prefix)  # our log — the consolidation destination
-        prune_logs = {f"{w}.log" for w in prune} - {target.name}
+        explicit_prune = {f"{w}.log" for w in prune}
         with self._writer_lock(prefix):  # serialise same-node writes to our log
             # Snapshot every source log's identity BEFORE the merge. A pruned
             # writer (or a same-node process holding that writer_id) may append
@@ -781,7 +824,10 @@ class LogCache:
             # deleting, so a write that lands mid-consolidation is never lost.
             snapshot: dict[str, tuple[int, int]] = {}
             unstat: set[str] = set()
+            conflict_logs: set[str] = set()
             for log in pdir.glob("*.log"):
+                if _is_conflict_log(log.name):
+                    conflict_logs.add(log.name)
                 try:
                     st = log.stat()
                 except FileNotFoundError:
@@ -803,6 +849,13 @@ class LogCache:
                     )
                     continue
                 snapshot[log.name] = (st.st_size, st.st_mtime_ns)
+            # A syncer-minted conflict copy is complete, immutable and locally
+            # finalized, so it is fold-eligible regardless of owner — the one
+            # exception to never-touch-peer-files, since no writer will ever
+            # append to it (our OWN log can gain conflict copies too). Its
+            # winners fold into our rewrite and the copy is deleted whole-file;
+            # a foreign canonical log stays untouched unless explicitly pruned.
+            prune_logs = (explicit_prune | conflict_logs) - {target.name}
             keep, unread = self._collect_live_across_logs(
                 pdir, snapshot, now, prune_logs
             )
@@ -1317,9 +1370,16 @@ class LogCache:
                 or time.monotonic() - last_pass > _AUTO_CONSOLIDATE_COOLDOWN_S
             )
             if log_size > self.max_log_bytes:
-                if len(self._sig.get(prefix, {})) <= 1 and cooled_down:
-                    # A lone-writer prefix's only sweep: with a single log,
-                    # consolidation degenerates to compaction plus the pool GC.
+                peer_logs = sum(
+                    1
+                    for name in self._sig.get(prefix, {})
+                    if not _is_conflict_log(name)
+                )
+                if peer_logs <= 1 and cooled_down:
+                    # A lone-writer prefix's only sweep: with a single canonical
+                    # log, consolidation degenerates to compaction plus the pool
+                    # GC — and folds any conflict copies away (they are not peers,
+                    # so they don't force the compact-only path a live peer does).
                     # (`_sig` may be stale; a hidden peer is simply left alone —
                     # a prune-free pass touches nothing of theirs.) The cooldown
                     # bounds the pathological case — a live set that cannot
