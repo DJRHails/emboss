@@ -300,8 +300,11 @@ def _sanitize(writer_id: str) -> str:
 # an un-synced tail — never safe to fold), a conflict copy is complete,
 # immutable and locally present, so it IS foldable. The date-time-device
 # structure is the guard against a false positive: matching a live writer's log
-# here would fold and delete it. `writer_id`s are hostnames, which never carry
-# that structure, so the strict anchor keeps the match Syncthing-only.
+# here would fold and delete it (our OWN log is shielded by the `- {target.name}`
+# exclusion, but a peer's would not be). That full structure is vanishingly
+# unlikely in a `writer_id` — whether the hostname default or a caller-supplied
+# id (`_sanitize` keeps `.`/`-`/digits, so an adversarial id COULD carry it) —
+# so the strict anchor keeps the match Syncthing-only in practice.
 _SYNC_CONFLICT_LOG = re.compile(
     r"""(?x)                 # verbose
     \.sync-conflict-         # the conflict-copy infix
@@ -729,15 +732,20 @@ class LogCache:
         the next pass retries.
 
         Syncer-minted conflict copies (`<writer>.sync-conflict-<ts>-<device>.log`)
-        are folded and deleted on EVERY pass, without an allowlist entry. They
-        are read by the `*.log` glob but nothing ever appends to them, and —
-        unlike a foreign canonical log, which may be an incomplete replica — a
-        conflict copy is complete, immutable and locally finalized, so folding
-        its winners into our log and deleting it loses nothing: the records
-        replicate in our log, the deletion replicates, and a concurrent fold on
-        another node produces duplicates that per-key latest-wins dedups. This
-        is the one owner-agnostic fold inside the never-touch-peer-files rule.
-        The same `(size, mtime)` re-stat guards the delete.
+        are folded and deleted on every CONSOLIDATION pass, without an allowlist
+        entry — an explicit `consolidate()`, or the size-triggered auto-pass on a
+        lone-canonical-writer prefix. (A multi-writer prefix's auto-sweep is
+        compaction, which rewrites only our own log; its conflict copies wait
+        for the next `consolidate()`.) They are read by the `*.log` glob but
+        nothing ever appends to them, and — unlike a foreign canonical log, which
+        may be an incomplete replica — a conflict copy is complete, immutable and
+        locally finalized, so folding its winners into our log and deleting it
+        loses nothing: the records replicate in our log, the deletion replicates,
+        and a concurrent fold on another node produces duplicates that per-key
+        latest-wins dedups. This is the one owner-agnostic fold inside the
+        never-touch-peer-files rule. The same `(size, mtime)` re-stat guards the
+        delete; a copy whose folded record referenced a not-yet-synced spill is
+        kept until that spill lands (see `_resolve_spills`), so no record is lost.
 
         Legacy-spill migration: a kept record referencing a per-writer
         `<writer>.spill/` file (the pre-pool layout) has its value adopted into
@@ -808,6 +816,48 @@ class LogCache:
             )
         raise errors[0][1]
 
+    def _snapshot_sources(
+        self, pdir: Path
+    ) -> tuple[dict[str, tuple[int, int]], AbstractSet[str], AbstractSet[str]]:
+        """Snapshot every source log's `(size, mtime)` identity BEFORE the merge.
+
+        A pruned writer (or a same-node process holding that writer_id) may
+        append concurrently; the caller compares this snapshot to a re-stat
+        before deleting, so a write that lands mid-consolidation is never lost.
+
+        Returns `(snapshot, unstat, conflict_logs)`: the `(size, mtime)` map, the
+        names of logs a transient `stat` fault made unreadable, and the subset
+        that are syncer-minted conflict copies. `conflict_logs` is populated only
+        after a successful `stat`, so it is always a subset of `snapshot`."""
+        snapshot: dict[str, tuple[int, int]] = {}
+        unstat: set[str] = set()
+        conflict_logs: set[str] = set()
+        for log in pdir.glob("*.log"):
+            try:
+                st = log.stat()
+            except FileNotFoundError:
+                continue  # deleted between glob and stat — genuinely absent
+            except OSError as exc:
+                # A transient stat fault is NOT absence (the same asymmetry as
+                # `_read_records` / `_resolve_spills`): a log missing from the
+                # snapshot would be read by nobody and land in neither `keep`
+                # nor `unread`, silently disengaging every guard keyed on
+                # `unread` — the own-log abort (our rewrite would then unlink
+                # our own log as "empty"), the sweeps' blindness rule, and the
+                # prune shield. Treat it as unreadable instead.
+                unstat.add(log.name)
+                logger.warning(
+                    "emboss.LogCache: could not stat source log %s during "
+                    "consolidation (%s) — treating it as unreadable.",
+                    log,
+                    exc,
+                )
+                continue
+            snapshot[log.name] = (st.st_size, st.st_mtime_ns)
+            if _is_conflict_log(log.name):
+                conflict_logs.add(log.name)
+        return snapshot, unstat, conflict_logs
+
     def _consolidate_prefix(
         self, prefix: str, prune: AbstractSet[str] = frozenset()
     ) -> None:
@@ -818,37 +868,7 @@ class LogCache:
         target = self._log_path(prefix)  # our log — the consolidation destination
         explicit_prune = {f"{w}.log" for w in prune}
         with self._writer_lock(prefix):  # serialise same-node writes to our log
-            # Snapshot every source log's identity BEFORE the merge. A pruned
-            # writer (or a same-node process holding that writer_id) may append
-            # concurrently; we compare this snapshot to a re-stat before
-            # deleting, so a write that lands mid-consolidation is never lost.
-            snapshot: dict[str, tuple[int, int]] = {}
-            unstat: set[str] = set()
-            conflict_logs: set[str] = set()
-            for log in pdir.glob("*.log"):
-                if _is_conflict_log(log.name):
-                    conflict_logs.add(log.name)
-                try:
-                    st = log.stat()
-                except FileNotFoundError:
-                    continue  # deleted between glob and stat — genuinely absent
-                except OSError as exc:
-                    # A transient stat fault is NOT absence (the same asymmetry as
-                    # `_read_records` / `_resolve_spills`): a log missing from the
-                    # snapshot would be read by nobody and land in neither `keep`
-                    # nor `unread`, silently disengaging every guard keyed on
-                    # `unread` — the own-log abort below (our rewrite would then
-                    # unlink our own log as "empty"), the sweeps' blindness rule,
-                    # and the prune shield. Treat it as unreadable instead.
-                    unstat.add(log.name)
-                    logger.warning(
-                        "emboss.LogCache: could not stat source log %s during "
-                        "consolidation (%s) — treating it as unreadable.",
-                        log,
-                        exc,
-                    )
-                    continue
-                snapshot[log.name] = (st.st_size, st.st_mtime_ns)
+            snapshot, unstat, conflict_logs = self._snapshot_sources(pdir)
             # A syncer-minted conflict copy is complete, immutable and locally
             # finalized, so it is fold-eligible regardless of owner — the one
             # exception to never-touch-peer-files, since no writer will ever
@@ -883,11 +903,21 @@ class LogCache:
             if self.size_limit is not None:
                 ours = self._trim_to_limit(ours, lambda pair: pair[0])
             ours.sort(key=lambda pair: pair[0].store_time)
-            consolidated, failed_adoptions = self._resolve_spills(prefix, ours)
-            # A namespace whose adoption hit a transient fault keeps its log too:
-            # its records were dropped from the merge, so pruning the log would
-            # lose them along with the still-on-disk legacy bytes.
-            keep_sources = set(unread) | {f"{w}.log" for w in failed_adoptions}
+            consolidated, failed_adoptions, absent_spill_sources = self._resolve_spills(
+                prefix, ours
+            )
+            # Logs that must survive the prune despite being fold-eligible:
+            # a transient-fault adoption (records dropped from the merge, legacy
+            # bytes still on disk), and a CONFLICT copy whose folded record hit
+            # an absent spill (sync lag: the log arrived before its value). The
+            # copy is that record's only durable carrier — unlike a caller-pruned
+            # dead writer's asserted-gone value — so it is kept until the spill
+            # lands and a later pass folds it; strictly better than silent loss.
+            keep_sources = (
+                set(unread)
+                | {f"{w}.log" for w in failed_adoptions}
+                | (conflict_logs & absent_spill_sources)
+            )
             self._write_consolidated(target, consolidated)
             self._prune_consolidated_sources(
                 pdir, snapshot, target.name, keep_sources, prune_logs
@@ -1085,9 +1115,12 @@ class LogCache:
             # A mid-log tear in OUR OWN log is healed by the rewrite. In an
             # UNPRUNED peer log it is expected mid-sync replica state and the
             # file is left exactly as it is (the owner holds the complete
-            # original). A PRUNED log's tear is scanned past and the log then
-            # deleted on the caller's dead-writer assertion — the malformed
-            # frame(s) are discarded permanently, so that discard is warned.
+            # original). A PRUNED log's tear (a caller-asserted dead writer, or
+            # a syncer-minted conflict copy still mid-delivery) is scanned past
+            # and its records folded; the malformed frame(s) go with the file
+            # ONLY if it is then deleted — the `(size, mtime)` re-stat keeps a
+            # file still changing under the syncer, so a torn conflict copy is
+            # commonly kept and its full tail recovered on a later pass.
             if scan.recovered and name == self._log_path(pdir.name).name:
                 logger.warning(
                     "emboss.LogCache: consolidating %s past a torn frame at byte %d — "
@@ -1099,8 +1132,9 @@ class LogCache:
             elif scan.tear_at is not None and name in prune_logs:
                 logger.warning(
                     "emboss.LogCache: pruned source log %s has a torn/corrupt frame "
-                    "at byte %d — %d record(s) past it were recovered and folded, but "
-                    "the malformed frame(s) are discarded permanently with the log.",
+                    "at byte %d — %d record(s) past it were recovered and folded; if the "
+                    "log is byte-stable it is deleted and its malformed frame(s) go with "
+                    "it, otherwise it is kept and retried.",
                     pdir / name,
                     scan.tear_at,
                     scan.recovered,
@@ -1115,7 +1149,7 @@ class LogCache:
 
     def _resolve_spills(
         self, prefix: str, keep: list[tuple[_Record, str]]
-    ) -> tuple[list[_Record], AbstractSet[str]]:
+    ) -> tuple[list[_Record], AbstractSet[str], AbstractSet[str]]:
         """Make every kept spill reference point at an existing pool file.
 
         A pool reference is kept when its file exists and dropped when it does
@@ -1135,14 +1169,18 @@ class LogCache:
         merged from — the provenance decides which log a failed adoption must
         protect, so it is never reverse-engineered from the spill path.
 
-        Returns `(consolidated, failed_adoptions)`: the resolved records, and
-        the writers whose adoption hit a TRANSIENT fault (permissions, I/O —
-        not sync lag): their legacy bytes are still on disk, so the caller
-        must keep those namespaces (and their logs) for a retry — see
-        `_defer_failed_adoption` for which writers are protected and when a
-        record is kept un-repointed instead."""
+        Returns `(consolidated, failed_adoptions, absent_spill_sources)`: the
+        resolved records; the writers whose adoption hit a TRANSIENT fault
+        (permissions, I/O — not sync lag), whose legacy bytes are still on disk
+        so the caller must keep those namespaces (and their logs) for a retry
+        (see `_defer_failed_adoption`); and the source-log names that had a
+        record dropped because its spill was simply ABSENT (sync lag — the log
+        arrived before its value). The caller uses the last to protect a
+        conflict copy from deletion until its spill lands, so folding it never
+        loses the record."""
         consolidated: list[_Record] = []
         failed: set[str] = set()
+        absent_spill_sources: set[str] = set()
         migrated = 0
         dropped = 0
         for rec, src in keep:
@@ -1154,6 +1192,7 @@ class LogCache:
                     (self.directory / rec.spill).stat()
                 except FileNotFoundError:
                     dropped += 1  # pool file absent (sync lag) → drop, never dangle
+                    absent_spill_sources.add(src)
                 except OSError as exc:
                     # A transient stat fault is NOT absence: keep the record
                     # (its path also keeps the file out of the sweep); reads
@@ -1175,6 +1214,7 @@ class LogCache:
                 continue
             if new_rel is None:
                 dropped += 1  # legacy spill absent (sync lag) → drop, never dangle
+                absent_spill_sources.add(src)
                 continue
             migrated += 1
             consolidated.append(rec._replace(spill=new_rel, value=None))
@@ -1192,7 +1232,7 @@ class LogCache:
                 dropped,
                 prefix,
             )
-        return consolidated, failed
+        return consolidated, failed, absent_spill_sources
 
     def _defer_failed_adoption(
         self,
@@ -1370,12 +1410,12 @@ class LogCache:
                 or time.monotonic() - last_pass > _AUTO_CONSOLIDATE_COOLDOWN_S
             )
             if log_size > self.max_log_bytes:
-                peer_logs = sum(
+                canonical_logs = sum(
                     1
                     for name in self._sig.get(prefix, {})
                     if not _is_conflict_log(name)
                 )
-                if peer_logs <= 1 and cooled_down:
+                if canonical_logs <= 1 and cooled_down:
                     # A lone-writer prefix's only sweep: with a single canonical
                     # log, consolidation degenerates to compaction plus the pool
                     # GC — and folds any conflict copies away (they are not peers,
