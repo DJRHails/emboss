@@ -1954,7 +1954,7 @@ def test_pruned_log_tear_is_warned(tmp_path, caplog):
 
 
 def test_pruned_log_midtear_folds_recovered_records(tmp_path, caplog):
-    """A pruned log with a corrupt MIDDLE frame plus a valid record after it:
+    """A pruned log with a corrupt non-final frame plus a valid record after it:
     the later record is resynced past, folded into our log, and the warning
     reports a NON-ZERO recovered count — the `recovered > 0` path that
     test_pruned_log_tear_is_warned (a final-frame tear, recovered == 0) never
