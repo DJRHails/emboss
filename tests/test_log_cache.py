@@ -1244,9 +1244,9 @@ def test_unreadable_source_log_protects_pool_from_sweep(tmp_path, monkeypatch):
 
 
 def test_lone_writer_size_trigger_sweeps_pool(tmp_path, monkeypatch):
-    """A single-writer prefix never crosses the writer bound, so the
-    max_log_bytes trigger must consolidate (compact + sweep) — superseded pool
-    files cannot accumulate forever without a manual consolidate()."""
+    """A single-writer prefix has no peer logs to fold, so the max_log_bytes
+    trigger must consolidate (compact + sweep) — superseded pool files cannot
+    accumulate forever without a manual consolidate()."""
     import emboss._log_cache as m
 
     monkeypatch.setattr(m, "_AUTO_CONSOLIDATE_COOLDOWN_S", 0.0)  # sweep every trigger
@@ -1666,18 +1666,31 @@ def test_consolidate_default_leaves_peer_logs_untouched(tmp_path):
     root = tmp_path / "c"
     for w, k in zip("ABC", _SAME_PREFIX_KEYS):
         LogCache(root, writer_id=w, prefix_width=1).set(k, k * 3)
-    prefix = LogCache(root, prefix_width=1)._prefix(_SAME_PREFIX_KEYS[0])
-    peer_bytes = {p.name: p.read_bytes() for p in (root / prefix).glob("*.log")}
-
     gc = LogCache(root, writer_id="GC", prefix_width=1)
+    k_gc = _SAME_PREFIX_KEYS[3]
+    gc.set(k_gc, "gc-v1")
+    gc.set(k_gc, "gc-v2")  # a superseded record, so our own compaction has work
+    prefix = gc._prefix(_SAME_PREFIX_KEYS[0])
+    peer_bytes = {
+        p.name: p.read_bytes()
+        for p in (root / prefix).glob("*.log")
+        if p.name != "GC.log"
+    }
+
     gc.consolidate()
 
     for p in (root / prefix).glob("*.log"):
-        assert peer_bytes[p.name] == p.read_bytes()  # untouched, byte-for-byte
-    assert set(peer_bytes) == {p.name for p in (root / prefix).glob("*.log")}
+        if p.name != "GC.log":
+            assert peer_bytes[p.name] == p.read_bytes()  # untouched, byte-for-byte
+    assert {p.name for p in (root / prefix).glob("*.log")} == set(peer_bytes) | {
+        "GC.log"
+    }
+    # our own log WAS compacted: the superseded record is gone
+    assert [r.key for r in _iter_records(root / prefix / "GC.log")] == [k_gc]
     reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
     for w, k in zip("ABC", _SAME_PREFIX_KEYS):
         assert reader.get(k) == k * 3
+    assert reader.get(k_gc) == "gc-v2"
 
 
 def test_consolidate_default_survives_torn_peer_replica(tmp_path):
@@ -1696,15 +1709,14 @@ def test_consolidate_default_survives_torn_peer_replica(tmp_path):
     torn = peer_log.read_bytes()
 
     gc = LogCache(root, writer_id="GC", prefix_width=1)
+    k_gc = next(k for k in (f"gc{i}" for i in range(100)) if peer._prefix(k) == prefix)
+    gc.set(k_gc, "gc-v")  # our own record, so the rewritten target exists
     gc.consolidate()
 
     assert peer_log.exists()  # never deleted
     assert peer_log.read_bytes() == torn  # never rewritten either
     # our log carries none of the replica's records (nothing was folded in)
-    target = gc._log_path(prefix)
-    assert not target.exists() or all(
-        r.key not in _SAME_PREFIX_KEYS for r in _iter_records(target)
-    )
+    assert {r.key for r in _iter_records(gc._log_path(prefix))} == {k_gc}
 
 
 def test_consolidate_prunes_only_allowlisted_writers(tmp_path):
@@ -1773,3 +1785,167 @@ def test_no_auto_consolidation_on_writer_count(tmp_path):
     me.set("k", "ME")
     logs = {p.name for p in (root / prefix).glob("*.log")}
     assert logs == {f"{w}.log" for w in writers} | {"ME.log"}
+
+
+def test_consolidate_aborts_when_own_log_unstatable(tmp_path, monkeypatch, caplog):
+    """A transient stat fault (EACCES/EIO/ESTALE) on our OWN log must abort the
+    pass exactly like a read fault: a log missing from the snapshot is read by
+    nobody and lands in neither `keep` nor `unread`, so the unconditional
+    destination rewrite would otherwise unlink every record this writer holds
+    in the prefix — silently, and fleet-wide under a syncer."""
+    root = tmp_path / "c"
+    a = LogCache(root, writer_id="A", prefix_width=1)
+    a.set("d", "mine")
+    prefix = a._prefix("d")
+    own_log = root / prefix / "A.log"
+    real_stat = Path.stat
+
+    def flaky(self, *args, **kwargs):
+        if self.name == "A.log":
+            raise PermissionError(13, "transient EACCES", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", flaky)
+    with caplog.at_level("WARNING"):
+        a.consolidate(prefix)
+    monkeypatch.undo()
+
+    assert own_log.exists()  # never treated as empty and unlinked
+    assert any("could not stat source log" in r.message for r in caplog.records)
+    assert LogCache(root, writer_id="R", prefix_width=1, index_ttl=0).get("d") == "mine"
+
+
+def test_unstatable_peer_log_shields_sweep_and_prune(tmp_path, monkeypatch):
+    """A peer log whose stat() faults must count as unreadable: its spill
+    references are unknown, so the pool sweep is skipped rather than run blind
+    — and even an allowlisted prune must keep the log."""
+    root = tmp_path / "c"
+    peer = LogCache(root, writer_id="PEER", prefix_width=1, min_file_size=100)
+    peer.set("d", "p" * 5000)  # spills; only PEER's log references the pool file
+    prefix = peer._prefix("d")
+    peer_log = root / prefix / "PEER.log"
+    pool_file = next(root.glob("**/spill/*.val"))
+
+    gc = LogCache(root, writer_id="GC", prefix_width=1, min_file_size=100)
+    gc.set("f", "g" * 5000)  # our own record, so the pass has work to do
+    real_stat = Path.stat
+
+    def flaky(self, *args, **kwargs):
+        if self.name == "PEER.log":
+            raise PermissionError(13, "transient EACCES", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", flaky)
+    _sweep_now(gc, prefix, prune_writer_ids={"PEER"})
+    monkeypatch.undo()
+
+    assert peer_log.exists()  # unreadable → never pruned
+    assert pool_file.exists()  # sweep skipped; PEER's reference was unknown
+
+
+def test_prune_writer_ids_rejects_bare_string(tmp_path):
+    """The one destructive parameter must not accept the str-as-iterable
+    mistake: 'bonbon' would otherwise prune writers b, o, and n."""
+    c = LogCache(tmp_path / "c", writer_id="A")
+    with pytest.raises(TypeError, match="bare string"):
+        c.consolidate(prune_writer_ids="bonbon")
+
+
+def test_prune_writer_ids_are_sanitized(tmp_path):
+    """A caller passes the same RAW id it used as writer_id; the constructor
+    sanitized it on disk (host:1 -> host_1.log), so the prune must sanitize
+    symmetrically or silently no-op — leaving the retired log forever."""
+    root = tmp_path / "c"
+    LogCache(root, writer_id="host:1", prefix_width=1).set("k", "v1")
+    gc = LogCache(root, writer_id="GC", prefix_width=1)
+    prefix = gc._prefix("k")
+    assert (root / prefix / "host_1.log").exists()
+
+    gc.consolidate(prefix, prune_writer_ids={"host:1"})
+
+    assert not (root / prefix / "host_1.log").exists()  # folded in and removed
+    assert LogCache(root, writer_id="R", prefix_width=1, index_ttl=0).get("k") == "v1"
+
+
+def test_prune_own_writer_id_is_noop(tmp_path):
+    """Naming ourselves in the allowlist must never delete our just-rewritten
+    log or lock: consolidation folding its own destination would drop every
+    record it just wrote."""
+    root = tmp_path / "c"
+    gc = LogCache(root, writer_id="GC", prefix_width=1)
+    gc.set("k", "mine")
+    prefix = gc._prefix("k")
+
+    gc.consolidate(prefix, prune_writer_ids={"GC"})
+
+    assert (root / prefix / "GC.log").exists()
+    assert (root / prefix / "GC.lock").exists()
+    assert LogCache(root, writer_id="R", prefix_width=1, index_ttl=0).get("k") == "mine"
+
+
+def test_clear_with_only_peer_logs_is_a_safe_noop(tmp_path):
+    """The fleet-mainline clear(): most prefixes hold only peers' logs. It must
+    return 0, raise nothing, and leave every peer file byte-identical."""
+    root = tmp_path / "c"
+    b = LogCache(root, writer_id="B", prefix_width=1, min_file_size=100)
+    b.set("k", "b" * 5000)
+    prefix = b._prefix("k")
+    before = {p.name: p.read_bytes() for p in (root / prefix).glob("*.lo*")}
+    pool_file = next(root.glob("**/spill/*.val"))
+
+    a = LogCache(root, writer_id="A", prefix_width=1)
+    assert a.clear() == 0
+
+    after = {p.name: p.read_bytes() for p in (root / prefix).glob("*.lo*")}
+    assert after == before  # B's log and lock byte-identical
+    assert pool_file.exists()  # the shared pool is never clear()'s to touch
+
+
+def test_clear_warns_but_still_removes_unreadable_own_log(
+    tmp_path, monkeypatch, caplog
+):
+    """A read fault on our own log during clear() must be surfaced — the
+    returned count under-reports — while the deletion (the requested
+    operation) still proceeds."""
+    root = tmp_path / "c"
+    a = LogCache(root, writer_id="A", prefix_width=1)
+    a.set("k", "v")
+    own_log = root / a._prefix("k") / "A.log"
+    orig_read = Path.read_bytes
+
+    def boom(self):
+        if self == own_log:
+            raise OSError("simulated transient I/O error")
+        return orig_read(self)
+
+    monkeypatch.setattr(Path, "read_bytes", boom)
+    with caplog.at_level("WARNING"):
+        assert a.clear() == 0  # the unreadable log's records go uncounted
+
+    assert not own_log.exists()
+    assert any("during clear()" in r.message for r in caplog.records)
+
+
+def test_pruned_log_tear_is_warned(tmp_path, caplog):
+    """A torn frame in a log being pruned is discarded permanently with the
+    log — that discard must be visible, unlike a torn (and untouched)
+    unpruned replica, which stays quiet."""
+    root = tmp_path / "c"
+    dead = LogCache(root, writer_id="DEAD", prefix_width=1)
+    k1, k2 = _SAME_PREFIX_KEYS[:2]
+    dead.set(k1, "v1")
+    dead.set(k2, "v2")
+    prefix = dead._prefix(k1)
+    dead_log = root / prefix / "DEAD.log"
+    whole = dead_log.read_bytes()
+    dead_log.write_bytes(whole[:-3])  # tear the final frame mid-blob
+
+    gc = LogCache(root, writer_id="GC", prefix_width=1)
+    with caplog.at_level("WARNING"):
+        gc.consolidate(prefix, prune_writer_ids={"DEAD"})
+
+    assert not dead_log.exists()  # pruned on the caller's assertion
+    assert any("pruned source log" in r.message for r in caplog.records)
+    reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
+    assert reader.get(k1) == "v1"  # the intact record was folded
+    assert reader.get(k2) is None  # the torn one is gone — hence the warning
