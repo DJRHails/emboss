@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
+import contextvars
 import functools
 import hashlib
 import inspect
@@ -14,7 +16,7 @@ import tempfile
 import textwrap
 import types
 import typing
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, TypeVar, Union
 
@@ -31,6 +33,88 @@ logger = logging.getLogger(__name__)
 
 # Sentinel for "key absent from cache" — lets None be a valid cached value.
 _MISSING = object()
+
+# Cache-only override for the current thread / async task. `None` means "no
+# programmatic override — defer to the EMBOSS_CACHE_ONLY env var"; True/False
+# is an explicit `cache_only(enabled=...)` block. A ContextVar gives the
+# thread-local scoping `cache_only()` promises and additionally isolates
+# concurrent asyncio tasks on one loop.
+_CACHE_ONLY: contextvars.ContextVar[bool | None] = contextvars.ContextVar(
+    "emboss_cache_only", default=None
+)
+
+_ENV_TRUTHY = frozenset({"1", "true", "yes"})
+
+
+def _cache_only_active() -> bool:
+    """Whether cache-only mode is on right now.
+
+    A `cache_only(enabled=...)` block wins; otherwise the `EMBOSS_CACHE_ONLY`
+    environment variable decides ("1"/"true"/"yes", case-insensitively). The
+    env var is read live on every call — not snapshotted at import — so it can
+    be set or cleared mid-process (e.g. by a test harness).
+    """
+    override = _CACHE_ONLY.get()
+    if override is not None:
+        return override
+    return os.environ.get("EMBOSS_CACHE_ONLY", "").strip().lower() in _ENV_TRUTHY
+
+
+@contextlib.contextmanager
+def cache_only(enabled: bool = True) -> Iterator[None]:
+    """Scope cache-only mode to a block: genuine cache misses raise `CacheMiss`.
+
+    Inside the block, any `@cached` call that cannot be served from its cache —
+    neither the current key nor any `also_accept` fallback — raises `CacheMiss`
+    instead of executing the wrapped function. Cached values (including a
+    cached `None` or a stored negative/known-miss result) return normally, and
+    `also_accept` hits still migrate forward to the current key.
+
+    `cache_only(enabled=False)` force-DISABLES the mode within the block, even
+    when the `EMBOSS_CACHE_ONLY` env var turned it on process-wide — e.g. to
+    carve out one deliberately-recomputed call from an otherwise sealed run.
+
+    The scope is per-thread and per-async-task, and the prior state is restored
+    on exit even when the block raises. Use it to prove a run performs zero
+    uncached (external, paid) calls::
+
+        with emboss.cache_only():
+            run_all_monitors()  # any uncached call raises CacheMiss
+    """
+    token = _CACHE_ONLY.set(enabled)
+    try:
+        yield
+    finally:
+        _CACHE_ONLY.reset(token)
+
+
+class CacheMiss(RuntimeError):
+    """A `@cached` call missed its cache while cache-only mode was active.
+
+    `RuntimeError`, not `LookupError`: the caller performed a function call,
+    not a lookup, and `except LookupError` fallback paths in callers would
+    silently swallow exactly the "refused to execute" signal this exists to
+    deliver.
+
+    Attributes:
+        func_name: `__name__` of the wrapped function.
+        cache_id: the function's cache identity (`"name:body_hash"`).
+        key: the storage key computed for this call's arguments.
+
+    The message deliberately carries only the key and identity — never the
+    call's arguments, which may be huge or contain secrets.
+    """
+
+    def __init__(self, *, func_name: str, cache_id: str, key: str) -> None:
+        self.func_name = func_name
+        self.cache_id = cache_id
+        self.key = key
+        name, _, body_hash = cache_id.partition(":")
+        super().__init__(
+            f"cache-only mode: no cached entry for {func_name!r} "
+            f"(identity {name}:{body_hash[:8]}…, key {key[:8]}…); "
+            "refusing to execute"
+        )
 
 
 def safe_jsonable_encoder(
@@ -207,6 +291,41 @@ def cache_id(func: Callable[..., Any]) -> str:
     return info.cache_id
 
 
+def cache_keys(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> tuple[str, list[str]]:
+    """Return `(current key, also_accept fallback keys)` for a `@cached` call.
+
+    The keys come from the wrapper's own keying closure (attached at decoration
+    time), so they are byte-identical to what the wrapper reads and writes —
+    including the decorator's `default=` encoder setting. `func` is
+    positional-only so a wrapped function taking a `func=` kwarg still keys it.
+
+    Raises:
+        TypeError: if `func` is not an `@cached`-wrapped function.
+    """
+    keys_fn = getattr(func, "__emboss_keys__", None)
+    if keys_fn is None:
+        raise TypeError(
+            f"{getattr(func, '__qualname__', func)!r} is not an @cached-wrapped function "
+            "(missing __emboss_keys__ metadata) — cache_keys() only works on functions "
+            "decorated with emboss.cached."
+        )
+    return keys_fn(args, kwargs)
+
+
+def cache_key(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> str:
+    """Return the storage key a `@cached` call reads and writes.
+
+    `cache_key(fn, *args, **kwargs)` is the key `fn(*args, **kwargs)` uses —
+    derive it to check "is this specific call cached?" (`key in cache` /
+    `cache.get(key)`) or to migrate entries without recomputing them.
+
+    Raises:
+        TypeError: if `func` is not an `@cached`-wrapped function.
+    """
+    key, _accept_keys = cache_keys(func, *args, **kwargs)
+    return key
+
+
 def _parse_accept_token(token: str) -> tuple[str, str]:
     """Split an `also_accept` token into `(name, body_hash)`.
 
@@ -270,6 +389,11 @@ def cached(
     falls back to a fresh temporary directory (ephemeral, like the previous
     `diskcache` default). The cache location never affects keying (keys are
     function identity + arguments).
+
+    Under cache-only mode (the `EMBOSS_CACHE_ONLY` env var or a
+    `emboss.cache_only()` block), a call whose key — and every `also_accept`
+    fallback — misses raises `CacheMiss` instead of executing the function
+    (see `cache_only`).
     """
     if cache is None:
         cache_dir = os.environ.get("EMBOSS_CACHE_DIR") or tempfile.mkdtemp(prefix="emboss-")
@@ -357,17 +481,24 @@ def cached(
             if is_async:
 
                 async def execute():
+                    # Checked here — when the coroutine runs — not at call
+                    # time, so the raise pairs with the execution it prevents.
+                    if _cache_only_active():
+                        raise CacheMiss(func_name=info.name, cache_id=info.cache_id, key=key)
                     result = await func(*args, **kwargs)  # type: ignore[misc]
                     _store(key, _encode(result, model_cls, container))
                     return result
 
                 return execute()  # type: ignore[return-value]
 
+            if _cache_only_active():
+                raise CacheMiss(func_name=info.name, cache_id=info.cache_id, key=key)
             result = func(*args, **kwargs)
             _store(key, _encode(result, model_cls, container))
             return result
 
         wrapper.__emboss__ = info  # type: ignore[attr-defined]
+        wrapper.__emboss_keys__ = _keys  # type: ignore[attr-defined]
         return wrapper
 
     return decorator

@@ -2,7 +2,7 @@
 
 **O**n-**D**isk **I**nput-keyed **C**ache — disk-backed memoization with pydantic-aware encoding.
 
-Version: 0.8.0
+Version: 0.9.0
 
 ```bash
 pip install emboss              # core — zero runtime dependencies (stdlib only)
@@ -157,6 +157,54 @@ def summarise(text: str) -> str:
 ```
 
 **Warning: this disables emboss's invalidate-on-edit safety net.** Editing the body no longer invalidates the cache, so stale results are served until *you* bump the key (`"v1"` → `"v2"`). Use it only when you accept that responsibility — e.g. a hot cache you must not re-bill for cosmetic-but-not-quite-canonical churn. `also_accept` works alongside it, e.g. to migrate source-keyed entries into a manual-key identity.
+
+### `cache_key` / `cache_keys` — where would this call land?
+
+`cache_key(fn, *args, **kwargs)` returns the exact storage key `fn(*args, **kwargs)` reads and writes — derived by the wrapper's own keying logic, so it can never drift from what `@cached` actually does. `cache_keys` additionally returns the `also_accept` fallback keys:
+
+```python
+from emboss import cache_key, cache_keys
+
+key = cache_key(get_user, 42)          # "89ab...": md5(name + body_hash + arg_hash)
+key in cache                           # is this specific call cached?
+
+key, accept_keys = cache_keys(get_user, 42)   # + the fallback keys `also_accept` would try
+```
+
+This makes migrations first-class: read an entry under one call's key and write it under another's, without recomputing. Both raise `TypeError` on a function that isn't `@cached`-wrapped.
+
+## Cache-only mode — prove a run makes zero external calls
+
+When `@cached` functions wrap paid APIs, "this re-run is fully cached" is a guarantee worth enforcing, not assuming. Cache-only mode makes any **genuine** miss — the current key *and* every `also_accept` fallback absent — raise `emboss.CacheMiss` instead of executing the function:
+
+```python
+import emboss
+
+with emboss.cache_only():
+    run_all_monitors()   # every @cached call must resolve from cache;
+                         # anything uncached raises CacheMiss instead of paying
+```
+
+or process-wide, without touching code:
+
+```bash
+EMBOSS_CACHE_ONLY=1 python rerun_monitors.py   # "1"/"true"/"yes", case-insensitive
+```
+
+The env var is read live (not snapshotted at import), and either trigger suffices. The block scope is per-thread / per-async-task and restores the prior state on exit, even on exception. `emboss.cache_only(enabled=False)` force-disables the mode inside a block — e.g. to carve one deliberately-recomputed call out of an env-var-sealed run.
+
+What still counts as a hit (returns normally, never raises):
+
+- **Cached values of any shape** — including a cached `None` or a stored negative/known-miss result: they are real entries, distinct from the internal absent-sentinel.
+- **`also_accept` fallback hits** — an entry warm under an old identity is served and still migrated forward (write-through), so cache-only re-runs double as migrations.
+
+`CacheMiss` (a `RuntimeError`) carries `func_name`, `cache_id`, and `key` as attributes; its message includes only truncated hashes — never the call's arguments, which may be large or secret:
+
+```
+CacheMiss: cache-only mode: no cached entry for 'grade' (identity grade:3f2a9c1b…, key 89abcdef…); refusing to execute
+```
+
+Async functions raise the same way — `await`ing a missed call inside cache-only mode raises `CacheMiss`.
 
 ## Backends (`Cache` protocol)
 
