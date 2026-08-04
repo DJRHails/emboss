@@ -188,23 +188,24 @@ with emboss.cache_only():
 or process-wide, without touching code:
 
 ```bash
-EMBOSS_CACHE_ONLY=1 python rerun_monitors.py   # "1"/"true"/"yes", case-insensitive
+EMBOSS_CACHE_ONLY=1 python rerun_monitors.py   # "1"/"true"/"yes" enable; ""/"0"/"false"/"no"/"off" disable;
+                                               # anything else raises ValueError rather than silently unsealing
 ```
 
-The env var is read live (not snapshotted at import), and either trigger suffices. The block scope is per-thread / per-async-task and restores the prior state on exit, even on exception. `emboss.cache_only(enabled=False)` force-disables the mode inside a block — e.g. to carve one deliberately-recomputed call out of an env-var-sealed run.
+The env var is read live (not snapshotted at import), and either trigger suffices. The block scope is the calling thread's current context (isolated per async task) and restores the prior state on exit, even on exception. **Worker threads do not inherit the block**: `threading.Thread` / `ThreadPoolExecutor` workers start from a fresh context and fall back to the env var — seal a multi-threaded run with `EMBOSS_CACHE_ONLY=1` instead (`asyncio.to_thread` is safe; it copies the caller's context). `emboss.cache_only(enabled=False)` force-disables the mode inside a block — e.g. to carve one deliberately-recomputed call out of an env-var-sealed run.
 
 What still counts as a hit (returns normally, never raises):
 
 - **Cached values of any shape** — including a cached `None` or a stored negative/known-miss result: they are real entries, distinct from the internal absent-sentinel.
 - **`also_accept` fallback hits** — an entry warm under an old identity is served and still migrated forward (write-through), so cache-only re-runs double as migrations.
 
-`CacheMiss` (a `RuntimeError`) carries `func_name`, `cache_id`, and `key` as attributes; its message includes only truncated hashes — never the call's arguments, which may be large or secret:
+`CacheMiss` (a `RuntimeError`) carries `func_name`, `cache_id`, and `key` as attributes; its message includes only the function name and truncated hashes — never the call's arguments, which may be large or secret:
 
 ```
 CacheMiss: cache-only mode: no cached entry for 'grade' (identity grade:3f2a9c1b…, key 89abcdef…); refusing to execute
 ```
 
-Async functions raise the same way — `await`ing a missed call inside cache-only mode raises `CacheMiss`.
+Async functions raise the same way — `await`ing a missed call inside cache-only mode raises `CacheMiss`. The mode is checked when the coroutine runs, not when it is created: a task started with `asyncio.create_task` inside the block stays sealed, but a bare coroutine created inside the block and only awaited after it exits executes normally.
 
 ## Backends (`Cache` protocol)
 

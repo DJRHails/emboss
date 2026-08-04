@@ -4,9 +4,13 @@ and public key derivation (`cache_key` / `cache_keys`)."""
 from __future__ import annotations
 
 import asyncio
+import copy
+import pickle
+from concurrent.futures import ThreadPoolExecutor
 
 import diskcache
 import pytest
+from pydantic import BaseModel
 
 from emboss import CacheMiss, cache_id, cache_key, cache_keys, cache_only, cached
 
@@ -122,6 +126,19 @@ def test_env_var_falsy_disables(cache, monkeypatch, value):
 
     monkeypatch.setenv("EMBOSS_CACHE_ONLY", value)
     assert f(1) == 1
+
+
+@pytest.mark.parametrize("value", ["on", "y", "enabled", "TRUE1"])
+def test_env_var_unrecognized_value_raises(cache, monkeypatch, value):
+    """A typo'd truthy-intent value must fail loudly, not silently unseal the run."""
+
+    @cached(cache)
+    def f(x: int) -> int:
+        return x
+
+    monkeypatch.setenv("EMBOSS_CACHE_ONLY", value)
+    with pytest.raises(ValueError, match="EMBOSS_CACHE_ONLY"):
+        f(1)
 
 
 def test_context_manager_force_disables_env_var(cache, monkeypatch):
@@ -248,6 +265,155 @@ def test_cache_only_spans_asyncio_run(cache):
         asyncio.run(f(1))
 
 
+# ── cache-only mode: scope boundaries (threads / coroutines / tasks) ─────────
+
+
+def test_worker_threads_do_not_inherit_the_block(cache):
+    """Documented escape: ThreadPoolExecutor workers start from a fresh context,
+    so a `cache_only()` block does NOT seal them — `EMBOSS_CACHE_ONLY` does."""
+    calls = {"n": 0}
+
+    @cached(cache)
+    def f(x: int) -> int:
+        calls["n"] += 1
+        return x
+
+    with cache_only(), ThreadPoolExecutor(max_workers=1) as ex:
+        assert ex.submit(f, 1).result() == 1  # executes — the seal does not reach it
+    assert calls["n"] == 1
+
+
+def test_asyncio_to_thread_inherits_the_block(cache):
+    """`asyncio.to_thread` copies the caller's context, so the seal holds."""
+    calls = {"n": 0}
+
+    @cached(cache)
+    def f(x: int) -> int:
+        calls["n"] += 1
+        return x
+
+    async def run():
+        with cache_only():
+            await asyncio.to_thread(f, 1)
+
+    with pytest.raises(CacheMiss):
+        asyncio.run(run())
+    assert calls["n"] == 0
+
+
+def test_coroutine_created_inside_block_awaited_after_executes(cache):
+    """Documented boundary: the mode is checked when the coroutine RUNS, so a
+    bare coroutine created inside the block but awaited after it exits is no
+    longer sealed."""
+    calls = {"n": 0}
+
+    @cached(cache)
+    async def f(x: int) -> int:
+        calls["n"] += 1
+        return x * 2
+
+    with cache_only():
+        coro = f(3)  # created sealed…
+    assert asyncio.run(coro) == 6  # …but runs unsealed → executes
+    assert calls["n"] == 1
+
+
+def test_concurrent_tasks_have_isolated_states(cache):
+    """`create_task` copies the context at creation: a task created inside the
+    block stays sealed even when awaited outside it, alongside an unsealed one
+    on the same loop."""
+
+    @cached(cache)
+    async def f(x: int) -> int:
+        return x
+
+    async def main():
+        with cache_only():
+            sealed = asyncio.create_task(f(1))
+        unsealed = asyncio.create_task(f(2))
+        assert await unsealed == 2
+        with pytest.raises(CacheMiss):
+            await sealed
+
+    asyncio.run(main())
+
+
+# ── cache-only mode: CacheMiss ergonomics ────────────────────────────────────
+
+
+def test_cache_miss_survives_pickle_and_copy(cache):
+    """A CacheMiss crossing a multiprocessing boundary must round-trip —
+    BaseException's default reduce would choke on the keyword-only __init__."""
+
+    @cached(cache)
+    def f(x: int) -> int:
+        return x
+
+    with cache_only(), pytest.raises(CacheMiss) as exc_info:
+        f(1)
+    err = exc_info.value
+    for clone in (pickle.loads(pickle.dumps(err)), copy.copy(err)):
+        assert isinstance(clone, CacheMiss)
+        assert clone.func_name == err.func_name
+        assert clone.cache_id == err.cache_id
+        assert clone.key == err.key
+        assert str(clone) == str(err)
+
+
+def test_miss_leaves_cache_unwritten(cache):
+    @cached(cache)
+    def f(x: int) -> int:
+        return x
+
+    with cache_only(), pytest.raises(CacheMiss):
+        f(3)
+    assert cache.get(cache_key(f, 3), default="absent") == "absent"
+
+
+# ── cache-only mode: pydantic model path ─────────────────────────────────────
+
+
+class _User(BaseModel):
+    name: str
+
+
+def test_model_hit_returns_rehydrated_model_and_cold_call_raises(cache):
+    calls = {"n": 0}
+
+    @cached(cache)
+    def get_user(uid: int) -> _User:
+        calls["n"] += 1
+        return _User(name=f"u{uid}")
+
+    assert get_user(1) == _User(name="u1")  # warm: stored as a dict
+    with cache_only():
+        got = get_user(1)
+        assert isinstance(got, _User)  # decode path runs on a sealed hit
+        assert got.name == "u1"
+        with pytest.raises(CacheMiss):
+            get_user(2)  # cold model-annotated call raises before executing
+    assert calls["n"] == 1
+
+
+# ── cache-only mode: unsafe_manual_key ───────────────────────────────────────
+
+
+def test_unsafe_manual_key_keys_and_miss_message(cache):
+    @cached(cache, unsafe_manual_key="v1")
+    def f(x: int) -> int:
+        return x
+
+    key = cache_key(f, 1)
+    assert f(1) == 1
+    assert cache.get(key) == 1  # cache_key matches the wrapper's storage
+
+    with cache_only(), pytest.raises(CacheMiss) as exc_info:
+        f(2)
+    err = exc_info.value
+    assert err.cache_id == "f:v1"
+    assert "identity f:v1," in str(err)  # short manual key: no misleading ellipsis
+
+
 # ── public key derivation ─────────────────────────────────────────────────────
 
 
@@ -301,3 +467,16 @@ def test_cache_key_rejects_unwrapped_function():
 
     with pytest.raises(TypeError, match="not an @cached-wrapped function"):
         cache_key(plain, 1)
+
+
+def test_cache_key_rejects_non_callable_metadata():
+    """A stray non-callable __emboss_keys__ (e.g. copied through an unrelated
+    wrapper's __dict__ by functools.wraps) gets the curated TypeError, not a
+    bare 'str is not callable'."""
+
+    def impostor(x: int) -> int:
+        return x
+
+    impostor.__emboss_keys__ = "not-a-closure"
+    with pytest.raises(TypeError, match="not an @cached-wrapped function"):
+        cache_key(impostor, 1)
