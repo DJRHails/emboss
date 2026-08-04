@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import logging
 import os
 import pickle
 import shutil
@@ -48,6 +49,8 @@ import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
+
+logger = logging.getLogger(__name__)
 
 _MISSING = object()
 
@@ -107,9 +110,15 @@ class FileCache:
         try:
             with path.open("rb") as f:
                 obj = pickle.load(f)
-        except (EOFError, pickle.UnpicklingError, OSError):
+        except (EOFError, pickle.UnpicklingError, OSError) as exc:
             # Partial write or corrupted file; treat as a miss. Caller recomputes
-            # and atomic-renames a fresh copy over it.
+            # and atomic-renames a fresh copy over it. Logged because a read
+            # *fault* (e.g. PermissionError) on a genuinely warm entry would
+            # otherwise masquerade as a miss — under cache-only mode, as a
+            # false CacheMiss.
+            logger.warning(
+                "emboss.FileCache: treating unreadable entry %s as a miss (%s).", path, exc
+            )
             return default
         return obj.value if isinstance(obj, _Entry) else obj  # else: legacy raw value
 

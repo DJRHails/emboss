@@ -49,15 +49,19 @@ def test_clear(cache):
     assert cache.get("b") is None
 
 
-def test_corrupt_file_treated_as_miss(cache, tmp_path):
-    """Partial writes shouldn't poison the cache — corrupted files behave as misses."""
+def test_corrupt_file_treated_as_miss(cache, tmp_path, caplog):
+    """Partial writes shouldn't poison the cache — corrupted files behave as
+    misses, but loudly: a warning distinguishes an unreadable entry from a
+    genuine miss (under cache-only mode the difference is a false CacheMiss)."""
     cache.set("k", "v")
     # Find the file and truncate it to corrupt the pickle.
     pkl_files = list((tmp_path / "cache").glob("**/*.pkl"))
     assert len(pkl_files) == 1
     pkl_files[0].write_bytes(b"not a pickle")
-    assert cache.get("k") is None
-    assert cache.get("k", default="fallback") == "fallback"
+    with caplog.at_level("WARNING", logger="emboss._file_cache"):
+        assert cache.get("k") is None
+        assert cache.get("k", default="fallback") == "fallback"
+    assert "treating unreadable entry" in caplog.text
 
 
 def test_dunder_methods(cache):
