@@ -13,8 +13,9 @@ prefix each node appends to **its own** log:
     directory/<prefix>/<writer_id>.log       # written by exactly ONE node
     directory/<prefix>/<writer_id>.lock      # flock; excludes append/compact races
     directory/<prefix>/spill/<sha256>.val    # large values — shared, content-addressed pool
-    directory/<prefix>/<writer_id>.spill/*   # legacy layout — own dir migrated on sight;
-                                             # a peer's only when its writer is pruned
+    directory/<prefix>/<writer_id>.spill/*   # legacy layout — own dir migrated on the
+                                             # next write after it's seen; a peer's
+                                             # only when its writer is pruned
 
 Because no LOG is ever written by two nodes — and any two nodes writing the same
 content-addressed pool file write identical bytes — a file syncer just ships each
