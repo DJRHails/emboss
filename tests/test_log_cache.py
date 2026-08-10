@@ -16,6 +16,7 @@ from emboss import Cache, LogCache, cached
 from emboss._log_cache import (
     _HEADER,
     _frame,
+    _is_conflict_log,
     _iter_records,
     _parse_frame,
     _read_records,
@@ -1741,6 +1742,241 @@ def test_consolidate_prunes_only_allowlisted_writers(tmp_path):
     assert reader.get(k_dead) == "dead-v"
     assert reader.get(k_live) == "live-v"
     assert reader.get(k_mine) == "mine-v"
+
+
+# ── syncer-minted conflict copies (`*.sync-conflict-*.log`) ───────────────────
+# A file syncer mints `<writer>.sync-conflict-<ts>-<device>.log` when two nodes
+# diverge on a log. It is read by the `*.log` glob but — unlike a foreign
+# CANONICAL log, which may be an incomplete replica — it is complete, immutable
+# and locally finalized, so consolidation folds it in and deletes it (otherwise
+# conflict copies accrete forever after any conflict event).
+
+_CONFLICT_SUFFIX = ".sync-conflict-20260710-200058-ABCDEFG.log"
+
+
+def _make_conflict_copy(prefix_dir, canonical_name):
+    """Copy `<writer>.log` to a syncer-style conflict sibling; return its path."""
+    src = prefix_dir / canonical_name
+    dst = prefix_dir / (canonical_name[:-4] + _CONFLICT_SUFFIX)
+    dst.write_bytes(src.read_bytes())
+    return dst
+
+
+def test_is_conflict_log_matches_only_syncer_names():
+    assert _is_conflict_log("bonbon.sync-conflict-20260710-200058-ABCDEFG.log")
+    assert _is_conflict_log("A.sync-conflict-20240101-000000-Z2A7QKD.log")
+    # a plain node log — never a conflict copy, however the hostname reads
+    assert not _is_conflict_log("bonbon.log")
+    assert not _is_conflict_log("web-01.prod.log")
+    # the words alone, without the date-time-device structure, must miss —
+    # a false positive here would fold and delete a live writer's log
+    assert not _is_conflict_log("sync-conflict-host.log")
+    assert not _is_conflict_log("A.sync-conflict-notadate-XYZ.log")
+    # only the *.log form is a foldable node log; sibling kinds are not
+    assert not _is_conflict_log("A.sync-conflict-20260710-200058-ABCDEFG.lock")
+
+
+def test_conflict_copy_of_dead_peer_is_folded_and_deleted(tmp_path):
+    """A conflict copy left behind by a since-removed peer log is folded into our
+    log and deleted whole-file; its records read back through our (replicating)
+    log — no allowlist entry needed."""
+    root = tmp_path / "c"
+    peer = LogCache(root, writer_id="PEER", prefix_width=1)
+    peer.set(_SAME_PREFIX_KEYS[0], "peer-v")
+    prefix = peer._prefix(_SAME_PREFIX_KEYS[0])
+    conflict = _make_conflict_copy(root / prefix, "PEER.log")
+    (root / prefix / "PEER.log").unlink()  # only the copy remains
+
+    gc = LogCache(root, writer_id="GC", prefix_width=1)
+    gc.set(_SAME_PREFIX_KEYS[1], "gc-v")  # our own record, so the target exists
+    gc.consolidate(prefix)  # default pass — no prune_writer_ids
+
+    assert not conflict.exists()  # folded in and deleted
+    assert {p.name for p in (root / prefix).glob("*.log")} == {"GC.log"}
+    reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
+    assert reader.get(_SAME_PREFIX_KEYS[0]) == "peer-v"  # preserved via the fold
+    assert reader.get(_SAME_PREFIX_KEYS[1]) == "gc-v"
+
+
+def test_conflict_copy_of_own_log_is_folded(tmp_path):
+    """Our OWN log can gain a conflict copy too (we diverged during sync). It
+    carries a record we never merged locally; the fold brings it in."""
+    root = tmp_path / "c"
+    gc = LogCache(root, writer_id="GC", prefix_width=1)
+    gc.set(_SAME_PREFIX_KEYS[0], "mine")
+    prefix = gc._prefix(_SAME_PREFIX_KEYS[0])
+    divergent = _Record(
+        _SAME_PREFIX_KEYS[1], "from-divergent-self", None, time.time(), False, None
+    )
+    conflict = root / prefix / ("GC" + _CONFLICT_SUFFIX)
+    conflict.write_bytes(_frame(divergent))
+
+    gc.consolidate(prefix)
+
+    assert not conflict.exists()
+    reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
+    assert reader.get(_SAME_PREFIX_KEYS[0]) == "mine"
+    assert reader.get(_SAME_PREFIX_KEYS[1]) == "from-divergent-self"
+
+
+def test_conflict_copy_folded_but_live_peer_canonical_untouched(tmp_path):
+    """A live peer's canonical log stays byte-for-byte (never-touch-peer-files),
+    yet a conflict copy of it is still folded and removed."""
+    root = tmp_path / "c"
+    peer = LogCache(root, writer_id="PEER", prefix_width=1)
+    peer.set(_SAME_PREFIX_KEYS[0], "peer-v")
+    prefix = peer._prefix(_SAME_PREFIX_KEYS[0])
+    canonical_bytes = (root / prefix / "PEER.log").read_bytes()
+    conflict = _make_conflict_copy(root / prefix, "PEER.log")
+
+    gc = LogCache(root, writer_id="GC", prefix_width=1)
+    gc.set(_SAME_PREFIX_KEYS[1], "gc-v")
+    gc.consolidate(prefix)  # default pass — PEER is NOT pruned
+
+    assert (root / prefix / "PEER.log").read_bytes() == canonical_bytes  # untouched
+    assert not conflict.exists()  # copy folded + deleted
+    reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
+    assert reader.get(_SAME_PREFIX_KEYS[0]) == "peer-v"
+    assert reader.get(_SAME_PREFIX_KEYS[1]) == "gc-v"
+
+
+def test_conflict_copy_newer_record_wins_on_fold(tmp_path):
+    """A newer store_time in the conflict copy wins after the fold (latest-wins
+    across the whole merge)."""
+    root = tmp_path / "c"
+    gc = LogCache(root, writer_id="GC", prefix_width=1)
+    gc.set(_SAME_PREFIX_KEYS[0], "old")
+    prefix = gc._prefix(_SAME_PREFIX_KEYS[0])
+    newer = _Record(_SAME_PREFIX_KEYS[0], "new", None, time.time() + 10, False, None)
+    conflict = root / prefix / ("PEER" + _CONFLICT_SUFFIX)
+    conflict.write_bytes(_frame(newer))
+
+    gc.consolidate(prefix)
+
+    assert not conflict.exists()
+    reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
+    assert reader.get(_SAME_PREFIX_KEYS[0]) == "new"
+
+
+def test_conflict_copy_with_spill_folds_without_growing_pool(tmp_path):
+    """A conflict copy referencing a pooled spill folds without copying the pool
+    file, and re-running is idempotent — the pool never grows, the value stays."""
+    root = tmp_path / "c"
+    peer = LogCache(root, writer_id="PEER", prefix_width=1, min_file_size=100)
+    peer.set(_SAME_PREFIX_KEYS[0], "z" * 5000)
+    prefix = peer._prefix(_SAME_PREFIX_KEYS[0])
+    assert len(_spills(root)) == 1
+    conflict = _make_conflict_copy(root / prefix, "PEER.log")
+    (root / prefix / "PEER.log").unlink()
+
+    gc = LogCache(root, writer_id="GC", prefix_width=1, min_file_size=100)
+    for _ in range(2):  # idempotent across repeated passes
+        gc.consolidate(prefix)
+
+    assert not conflict.exists()
+    assert len(_spills(root)) == 1  # pool file preserved, never duplicated
+    reader = LogCache(
+        root, writer_id="R", prefix_width=1, index_ttl=0, min_file_size=100
+    )
+    assert reader.get(_SAME_PREFIX_KEYS[0]) == "z" * 5000
+
+
+def test_lone_writer_auto_consolidation_folds_conflict_copies(tmp_path):
+    """A lone writer whose tree accreted conflict copies folds them on the
+    size-triggered auto pass: conflict copies are not peers, so they don't force
+    the compact-only path a live peer canonical log does."""
+    root = tmp_path / "c"
+    c = LogCache(root, writer_id="A", prefix_width=1, max_log_bytes=1500, index_ttl=0)
+    c.set(_SAME_PREFIX_KEYS[0], "seed")
+    prefix = c._prefix(_SAME_PREFIX_KEYS[0])
+    conflict = _make_conflict_copy(root / prefix, "A.log")
+    c.set(_SAME_PREFIX_KEYS[1], "x" * 3000)  # trips our own log past max_log_bytes
+
+    assert not conflict.exists()  # auto-consolidation folded the conflict copy
+    assert {p.name for p in (root / prefix).glob("*.log")} == {"A.log"}
+    reader = LogCache(root, writer_id="R", prefix_width=1, index_ttl=0)
+    assert reader.get(_SAME_PREFIX_KEYS[0]) == "seed"
+    assert reader.get(_SAME_PREFIX_KEYS[1]) == "x" * 3000
+
+
+def test_live_peer_keeps_conflict_copy_on_auto_compaction(tmp_path):
+    """With a live peer canonical log present, the size-triggered auto pass
+    COMPACTS (never touches the peer) — so a conflict copy is left for an
+    explicit consolidate(), which then folds it."""
+    root = tmp_path / "c"
+    peer = LogCache(root, writer_id="PEER", prefix_width=1)
+    peer.set(_SAME_PREFIX_KEYS[2], "peer-v")
+    a = LogCache(root, writer_id="A", prefix_width=1, max_log_bytes=1500, index_ttl=0)
+    a.set(_SAME_PREFIX_KEYS[0], "seed")
+    prefix = a._prefix(_SAME_PREFIX_KEYS[0])
+    conflict = _make_conflict_copy(root / prefix, "PEER.log")
+    a.set(_SAME_PREFIX_KEYS[1], "x" * 3000)  # trips A's log; PEER is a live peer
+
+    assert conflict.exists()  # a live peer forced compact-only — copy untouched
+    a.consolidate(prefix)  # explicit pass folds it
+    assert not conflict.exists()
+
+
+def test_conflict_copy_kept_when_folded_record_spill_absent(tmp_path):
+    """A conflict copy whose folded record references a spill not yet on disk
+    (sync lag: the log synced ahead of its value) is KEPT, not deleted — the
+    copy is that record's only durable carrier, so deleting it would lose the
+    record outright rather than "recompute on next read". Once the spill lands,
+    a later pass folds and deletes it."""
+    root = tmp_path / "c"
+    peer = LogCache(root, writer_id="PEER", prefix_width=1, min_file_size=100)
+    peer.set(_SAME_PREFIX_KEYS[0], "z" * 5000)  # spills to the shared pool
+    prefix = peer._prefix(_SAME_PREFIX_KEYS[0])
+    conflict = _make_conflict_copy(root / prefix, "PEER.log")
+    (root / prefix / "PEER.log").unlink()  # only the copy carries the record
+    (spill,) = _spills(root)  # the value lags the log: move it aside
+    stashed = spill.with_name(spill.name + ".lagging")
+    spill.rename(stashed)
+
+    gc = LogCache(root, writer_id="GC", prefix_width=1, min_file_size=100)
+    gc.set(_SAME_PREFIX_KEYS[1], "gc-v")  # our own record, so the target exists
+    gc.consolidate(prefix)
+
+    assert conflict.exists()  # kept — its record's spill has not synced in yet
+
+    stashed.rename(spill)  # the value arrives
+    gc.consolidate(prefix)
+
+    assert not conflict.exists()  # now folded and deleted, nothing lost
+    reader = LogCache(
+        root, writer_id="R", prefix_width=1, index_ttl=0, min_file_size=100
+    )
+    assert reader.get(_SAME_PREFIX_KEYS[0]) == "z" * 5000
+    assert reader.get(_SAME_PREFIX_KEYS[1]) == "gc-v"
+
+
+def test_conflict_copy_fold_leaves_live_peer_lock_untouched(tmp_path):
+    """Deleting a folded conflict copy derives its sibling names from the FULL
+    copy basename, so a live peer's own `PEER.lock` and pooled value are never
+    touched — the never-touch-peer-files invariant the `writer = name[:-4]`
+    cleanup depends on."""
+    root = tmp_path / "c"
+    peer = LogCache(root, writer_id="PEER", prefix_width=1, min_file_size=100)
+    peer.set(_SAME_PREFIX_KEYS[0], "y" * 5000)  # spills to the shared pool
+    prefix = peer._prefix(_SAME_PREFIX_KEYS[0])
+    pdir = root / prefix
+    peer_lock = pdir / "PEER.lock"
+    assert peer_lock.exists()  # the live peer's own lock
+    canonical_bytes = (pdir / "PEER.log").read_bytes()
+    conflict = _make_conflict_copy(pdir, "PEER.log")
+
+    gc = LogCache(root, writer_id="GC", prefix_width=1, min_file_size=100)
+    gc.set(_SAME_PREFIX_KEYS[1], "gc-v")
+    gc.consolidate(prefix)  # PEER is a live peer — NOT pruned
+
+    assert not conflict.exists()  # copy folded + deleted
+    assert (pdir / "PEER.log").read_bytes() == canonical_bytes  # untouched
+    assert peer_lock.exists()  # the peer's lock survived the copy's deletion
+    assert len(_spills(root)) == 1  # the peer's pooled value untouched
+    reader = LogCache(
+        root, writer_id="R", prefix_width=1, index_ttl=0, min_file_size=100
+    )
+    assert reader.get(_SAME_PREFIX_KEYS[0]) == "y" * 5000
 
 
 def test_clear_removes_only_own_writer_files(tmp_path):
