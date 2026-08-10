@@ -15,6 +15,7 @@ import pytest
 from emboss import Cache, LogCache, cached
 from emboss._log_cache import (
     _HEADER,
+    _STALE,
     _frame,
     _is_conflict_log,
     _iter_records,
@@ -300,7 +301,8 @@ def test_missing_spill_is_a_quiet_miss(tmp_path, caplog):
     a present-but-unreadable spill or a persistent I/O error warns."""
     c = LogCache(tmp_path / "c", writer_id="A", min_file_size=1)
     c.set("k", "value-that-spills")
-    next((c.directory / c._prefix("k") / "spill").glob("*.val")).unlink()  # not synced yet
+    spills = (c.directory / c._prefix("k") / "spill").glob("*.val")
+    next(spills).unlink()  # not synced to this node yet
     fresh = LogCache(tmp_path / "c", writer_id="A", min_file_size=1, index_ttl=0)
     with caplog.at_level("WARNING"):
         assert fresh.get("k", "MISS") == "MISS"
@@ -503,12 +505,215 @@ def test_dead_keys_absent_from_index(tmp_path):
 
 def test_entry_expiring_after_build_still_misses(tmp_path):
     """An entry that expires between the index build and the read dies at read time
-    — liveness is re-checked against `expire_time` on every `get`."""
+    — liveness is re-checked against the frame's `expire_time` on every `get`."""
     c = LogCache(tmp_path / "c", writer_id="A")
-    c.set("k", "v", expire=0.05)
-    assert c.get("k") == "v"  # alive: index entry carries its expire_time
+    c.set("k", "v", expire=0.5)  # wide margin: a stall before the hit must not flake
+    assert c.get("k") == "v"
+    time.sleep(0.7)
+    assert c.get("k", "MISS") == "MISS"  # same location, frame now past expiry
+
+
+def test_expiry_inside_ttl_hidden_from_len_iter_and_volume(tmp_path):
+    """An entry that expires while the index is still warm must vanish from every live
+    view, not just `get()`. `len()`/iteration/`volume()` scan logs rather than the index,
+    so this pins that all three apply the liveness check independently of the read path."""
+    c = LogCache(tmp_path / "c", writer_id="A", index_ttl=300.0)
+    c.set("k", "v", expire=0.3)
+    assert c.get("k") == "v"  # warms the index
+    time.sleep(0.5)
+    assert len(c) == 0
+    assert list(c) == []
+    assert c.volume() == 0
+
+
+def test_deleted_key_at_a_reused_offset_is_not_a_hit(tmp_path):
+    """Compaction shortens a log, so a later append can re-occupy an offset a reader
+    still holds inside its index_ttl. A tombstone frame is exactly as long as a live
+    frame whose value pickles to one byte, so key+span alone cannot tell them apart —
+    were liveness judged from the index rather than the re-read frame, the tombstone's
+    empty `value` would come back as a HIT: `None` for a key that never stored it, which
+    `@cached` would then cache and never recompute.
+
+    Several layouts are swept because the offset collision depends on incidental frame
+    lengths; one arrangement proves little either way.
+    """
+    for victim in range(2, 6):
+        root = tmp_path / f"c{victim}"
+        writer = LogCache(root, writer_id="A")
+        keys = _same_prefix_keys(writer, 6)
+        for key in keys[:victim]:
+            writer.set(key, False)  # 1-byte values: live and tombstone frames match
+        writer.set(keys[0], False)  # supersede, so compaction shortens the log
+        target = keys[victim - 1]
+
+        reader = LogCache(root, writer_id="A", index_ttl=300.0)
+        assert reader.get(target) is False  # memorises the location
+        writer.compact()
+        writer.delete(target)
+
+        assert reader.get(target, "MISS") == "MISS", f"layout {victim}"
+        assert target not in reader, f"layout {victim}"
+
+
+def test_spilled_value_replacing_an_inline_one_is_never_served_as_none(tmp_path):
+    """The same hazard's other face: a spilled record carries `value=None` and the spill
+    path must be taken from the RE-READ frame. If it were taken from a cached flag, a
+    reader holding an inline location would hand back `None` once the winner spilled."""
+    for pad in (200, 240, 250, 255):
+        root = tmp_path / f"c{pad}"
+        writer = LogCache(root, writer_id="A", min_file_size=256)
+        keys = _same_prefix_keys(writer, 3)
+        writer.set(keys[0], "a" * 10)
+        writer.set(keys[1], "x" * pad)  # inline
+
+        reader = LogCache(root, writer_id="A", index_ttl=300.0)
+        assert reader.get(keys[1]) == "x" * pad
+        writer.compact()
+        writer.set(keys[1], "y" * 5000)  # now spills
+
+        got = reader.get(keys[1], "MISS")
+        # Stale-but-genuine is the documented contract; `None` never is.
+        assert got in ("x" * pad, "y" * 5000), f"pad {pad}: {got!r}"
+
+
+def test_newest_tombstone_wins_over_an_older_live_peer_record(tmp_path):
+    """Cross-log latest-wins: the build must not let an older live record in a
+    later-sorted log overwrite a newer tombstone, or a deleted key resurrects. The
+    writer ids matter — `A.log` must sort BEFORE `Z.log` so the dead winner is seen
+    first; renaming them would silently defang this test."""
+    peer = LogCache(tmp_path / "c", writer_id="Z", index_ttl=0)
+    peer.set("shared", "peer-old")
+    time.sleep(0.01)
+    own = LogCache(tmp_path / "c", writer_id="A", index_ttl=0)
+    own.set("shared", "own-new")
+    assert own.delete("shared") is True  # newest record for the key is a tombstone
+
+    fresh = LogCache(tmp_path / "c", writer_id="A", index_ttl=0)
+    assert fresh.get("shared", "MISS") == "MISS"
+    assert len(fresh) == 0
+
+
+def test_newest_expired_record_wins_over_an_older_live_peer_record(tmp_path):
+    """The same ordering guard with expiry rather than a tombstone as the newest."""
+    peer = LogCache(tmp_path / "c", writer_id="Z", index_ttl=0)
+    peer.set("shared", "peer-old")
+    time.sleep(0.01)
+    own = LogCache(tmp_path / "c", writer_id="A", index_ttl=0)
+    own.set("shared", "own-new", expire=0.05)
     time.sleep(0.1)
-    assert c.get("k", "MISS") == "MISS"  # same index entry, now past expiry
+
+    fresh = LogCache(tmp_path / "c", writer_id="A", index_ttl=0)
+    assert fresh.get("shared", "MISS") == "MISS"
+
+
+def test_warm_own_write_never_rescans_a_log(monkeypatch, tmp_path):
+    """`set()` folds its frame's own location into the overlay, so reading a key this
+    process just wrote must never touch a log. This is the only assertion that can see
+    the offset bookkeeping break: a bad offset still returns the right value (the stale
+    re-read rebuilds), but it silently pays a full prefix rescan per operation — the
+    O(corpus)-per-op cliff whose memory analogue motivated this whole change."""
+    import emboss._log_cache as mod
+
+    c = LogCache(tmp_path / "c", writer_id="A", index_ttl=300.0)
+    keys = _same_prefix_keys(c, 40)
+    for key in keys:  # build the index once, before counting
+        c.set(key, f"seed-{key}")
+    assert c.get(keys[0]) == f"seed-{keys[0]}"
+
+    scans = []
+    real = mod._read_records
+
+    def counting(path):
+        scans.append(path)
+        return real(path)
+
+    monkeypatch.setattr(mod, "_read_records", counting)
+    for key in keys:
+        c.set(key, f"value-{key}")
+        assert c.get(key) == f"value-{key}"
+    assert scans == [], f"warm own writes rescanned {len(scans)} log(s)"
+
+    for key in keys:  # and with an expiry, which takes a different frame shape
+        c.set(key, f"ttl-{key}", expire=3600)
+        assert c.get(key) == f"ttl-{key}"
+    assert scans == [], f"warm expiring writes rescanned {len(scans)} log(s)"
+
+
+def test_unreadable_frame_warns_rather_than_missing_in_silence(tmp_path, caplog):
+    """A persistent local fault (EACCES/EIO) on a log is not a benign miss: the rebuild
+    cannot heal it — its own read is suppressed, emptying the prefix — so every key in
+    that log misses and re-bills forever. It must be visible, matching how the spill
+    path already distinguishes a missing pool file from an unreadable one."""
+    c = LogCache(tmp_path / "c", writer_id="A", index_ttl=300.0)
+    c.set("k", "v1")
+    assert c.get("k") == "v1"
+    log = tmp_path / "c" / c._prefix("k") / "A.log"
+    log.chmod(0o000)
+    try:
+        log.read_bytes()  # running as root: the chmod denies us nothing
+        pytest.skip("cannot make a file unreadable as this user")
+    except OSError:
+        pass
+    with caplog.at_level("WARNING"):
+        assert c.get("k", "MISS") == "MISS"
+    log.chmod(0o644)
+    assert any("could not be read" in r.message for r in caplog.records), caplog.text
+
+
+def test_double_stale_read_warns_and_terminates(monkeypatch, tmp_path, caplog):
+    """A location that will not resolve even after a rebuild must be a WARNED miss, and
+    the retry must terminate — a refactor to an unbounded loop would wedge a reader on
+    a single unlucky key."""
+    import emboss._log_cache as mod
+
+    c = LogCache(tmp_path / "c", writer_id="A", index_ttl=300.0)
+    c.set("k", "v")
+    assert c.get("k") == "v"
+
+    rebuilds = []
+    real = mod._read_records
+
+    def counting(path):
+        rebuilds.append(path)
+        return real(path)
+
+    monkeypatch.setattr(mod, "_read_records", counting)
+    monkeypatch.setattr(LogCache, "_read_verified", lambda *_args: mod._STALE)
+
+    with caplog.at_level("WARNING"):
+        assert c.get("k", "MISS") == "MISS"
+
+    assert len(rebuilds) == 1, "exactly one rebuild — not a loop, not zero"
+    warned = [r for r in caplog.records if "after an index rebuild" in r.message]
+    assert len(warned) == 1, caplog.text
+
+
+def test_read_verified_rejects_a_frame_of_the_wrong_span(tmp_path):
+    """The span check: a frame that parses and carries the right key but does NOT span
+    the recorded length means the log was rewritten under us, so the location can no
+    longer be trusted to name the winner. Accepting it would silently serve whatever
+    record happens to start there and skip the rebuild that finds the real one."""
+    c = LogCache(tmp_path / "c", writer_id="A", index_ttl=300.0)
+    c.set("kk", "yyyy")
+    prefix = c._prefix("kk")
+    log = tmp_path / "c" / prefix / "A.log"
+    location = (log.name, 0, log.stat().st_size)
+    assert c._read_verified(prefix, "kk", location).value == "yyyy"  # baseline
+
+    # Same key, same offset, genuine frame — only shorter.
+    shorter = _frame(_Record("kk", "y", None, time.time(), False, None))
+    assert len(shorter) < location[2]
+    log.write_bytes(shorter + b"\x00" * (location[2] - len(shorter)))
+    assert c._read_verified(prefix, "kk", location) is _STALE
+
+
+def test_volume_counts_spilled_values(tmp_path):
+    """`volume()` scans logs and must size a spilled value from its pool file."""
+    c = LogCache(tmp_path / "c", writer_id="A", min_file_size=100)
+    c.set("big", "x" * 5000)
+    assert c.volume() >= 5000
+    c.set("small", "y" * 10)
+    assert c.volume() >= 5010
 
 
 def test_auto_compaction_on_large_log(tmp_path):

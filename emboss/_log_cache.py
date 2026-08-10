@@ -95,9 +95,10 @@ sharing a node-log are serialised by the per-writer lock file. Inodes are bounde
   legacy layout auto-runs one on the next write; also `consolidate()`.
 
 Tunables (defaults chosen via `python scripts/bench.py`):
-- `index_ttl` (1.0 s) — index reuse before re-stat'ing for peers' appends; the
-  dominant read lever (~10^4/s always-fresh -> ~10^5/s throttled), at the cost of
-  up to `index_ttl` of staleness on cross-node writes (own writes immediate).
+- `index_ttl` (1.0 s) — index reuse before re-stat'ing for peers' appends; it saves
+  the per-read `stat` (~3x10^4/s always-fresh -> ~4x10^4/s throttled) but no longer
+  dominates the read cost, since every hit re-reads its frame either way. Costs up to
+  `index_ttl` of staleness on cross-node writes (own writes immediate).
 - `prefix_width` (2 -> 256 shards) — inodes vs per-log size. Aim ~1k entries per
   prefix: width 1 (<~10k entries), 2 (~10k-2M), 3 (>~2M); avoid >=4 (the parent
   dir then holds 65k+ subdirs — the cliff). Must match across a directory.
@@ -120,6 +121,7 @@ the `Cache` protocol subset `@cached` needs plus dunders, `len()`, iteration,
 from __future__ import annotations
 
 import contextlib
+import enum
 import hashlib
 import io
 import logging
@@ -182,8 +184,16 @@ class _Record(NamedTuple):
 _ENTRY = struct.Struct(">16sHIQ")
 _DIGEST_SIZE = 16
 
+
 # Overlay tombstone: this process deleted the key after the base array was built.
-_DELETED = object()
+# An enum member rather than a bare `object()` so the overlay's value type is a union a
+# type checker can narrow — with `object` in it, `lookup`'s early returns cannot prove
+# the survivor is a location, which is what the old `type: ignore` was papering over.
+class _Deleted(enum.Enum):
+    TOKEN = "deleted"
+
+
+_DELETED = _Deleted.TOKEN
 
 
 def _digest(key: str) -> bytes:
@@ -206,12 +216,12 @@ class _PackedIndex:
     frames are on disk, so the rebuild re-reads them into the new base.
     """
 
-    __slots__ = ("logs", "entries", "overlay")
+    __slots__ = ("entries", "logs", "overlay")
 
     def __init__(self, logs: tuple[str, ...], entries: bytes) -> None:
         self.logs = logs
         self.entries = entries
-        self.overlay: dict[bytes, tuple[str, int, int] | object] = {}
+        self.overlay: dict[bytes, tuple[str, int, int] | _Deleted] = {}
 
     def lookup(self, digest: bytes) -> tuple[str, int, int] | None:
         """The winning frame's `(log name, offset, length)`, or `None` for a miss."""
@@ -219,7 +229,7 @@ class _PackedIndex:
         if hit is _DELETED:
             return None
         if hit is not None:
-            return hit  # type: ignore[return-value]  # non-_DELETED overlay values are locations
+            return hit
         entry_size = _ENTRY.size
         lo, hi = 0, len(self.entries) // entry_size
         while lo < hi:
@@ -729,13 +739,17 @@ class LogCache:
                     _warn_recovered(log, scan)
                     log_id = len(logs)
                     logs.append(log.name)
-                    for rec, (start, end) in zip(scan.records, scan.spans):
+                    # `strict=True` is load-bearing: `records` and `spans` are appended
+                    # in lockstep, but a silent `zip` truncation would drop a log's tail
+                    # from the index — a run of keys quietly recomputing and re-billing.
+                    for rec, (start, end) in zip(scan.records, scan.spans, strict=True):
                         digest = _digest(rec.key)
                         prev = merge.get(digest)
                         if prev is not None and rec.store_time < prev[0]:
                             continue
                         live = self._live(rec, wall_now)
-                        merge[digest] = (rec.store_time, live, log_id, start, end - start)
+                        length = end - start
+                        merge[digest] = (rec.store_time, live, log_id, start, length)
         packed = b"".join(
             _ENTRY.pack(digest, log_id, length, offset)
             for digest, (_, live, log_id, offset, length) in sorted(merge.items())
@@ -770,17 +784,35 @@ class LogCache:
         sibling process compacting it, or a syncer replacing a peer's log — so the
         frame is verified before the record is trusted: it must parse, span exactly
         the recorded length, and carry `key` (which also resolves a digest collision
-        to a miss rather than a wrong value). A same-key frame that happens to sit
-        at the same location in a rewritten log is by construction a genuine (and
-        possibly newer) record for this key, so returning it is correct."""
+        to a miss rather than a wrong value). A same-key frame that happens to sit at
+        the same location in a rewritten log is a genuine record for this key — though
+        not necessarily the winning one, so it may be stale by up to one rebuild, which
+        is the standing eventual-consistency contract. Liveness and the spill path are
+        deliberately NOT judged here: `_shard_get` reads them off this record, so a
+        location that has come to hold a tombstone, or a newly-spilled record for the
+        same key, resolves correctly instead of yielding that frame's empty `value`."""
         log_name, offset, length = location
         path = self.directory / prefix / log_name
         try:
             with open(path, "rb") as f:
                 f.seek(offset)
                 data = f.read(length)
-        except OSError:
-            return _STALE  # log gone or unreadable — rebuild decides what is left
+        except FileNotFoundError:
+            return _STALE  # log compacted/renamed away — the rebuild is the answer
+        except OSError as exc:
+            # A persistent local fault (EACCES/EIO) that no rebuild can heal: the
+            # rebuild's own read fails too and `_ensure_index` suppresses it, dropping
+            # every key in this log, so without this warning the whole prefix would
+            # miss — and re-bill — in silence. Mirrors the spill path's distinction.
+            logger.warning(
+                "emboss.LogCache: frame for key %r in %s/%s could not be read (%s); "
+                "treating as a miss (the value is on disk — every read re-bills).",
+                key,
+                prefix,
+                log_name,
+                exc,
+            )
+            return _STALE
         parsed = _parse_frame(data, 0)
         if parsed is None:
             return _STALE
@@ -1536,6 +1568,15 @@ class LogCache:
     # ── core API ────────────────────────────────────────────────────────────
 
     def get(self, key: Any, default: Any = None) -> Any:
+        """Return the value cached for `key`, or `default`.
+
+        Every miss reason yields `default` rather than raising: the key is absent, its
+        record has expired or is tombstoned, its spill file is unreadable, or its frame
+        location no longer resolves. The index holds locations — not values, not even
+        keys — so a hit re-reads and verifies the frame; a location invalidated by a log
+        rewritten underneath us costs at most one index rebuild and retry, after which
+        the miss is warned.
+        """
         skey = str(key)
         prefix = self._prefix(key)
         for retry in (False, True):
@@ -1549,12 +1590,10 @@ class LogCache:
             if outcome is not _STALE:
                 return outcome
             # The location no longer yields this key's frame: the log was rewritten
-            # or replaced under us. Drop the prefix state and rebuild once; a second
-            # stale read means the on-disk state itself is unreadable — a warned miss.
-            with self._lock:
-                self._index.pop(prefix, None)
-                self._sig.pop(prefix, None)
-                self._checked.pop(prefix, None)
+            # or replaced under us. Rebuild once and retry; a second stale read means
+            # the on-disk state itself is unreadable — a warned miss. Re-invalidating
+            # after that last attempt would buy nothing (the rebuild just produced this
+            # same location) and would make persistent churn rescan on every read.
             if retry:
                 logger.warning(
                     "emboss.LogCache: frame for key %r in %s/ is unreadable even "
@@ -1562,9 +1601,16 @@ class LogCache:
                     key,
                     prefix,
                 )
+                break
+            with self._lock:
+                self._index.pop(prefix, None)
+                self._sig.pop(prefix, None)
+                self._checked.pop(prefix, None)
         return default
 
-    def _fold_own_append(self, prefix: str, rec: _Record, offset: int, length: int) -> None:
+    def _fold_own_append(
+        self, prefix: str, rec: _Record, offset: int, length: int
+    ) -> None:
         """Fold a just-appended record into an already-built index's overlay.
 
         Own-write visibility between rebuilds: a live record's location becomes the
@@ -1725,7 +1771,18 @@ class LogCache:
             return sum(self._rec_size(rec) for rec in self._iter_live())
 
     def _iter_live(self) -> Iterator[_Record]:
-        """Every live per-key winner, by scanning all logs (never via the index)."""
+        """Every live per-key winner, by scanning all logs (never via the index).
+
+        This is a DIFFERENT consistency view from `get()`, and the difference is
+        observable: the scan is always disk-fresh, while `get()` serves from the index
+        plus this process's own-write overlay and so is stale by up to a rebuild. With a
+        second writer on the same directory, `len()`/iteration/`volume()` can therefore
+        count a newer winner than `get()` will return for the same key (measured: a
+        `volume()` of 1750 against a read path serving the older 17-byte record). The
+        index cannot serve these — digests do not give keys back — so the divergence is
+        inherent, not a bug to fix; it is bounded by the same `index_ttl` staleness the
+        module already documents for reads.
+        """
         now = time.time()
         for pdir in self.directory.iterdir():
             if not pdir.is_dir():
