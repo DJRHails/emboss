@@ -429,6 +429,82 @@ def test_compaction_shrinks_and_keeps_latest(tmp_path):
     assert len(c) == 1
 
 
+# ── slim index: the in-memory index holds frame locations, never values ──────
+
+
+def test_index_entries_hold_no_values(tmp_path):
+    """The regression guard for the corpus-in-RAM leak: a built index must not retain
+    value objects, or a long-lived process's memory scales with every prefix it
+    touches (a warm sweep over a 53 GB production corpus held ~30 GB of unpickled
+    values per process — the 2026-08-10 incident)."""
+    c = LogCache(tmp_path / "c", writer_id="A")
+    payload = {"payload": list(range(100))}
+    c.set("k", payload)
+    fresh = LogCache(tmp_path / "c", writer_id="A", index_ttl=0)
+    assert fresh.get("k") == payload  # read through the location, not a retained object
+    entries = [e for index in fresh._index.values() for e in index.values()]
+    assert entries, "the read must have built an index"
+    for entry in entries:
+        assert not hasattr(entry, "value")
+        assert entry.length > 0  # a real frame location, re-read on every hit
+
+
+def _same_prefix_keys(cache, n):
+    """`n` distinct keys that shard into one prefix, so one log holds them all."""
+    target = cache._prefix("anchor")
+    keys, i = ["anchor"], 0
+    while len(keys) < n:
+        candidate = f"key-{i}"
+        if cache._prefix(candidate) == target:
+            keys.append(candidate)
+        i += 1
+    return keys
+
+
+def test_get_survives_sibling_compaction_within_ttl(tmp_path):
+    """A same-writer sibling process compacting the log shifts every frame offset.
+    A reader still inside its index_ttl window (no re-stat, no rebuild) must detect
+    the stale location on the frame re-read, rebuild once, and return the value."""
+    writer = LogCache(tmp_path / "c", writer_id="A")
+    first, second = _same_prefix_keys(writer, 2)
+    writer.set(first, "superseded")
+    time.sleep(0.01)
+    writer.set(second, "value-B")
+    time.sleep(0.01)
+    writer.set(first, "value-A")  # 3 frames on disk; compaction will keep 2
+    reader = LogCache(tmp_path / "c", writer_id="A", index_ttl=300.0)
+    assert reader.get(second) == "value-B"  # index built; offsets memorised
+    writer.compact()  # rewrites the log — every offset the reader holds is stale
+    assert reader.get(second) == "value-B"  # stale re-read -> rebuild -> correct
+    assert reader.get(first) == "value-A"
+
+
+def test_dead_keys_absent_from_index(tmp_path):
+    """Tombstoned and pre-expired winners are dropped at build time (and `delete`
+    pops in place) — dead keys cost no index memory."""
+    c = LogCache(tmp_path / "c", writer_id="A")
+    c.set("gone", "v")
+    c.delete("gone")
+    c.set("stale", "v", expire=0.01)
+    time.sleep(0.05)
+    fresh = LogCache(tmp_path / "c", writer_id="A", index_ttl=0)
+    assert fresh.get("gone", "MISS") == "MISS"
+    assert fresh.get("stale", "MISS") == "MISS"
+    for index in fresh._index.values():
+        assert "gone" not in index
+        assert "stale" not in index
+
+
+def test_entry_expiring_after_build_still_misses(tmp_path):
+    """An entry that expires between the index build and the read dies at read time
+    — liveness is re-checked against `expire_time` on every `get`."""
+    c = LogCache(tmp_path / "c", writer_id="A")
+    c.set("k", "v", expire=0.05)
+    assert c.get("k") == "v"  # alive: index entry carries its expire_time
+    time.sleep(0.1)
+    assert c.get("k", "MISS") == "MISS"  # same index entry, now past expiry
+
+
 def test_auto_compaction_on_large_log(tmp_path):
     c = LogCache(tmp_path / "c", writer_id="A", max_log_bytes=2000)
     for i in range(500):

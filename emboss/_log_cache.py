@@ -24,8 +24,18 @@ sharing a node-log are serialised by the per-writer lock file. Inodes are bounde
 
 - **Reads** consult a per-prefix in-memory index (built by scanning that
   prefix's logs once; rebuilt when a log's size changes — a peer's appends). The
-  freshness check is throttled by `index_ttl`, so warm reads are an in-memory
-  lookup. A miss just recomputes — safe under eventual consistency.
+  freshness check is throttled by `index_ttl`, so warm reads pay one in-memory
+  lookup plus one page-cached frame read. A miss just recomputes — safe under
+  eventual consistency. **The index holds locations, never values**: each entry
+  is liveness metadata plus the winning frame's `(log, offset, length)`, and
+  `get()` re-reads the frame from disk on every hit. Retaining values made a
+  process's memory scale with the whole corpus it touched — a warm sweep over a
+  53 GB production cache held ~30 GB of unpickled values per process (the
+  2026-08-10 taffy swap-thrash incident, two such processes plus CI). A location
+  can go stale when the log is rewritten under us (a sibling process compacting
+  this writer's log, a syncer replacing a peer's); the re-read detects that —
+  frame fails to parse, or parses to a different key/length — and rebuilds the
+  index once before treating the key as a miss.
 - **Writes** append a length-framed record; a torn tail from a crash is ignored.
 - **Large values spill to a shared, content-addressed pool** (`min_file_size`,
   default 32 KB): the record holds a filename reference instead of the value,
@@ -86,8 +96,11 @@ Tunables (defaults chosen via `python scripts/bench.py`):
 - `min_file_size` (32 KB) — values this big or larger spill to side files.
 - `max_log_bytes` (4 MB) — per-log size that triggers compaction.
 
-Benchmark (local SSD, 512-byte values), order of magnitude:
-    set ~10^4 ops/s     get ~10^5 ops/s (index_ttl=1.0; ~10^4/s if index_ttl=0)
+Benchmark (local SSD, ~1.5 KB values), order of magnitude:
+    set ~10^4 ops/s     get ~4x10^4 ops/s (index_ttl=1.0; each hit re-reads its
+    page-cached frame — the pre-slim-index in-memory lookup was ~10^6/s, at the
+    cost of index memory scaling with the corpus; the slim index holds ~300 B
+    per live key regardless of value size)
 The headline win is inodes: ~256 files for *any* number of small entries.
 
 `writer_id` defaults to the hostname and **must be unique per node**. Implements
@@ -120,6 +133,9 @@ _T = TypeVar("_T")
 logger = logging.getLogger(__name__)
 
 _MISSING = object()
+# `get()`'s frame re-read returns this when the stored location no longer yields the
+# expected record — the log was rewritten/replaced under us; rebuild the index and retry.
+_STALE = object()
 _HEADER = struct.Struct(">I")  # 4-byte big-endian record length
 _PROTO = b"\x80"  # pickle PROTO opcode: every blob (protocol >= 2) starts with it
 _DEFAULT_MAX_LOG_BYTES = 4 * 2**20  # compact a node's per-prefix log past 4 MB
@@ -150,6 +166,24 @@ class _Record(NamedTuple):
     store_time: float
     deleted: bool
     spill: str | None  # relative path to a side file holding the value, or None
+
+
+class _IndexEntry(NamedTuple):
+    """One live key's in-memory index entry: liveness metadata plus the frame's location.
+
+    Deliberately value-free — `get()` re-reads the frame at `(log_name, offset, length)`
+    and unpickles on every hit (page-cached, so warm reads stay cheap). Holding values
+    here made index memory scale with the corpus a process touched. Tombstoned and
+    already-expired winners are simply omitted at build time (and `delete()` pops its
+    key), so the index needs neither `deleted` nor `store_time`; `store_time` ordering
+    matters only during the build merge, where the full records are in hand.
+    """
+
+    expire_time: float | None
+    spill: str | None  # relative path to a side file holding the value, or None
+    log_name: str  # name of the log file (within the prefix dir) holding the winning frame
+    offset: int  # byte offset of the frame ([length][blob]) in that log
+    length: int  # whole frame length in bytes, header included
 
 
 def _record_from(obj: Any) -> _Record | None:
@@ -224,6 +258,7 @@ def _resync(data: bytes, after: int) -> int | None:
 
 class _ScanResult(NamedTuple):
     records: list[_Record]  # valid records in on-disk order, resynced past any tears
+    spans: list[tuple[int, int]]  # records[i]'s frame `(start, end)` byte offsets
     tear_at: int | None  # byte offset of the first torn/corrupt frame, or None
     # valid records found *after* a tear (would be stranded by a stop-reader)
     recovered: int
@@ -245,6 +280,7 @@ def _read_records(path: Path) -> _ScanResult:
     n = len(data)
     pos = 0
     records: list[_Record] = []
+    spans: list[tuple[int, int]] = []
     tear_at: int | None = None
     recovered = 0
     while pos + _HEADER.size <= n:
@@ -254,6 +290,7 @@ def _read_records(path: Path) -> _ScanResult:
             if tear_at is not None:
                 recovered += 1
             records.append(rec)
+            spans.append((pos, end))
             pos = end
             continue
         if tear_at is None:
@@ -262,14 +299,12 @@ def _read_records(path: Path) -> _ScanResult:
         if nxt is None:
             break
         pos = nxt
-    return _ScanResult(records, tear_at, recovered)
+    return _ScanResult(records, spans, tear_at, recovered)
 
 
-def _iter_records(path: Path) -> Iterator[_Record]:
-    """Yield a log's records (resyncing past torn frames — see `_read_records`). Warns when a
-    mid-log tear stranded later records, so the silent re-bill becomes visible; a benign
-    truncated final write stays quiet. `OSError` propagates on first iteration."""
-    scan = _read_records(path)
+def _warn_recovered(path: Path, scan: _ScanResult) -> None:
+    """Surface a mid-log tear that stranded later records, so the silent re-bill becomes
+    visible; a benign truncated final write (`recovered == 0`) stays quiet."""
     if scan.recovered:
         logger.warning(
             "emboss.LogCache: torn/corrupt frame(s) in %s starting at byte %d — resynced past "
@@ -280,6 +315,13 @@ def _iter_records(path: Path) -> Iterator[_Record]:
             scan.tear_at,
             scan.recovered,
         )
+
+
+def _iter_records(path: Path) -> Iterator[_Record]:
+    """Yield a log's records (resyncing past torn frames — see `_read_records`). Warns when a
+    mid-log tear stranded later records. `OSError` propagates on first iteration."""
+    scan = _read_records(path)
+    _warn_recovered(path, scan)
     yield from scan.records
 
 
@@ -405,7 +447,7 @@ class LogCache:
         self.min_file_size = min_file_size
         self.writer_id = _sanitize(writer_id or _default_writer_id())
         self._lock = threading.Lock()  # serialise this process's threads
-        self._index: dict[str, dict[str, _Record]] = {}
+        self._index: dict[str, dict[str, _IndexEntry]] = {}
         self._sig: dict[str, dict[str, int]] = {}
         self._checked: dict[str, float] = {}  # monotonic time of last freshness check
         # per-prefix auto-consolidation cooldown (monotonic timestamps)
@@ -604,7 +646,7 @@ class LogCache:
                 sig[log.name] = log.stat().st_size
         return sig
 
-    def _ensure_index(self, prefix: str) -> dict[str, _Record]:
+    def _ensure_index(self, prefix: str) -> dict[str, _IndexEntry]:
         # Throttle the on-disk freshness check: within index_ttl of the last
         # check, reuse the in-memory index (own writes are applied to it directly,
         # so only a peer's writes can be missed — for up to index_ttl).
@@ -621,15 +663,31 @@ class LogCache:
         sig = self._current_sig(prefix)
         if prefix in self._index and self._sig.get(prefix) == sig:
             return self._index[prefix]
-        index: dict[str, _Record] = {}
+        # Slim entries only: the full records (values included) live exactly as long as
+        # each log's scan. Per-key latest-wins needs `store_time` and `deleted`, so the
+        # merge tracks the winning store_time separately and drops dead winners — a
+        # tombstoned or already-expired key is simply absent from the built index.
+        index: dict[str, _IndexEntry] = {}
+        best_store: dict[str, float] = {}
+        wall_now = time.time()
         pdir = self.directory / prefix
         if pdir.is_dir():
             for log in sorted(pdir.glob("*.log")):
                 with contextlib.suppress(OSError):
-                    for rec in _iter_records(log):
-                        cur = index.get(rec.key)
-                        if cur is None or rec.store_time >= cur.store_time:
-                            index[rec.key] = rec
+                    scan = _read_records(log)
+                    _warn_recovered(log, scan)
+                    log_name = log.name
+                    for rec, (start, end) in zip(scan.records, scan.spans):
+                        prev = best_store.get(rec.key)
+                        if prev is not None and rec.store_time < prev:
+                            continue
+                        best_store[rec.key] = rec.store_time
+                        if self._live(rec, wall_now):
+                            index[rec.key] = _IndexEntry(
+                                rec.expire_time, rec.spill, log_name, start, end - start
+                            )
+                        else:
+                            index.pop(rec.key, None)  # dead winner shadows older live records
         self._index[prefix] = index
         self._sig[prefix] = sig
         # Legacy layout detection: OUR OWN `<writer_id>.spill/` dir means this prefix
@@ -649,14 +707,51 @@ class LogCache:
             and (rec.expire_time is None or rec.expire_time >= now)
         )
 
+    @staticmethod
+    def _entry_live(entry: _IndexEntry | None, now: float) -> bool:
+        # Tombstoned/expired winners never enter the index, so only a not-yet-expired
+        # `expire_time` can kill an entry between the build and this read.
+        return entry is not None and (entry.expire_time is None or entry.expire_time >= now)
+
+    def _frame_value(self, prefix: str, key: str, entry: _IndexEntry) -> Any:
+        """Re-read an inline value from its recorded frame location, or `_STALE`.
+
+        The location goes stale when the log is rewritten under us — a same-writer
+        sibling process compacting it, or a syncer replacing a peer's log — so the
+        frame is verified before the value is trusted: it must parse, span exactly
+        `entry.length` bytes, and carry `key`. A same-key frame that happens to sit
+        at the same location in a rewritten log is by construction a genuine (and
+        possibly newer) value for this key, so returning it is correct."""
+        path = self.directory / prefix / entry.log_name
+        try:
+            with open(path, "rb") as f:
+                f.seek(entry.offset)
+                data = f.read(entry.length)
+        except OSError:
+            return _STALE  # log gone or unreadable — rebuild decides what is left
+        parsed = _parse_frame(data, 0)
+        if parsed is None:
+            return _STALE
+        rec, end = parsed
+        if end != entry.length or rec.key != key:
+            return _STALE
+        return rec.value
+
     # ── append / compaction ────────────────────────────────────────────────────
 
-    def _append(self, prefix: str, rec: _Record) -> int:
+    def _append(self, prefix: str, rec: _Record) -> tuple[int, int]:
+        """Append one frame to our log; return `(frame offset, resulting log size)`.
+
+        The offset is what the caller folds into the in-memory index — under the
+        writer flock nothing else can append between the write and the stat, so
+        `size - len(frame)` is exactly where this frame starts."""
         path = self._log_path(prefix)
+        frame = _frame(rec)
         with self._writer_lock(prefix):
             with open(path, "ab") as f:
-                f.write(_frame(rec))
-            return path.stat().st_size
+                f.write(frame)
+            size = path.stat().st_size
+        return size - len(frame), size
 
     def compact(self, prefix: str | None = None) -> None:
         """Rewrite this node's own log(s), dropping dead/superseded/expired records
@@ -1349,37 +1444,58 @@ class LogCache:
     # ── core API ────────────────────────────────────────────────────────────
 
     def get(self, key: Any, default: Any = None) -> Any:
-        now = time.time()
+        skey = str(key)
         prefix = self._prefix(key)
-        with self._lock:
-            rec = self._ensure_index(prefix).get(str(key))
-        if rec is None or not self._live(rec, now):
-            return default
-        if rec.spill:
-            try:
-                return self._spill_read(rec.spill)
-            except FileNotFoundError:
-                return default  # spill not present yet (log synced before it) -> miss
-            except (
-                OSError
-            ) as exc:  # persistent I/O error (EACCES/EIO): warn, don't hide
-                logger.warning(
-                    "emboss.LogCache: spill file %s for key %r could not be read "
-                    "(%s); treating as a miss.",
-                    rec.spill,
-                    key,
-                    exc,
-                )
+        for retry in (False, True):
+            now = time.time()
+            with self._lock:
+                entry = self._ensure_index(prefix).get(skey)
+            if not self._entry_live(entry, now):
                 return default
-            except Exception:  # noqa: BLE001 — corrupt/unpicklable spill: warn, miss (don't crash)
+            assert entry is not None  # narrowed by _entry_live
+            if entry.spill:
+                try:
+                    return self._spill_read(entry.spill)
+                except FileNotFoundError:
+                    return default  # spill not present yet (log synced before it) -> miss
+                except (
+                    OSError
+                ) as exc:  # persistent I/O error (EACCES/EIO): warn, don't hide
+                    logger.warning(
+                        "emboss.LogCache: spill file %s for key %r could not be read "
+                        "(%s); treating as a miss.",
+                        entry.spill,
+                        key,
+                        exc,
+                    )
+                    return default
+                except Exception:  # noqa: BLE001 — corrupt/unpicklable spill: warn, miss (don't crash)
+                    logger.warning(
+                        "emboss.LogCache: spill file %s for key %r is present but "
+                        "unreadable (corrupt/partial write); treating as a miss.",
+                        entry.spill,
+                        key,
+                    )
+                    return default
+            value = self._frame_value(prefix, skey, entry)
+            if value is not _STALE:
+                return value
+            # The location no longer yields this key's frame: the log was rewritten
+            # or replaced under us. Drop the prefix state and rebuild once; a second
+            # stale read means the on-disk state itself is unreadable — a warned miss.
+            with self._lock:
+                self._index.pop(prefix, None)
+                self._sig.pop(prefix, None)
+                self._checked.pop(prefix, None)
+            if retry:
                 logger.warning(
-                    "emboss.LogCache: spill file %s for key %r is present but "
-                    "unreadable (corrupt/partial write); treating as a miss.",
-                    rec.spill,
+                    "emboss.LogCache: frame for key %r in %s/%s is unreadable even "
+                    "after an index rebuild; treating as a miss.",
                     key,
+                    prefix,
+                    entry.log_name,
                 )
-                return default
-        return rec.value
+        return default
 
     def set(
         self, key: Any, value: Any, expire: float | None = None, **_kwargs: Any
@@ -1402,8 +1518,10 @@ class LogCache:
             # guaranteed for a lone-writer prefix by the size trigger below; a
             # multi-writer prefix sweeps only via an explicit consolidate(). A
             # spill orphaned by an append failure below likewise waits for a sweep).
-            log_size = self._append(prefix, rec)
-            index[rec.key] = rec
+            offset, log_size = self._append(prefix, rec)
+            index[rec.key] = _IndexEntry(
+                rec.expire_time, rec.spill, self._log_path(prefix).name, offset, log_size - offset
+            )
             self._sig.setdefault(prefix, {})[self._log_path(prefix).name] = log_size
             last_pass = self._consolidated_at.get(prefix)
             cooled_down = (
@@ -1447,11 +1565,13 @@ class LogCache:
         with self._lock:
             index = self._ensure_index(prefix)
             old = index.get(str(key))
-            if not self._live(old, now):
+            if not self._entry_live(old, now):
                 return False
             tombstone = _Record(str(key), None, None, now, True, None)
-            log_size = self._append(prefix, tombstone)
-            index[tombstone.key] = tombstone
+            _, log_size = self._append(prefix, tombstone)
+            # Dead keys are never indexed (the build drops tombstoned winners), so a
+            # delete pops rather than folding the tombstone in.
+            index.pop(str(key), None)
             self._sig.setdefault(prefix, {})[self._log_path(prefix).name] = log_size
             # The tombstoned value's pool file is collected by the consolidation
             # sweep once nothing references it — never deleted on the write path.
@@ -1509,18 +1629,37 @@ class LogCache:
         return dropped
 
     def volume(self) -> int:
-        """Total bytes of the live value payloads (across all writers)."""
-        with self._lock:
-            return sum(self._rec_size(rec) for rec in self._iter_live())
+        """Total bytes of the live value payloads (across all writers).
 
-    def _iter_live(self) -> Iterator[_Record]:
+        Inline values are re-read from their frames (the index holds locations, not
+        values), so this walks the corpus — an admin call, not a hot-path one."""
+        with self._lock:
+            return sum(
+                self._entry_size(prefix, key, entry)
+                for prefix, key, entry in self._iter_live()
+            )
+
+    def _entry_size(self, prefix: str, key: str, entry: _IndexEntry) -> int:
+        """One live entry's value-payload size in bytes; 0 when unreadable (matching
+        `_rec_size`'s treatment of an unreachable spill)."""
+        if entry.spill:
+            try:
+                return (self.directory / entry.spill).stat().st_size
+            except OSError:
+                return 0
+        value = self._frame_value(prefix, key, entry)
+        if value is _STALE:
+            return 0
+        return len(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL))
+
+    def _iter_live(self) -> Iterator[tuple[str, str, _IndexEntry]]:
         now = time.time()
         for pdir in self.directory.iterdir():
             if not pdir.is_dir():
                 continue
-            for rec in self._ensure_index(pdir.name).values():
-                if self._live(rec, now):
-                    yield rec
+            for key, entry in self._ensure_index(pdir.name).items():
+                if self._entry_live(entry, now):
+                    yield pdir.name, key, entry
 
     def __len__(self) -> int:
         with self._lock:
@@ -1528,7 +1667,7 @@ class LogCache:
 
     def __iter__(self) -> Iterator[str]:
         with self._lock:
-            keys = [rec.key for rec in self._iter_live()]
+            keys = [key for _, key, _ in self._iter_live()]
         return iter(keys)
 
     iterkeys = __iter__
