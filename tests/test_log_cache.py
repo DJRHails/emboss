@@ -287,8 +287,8 @@ def test_corrupt_spill_is_a_warned_miss(tmp_path, caplog):
         tmp_path / "c", writer_id="A", min_file_size=1
     )  # force every value to spill
     c.set("k", "value-that-spills")
-    rec = c._ensure_index(c._prefix("k"))["k"]
-    (c.directory / rec.spill).write_bytes(b"\x00not-a-pickle")  # corrupt the spill
+    spill = next((c.directory / c._prefix("k") / "spill").glob("*.val"))
+    spill.write_bytes(b"\x00not-a-pickle")  # corrupt the spill
     fresh = LogCache(tmp_path / "c", writer_id="A", min_file_size=1, index_ttl=0)
     with caplog.at_level("WARNING"):
         assert fresh.get("k", "MISS") == "MISS"
@@ -300,8 +300,7 @@ def test_missing_spill_is_a_quiet_miss(tmp_path, caplog):
     a present-but-unreadable spill or a persistent I/O error warns."""
     c = LogCache(tmp_path / "c", writer_id="A", min_file_size=1)
     c.set("k", "value-that-spills")
-    rec = c._ensure_index(c._prefix("k"))["k"]
-    (c.directory / rec.spill).unlink()  # spill not synced yet
+    next((c.directory / c._prefix("k") / "spill").glob("*.val")).unlink()  # not synced yet
     fresh = LogCache(tmp_path / "c", writer_id="A", min_file_size=1, index_ttl=0)
     with caplog.at_level("WARNING"):
         assert fresh.get("k", "MISS") == "MISS"
@@ -432,21 +431,26 @@ def test_compaction_shrinks_and_keeps_latest(tmp_path):
 # ── slim index: the in-memory index holds frame locations, never values ──────
 
 
-def test_index_entries_hold_no_values(tmp_path):
-    """The regression guard for the corpus-in-RAM leak: a built index must not retain
-    value objects, or a long-lived process's memory scales with every prefix it
-    touches (a warm sweep over a 53 GB production corpus held ~30 GB of unpickled
-    values per process — the 2026-08-10 incident)."""
+def test_index_holds_packed_locations_not_values(tmp_path):
+    """The regression guard for the corpus-in-RAM leak: a built index must be the packed
+    digest array — fixed bytes per live key, no value (or even key) objects — or a
+    long-lived process's memory scales with every prefix it touches (a warm sweep over
+    a 53 GB production corpus held ~30 GB of unpickled values per process — the
+    2026-08-10 incident)."""
+    from emboss._log_cache import _ENTRY, _PackedIndex
+
     c = LogCache(tmp_path / "c", writer_id="A")
     payload = {"payload": list(range(100))}
     c.set("k", payload)
     fresh = LogCache(tmp_path / "c", writer_id="A", index_ttl=0)
     assert fresh.get("k") == payload  # read through the location, not a retained object
-    entries = [e for index in fresh._index.values() for e in index.values()]
-    assert entries, "the read must have built an index"
-    for entry in entries:
-        assert not hasattr(entry, "value")
-        assert entry.length > 0  # a real frame location, re-read on every hit
+    assert fresh._index, "the read must have built an index"
+    for index in fresh._index.values():
+        assert type(index) is _PackedIndex
+        assert len(index.entries) % _ENTRY.size == 0
+        assert not index.overlay  # a fresh build carries no own-write overlay
+    prefix_index = fresh._index[fresh._prefix("k")]
+    assert len(prefix_index.entries) == _ENTRY.size  # exactly one live key, ~30 bytes
 
 
 def _same_prefix_keys(cache, n):
@@ -481,7 +485,9 @@ def test_get_survives_sibling_compaction_within_ttl(tmp_path):
 
 def test_dead_keys_absent_from_index(tmp_path):
     """Tombstoned and pre-expired winners are dropped at build time (and `delete`
-    pops in place) — dead keys cost no index memory."""
+    marks the overlay in place) — dead keys cost no packed-index memory."""
+    from emboss._log_cache import _digest
+
     c = LogCache(tmp_path / "c", writer_id="A")
     c.set("gone", "v")
     c.delete("gone")
@@ -490,9 +496,9 @@ def test_dead_keys_absent_from_index(tmp_path):
     fresh = LogCache(tmp_path / "c", writer_id="A", index_ttl=0)
     assert fresh.get("gone", "MISS") == "MISS"
     assert fresh.get("stale", "MISS") == "MISS"
-    for index in fresh._index.values():
-        assert "gone" not in index
-        assert "stale" not in index
+    for key in ("gone", "stale"):
+        index = fresh._index[fresh._prefix(key)]
+        assert index.lookup(_digest(key)) is None
 
 
 def test_entry_expiring_after_build_still_misses(tmp_path):
