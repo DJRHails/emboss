@@ -49,6 +49,35 @@ def test_basemodel_round_trip(cache):
     assert calls["n"] == 1
 
 
+def test_string_annotation_still_encodes_model(cache):
+    """PEP 563 (`from __future__ import annotations`) turns the return annotation
+    into a string. Detection must resolve it — otherwise the model pickles by
+    class reference and the cached value dies with the defining module."""
+
+    @cached(cache)
+    def f() -> "M":  # noqa: UP037 — the string annotation IS the test subject
+        return M(name="stringy", n=2)
+
+    r1 = f()
+    assert isinstance(r1, M) and r1.name == "stringy"
+    # the STORED value is the model_dump dict, not a pickled M instance
+    stored = cache[next(iter(cache))]
+    assert isinstance(stored, dict) and stored["name"] == "stringy"
+    assert isinstance(f(), M)  # decoded back to a model on a warm hit
+
+
+def test_unresolvable_string_annotation_falls_back(cache):
+    """A string annotation naming something not importable at decoration time
+    (e.g. behind TYPE_CHECKING) must not raise — encoding just stays off."""
+
+    @cached(cache)
+    def f() -> "NotDefinedAnywhere":  # noqa: F821, UP037 — deliberately unresolvable
+        return {"plain": True}
+
+    assert f() == {"plain": True}
+    assert f() == {"plain": True}
+
+
 def test_list_of_basemodel_round_trip(cache):
     calls = {"n": 0}
 

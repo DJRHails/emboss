@@ -468,6 +468,21 @@ def cached(
             return_anno = inspect.signature(func).return_annotation
         except (TypeError, ValueError):
             return_anno = inspect.Parameter.empty
+        if isinstance(return_anno, str):
+            # PEP 563 (`from __future__ import annotations`) delivers the annotation
+            # as a string `_model_info` cannot see a BaseModel in — silently
+            # disabling the model_dump encoding for every function in such a module
+            # (its models then pickle by class reference and die with the defining
+            # code). `get_type_hints` resolves it (including nested forward refs);
+            # a name unresolvable at decoration time (e.g. behind TYPE_CHECKING, in
+            # this or any parameter annotation) falls back to no model encoding, as
+            # before.
+            try:
+                return_anno = typing.get_type_hints(func).get(
+                    "return", inspect.Parameter.empty
+                )
+            except Exception:  # noqa: BLE001 — unresolvable annotation → passthrough
+                return_anno = inspect.Parameter.empty
         model_cls, container = _model_info(return_anno)
         is_async = asyncio.iscoroutinefunction(func)
 
