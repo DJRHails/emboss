@@ -274,10 +274,48 @@ def _record_from(obj: Any) -> _Record | None:
     return _Record(*obj)
 
 
-def _parse_frame(data: bytes, pos: int) -> tuple[_Record, int] | None:
-    """Try to parse one `[length][blob]` frame at `pos`; return `(record, end)` or
-    `None` if the header is short, the blob runs past EOF, the pickle does not
-    consume exactly `length` bytes, or it does not decode into a 6-field record.
+class _SkewStub:
+    """Placeholder for a value class that no longer imports (deleted or branch-only
+    caller code). A skewed record's plain fields (`key`, times, `deleted`, `spill`)
+    are genuine; only its `value` graph holds stubs — it is never served to a read
+    and never re-pickled (a skewed frame moves byte-verbatim or not at all)."""
+
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    def __setstate__(self, _state: Any) -> None:
+        pass
+
+
+class _LenientUnpickler(pickle.Unpickler):
+    """An unpickler that substitutes `_SkewStub` for unimportable classes.
+
+    Module skew — a record whose pickled value references a class the *scanning*
+    process cannot import — is not corruption: the frame is intact and a process
+    that can import the class reads it fine. Treating the `ModuleNotFoundError`
+    as a torn frame (what a plain unpickle does) misdiagnosed an entire
+    production corpus as corrupt, and made every log rewrite silently delete the
+    records (the rewrite keeps only frames it can re-parse)."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.skewed = False
+
+    def find_class(self, module: str, name: str) -> Any:
+        try:
+            return super().find_class(module, name)
+        except (ImportError, AttributeError):
+            self.skewed = True
+            return _SkewStub
+
+
+def _parse_frame_ex(data: bytes, pos: int) -> tuple[_Record, int, bool] | None:
+    """Try to parse one `[length][blob]` frame at `pos`; return
+    `(record, end, skewed)` or `None` if the header is short, the blob runs past
+    EOF, the pickle does not consume exactly `length` bytes, or it does not
+    decode into a 6-field record. `skewed` is True when the blob is structurally
+    intact but references classes this process cannot import — the record's
+    plain fields are genuine, its `value` holds `_SkewStub`s.
 
     The exact-length check is what makes `_resync` trustworthy: a genuine frame's
     blob is a single pickle with no trailing bytes, so any false anchor whose
@@ -291,14 +329,26 @@ def _parse_frame(data: bytes, pos: int) -> tuple[_Record, int] | None:
     if blob_end > len(data):
         return None  # truncated / corrupt length field
     reader = io.BytesIO(data[blob_start:blob_end])
+    unpickler = _LenientUnpickler(reader)
     try:
-        obj = pickle.Unpickler(reader).load()
+        obj = unpickler.load()
     except Exception:  # noqa: BLE001 — torn/corrupt frame; caller resyncs
         return None
     if reader.tell() != length:
         return None  # trailing bytes → not a genuine frame boundary
     rec = _record_from(obj)
-    return (rec, blob_end) if rec is not None else None
+    return (rec, blob_end, unpickler.skewed) if rec is not None else None
+
+
+def _parse_frame(data: bytes, pos: int) -> tuple[_Record, int] | None:
+    """`_parse_frame_ex` restricted to fully-importable records — the read path's
+    parser: a skewed record must never be *served* (its `value` is stubs), only
+    carried (see `_scan_bytes`)."""
+    parsed = _parse_frame_ex(data, pos)
+    if parsed is None or parsed[2]:
+        return None
+    rec, end, _ = parsed
+    return rec, end
 
 
 def _resync(data: bytes, after: int) -> int | None:
@@ -308,53 +358,56 @@ def _resync(data: bytes, after: int) -> int | None:
     stream is a candidate blob start whose frame begins `_HEADER.size` bytes
     earlier. Return the first such frame-start that re-parses; `None` at EOF. The
     search begins past `after`'s header so the returned frame is strictly after the
-    torn one (guaranteeing forward progress)."""
+    torn one (guaranteeing forward progress). A skewed frame is a genuine frame
+    boundary, so it anchors the resync like any other (`_parse_frame_ex`, not the
+    strict `_parse_frame`) — otherwise every skewed record sitting between a tear
+    and the next importable record would be skipped as part of the gap."""
     search = after + _HEADER.size + 1
     while True:
         idx = data.find(_PROTO, search)
         if idx < 0:
             return None
         frame_start = idx - _HEADER.size
-        if frame_start > after and _parse_frame(data, frame_start) is not None:
+        if frame_start > after and _parse_frame_ex(data, frame_start) is not None:
             return frame_start
         search = idx + 1
 
 
 class _ScanResult(NamedTuple):
-    records: list[_Record]  # valid records in on-disk order, resynced past any tears
+    records: list[_Record]  # servable records in on-disk order, resynced past any tears
     spans: list[tuple[int, int]]  # records[i]'s frame `(start, end)` byte offsets
     tear_at: int | None  # byte offset of the first torn/corrupt frame, or None
-    # valid records found *after* a tear (would be stranded by a stop-reader)
+    # servable records found *after* a tear (would be stranded by a stop-reader)
     recovered: int
+    # Intact frames whose values reference classes THIS process cannot import
+    # (module skew — deleted/branch-only caller code), with their spans. Invisible
+    # to reads (`value` is stubs), but log rewrites must carry them byte-verbatim:
+    # a process that can import the classes reads them fine, so dropping them is
+    # data loss, not cleanup. Deliberately last-with-a-default so third-party
+    # constructions of the tuple keep working.
+    skewed: tuple[tuple[_Record, tuple[int, int]], ...] = ()
 
 
-def _read_records(path: Path) -> _ScanResult:
-    """Read every valid record from a log, **skipping torn/corrupt frames and resyncing** to the
-    next valid frame rather than stopping at the first bad one.
-
-    A torn frame (a crash or a concurrent container teardown mid-append) can land *mid-log* with
-    valid frames after it. Stopping at the first bad frame — the old behaviour — stranded every
-    record past the tear: invisible to reads, so each silently re-executes and re-bills forever.
-    Here a bad frame is skipped (resynced via the PROTO-opcode anchor). A benign truncated *final*
-    write (the documented crash-mid-append case) recovers nothing past it (`recovered == 0`).
-
-    `OSError` from the read propagates — a caller that must not treat an unreadable log as empty
-    (consolidation, which would then prune it) relies on that."""
-    data = path.read_bytes()  # OSError propagates by design (see docstring)
+def _scan_bytes(data: bytes) -> _ScanResult:
+    """`_read_records` over in-memory log bytes (the caller already read the file)."""
     n = len(data)
     pos = 0
     records: list[_Record] = []
     spans: list[tuple[int, int]] = []
+    skewed: list[tuple[_Record, tuple[int, int]]] = []
     tear_at: int | None = None
     recovered = 0
     while pos + _HEADER.size <= n:
-        parsed = _parse_frame(data, pos)
+        parsed = _parse_frame_ex(data, pos)
         if parsed is not None:
-            rec, end = parsed
-            if tear_at is not None:
-                recovered += 1
-            records.append(rec)
-            spans.append((pos, end))
+            rec, end, is_skewed = parsed
+            if is_skewed:
+                skewed.append((rec, (pos, end)))
+            else:
+                if tear_at is not None:
+                    recovered += 1
+                records.append(rec)
+                spans.append((pos, end))
             pos = end
             continue
         if tear_at is None:
@@ -363,7 +416,78 @@ def _read_records(path: Path) -> _ScanResult:
         if nxt is None:
             break
         pos = nxt
-    return _ScanResult(records, spans, tear_at, recovered)
+    return _ScanResult(records, spans, tear_at, recovered, tuple(skewed))
+
+
+def _read_records(path: Path) -> _ScanResult:
+    """Read every record from a log, **skipping torn/corrupt frames and resyncing** to the
+    next valid frame rather than stopping at the first bad one.
+
+    A torn frame (a crash or a concurrent container teardown mid-append) can land *mid-log* with
+    valid frames after it. Stopping at the first bad frame — the old behaviour — stranded every
+    record past the tear: invisible to reads, so each silently re-executes and re-bills forever.
+    Here a bad frame is skipped (resynced via the PROTO-opcode anchor). A benign truncated *final*
+    write (the documented crash-mid-append case) recovers nothing past it (`recovered == 0`).
+
+    Only STRUCTURAL damage counts as a tear. An intact frame whose value classes this process
+    cannot import lands in `skewed` instead of `records`: unservable here, but genuine data a
+    differently-provisioned process can read — see `_ScanResult.skewed`.
+
+    `OSError` from the read propagates — a caller that must not treat an unreadable log as empty
+    (consolidation, which would then prune it) relies on that."""
+    # OSError from the read propagates by design (see docstring).
+    return _scan_bytes(path.read_bytes())
+
+
+class _Winner(NamedTuple):
+    """One merged record with the provenance a log rewrite needs: which log it
+    came from (`src`), its frame's byte span there, and whether it is skewed
+    (must move byte-verbatim — its `value` holds stubs and cannot be re-pickled)."""
+
+    rec: _Record
+    span: tuple[int, int]
+    skewed: bool
+    src: str
+
+
+def _scan_entries(scan: _ScanResult, src: str) -> list[_Winner]:
+    """A scan's records — servable and skewed — as provenance-carrying entries in
+    on-disk order (the order latest-wins tie-breaking has always used)."""
+    entries = [
+        _Winner(rec, span, False, src)
+        for rec, span in zip(scan.records, scan.spans, strict=True)
+    ]
+    entries += [_Winner(rec, span, True, src) for rec, span in scan.skewed]
+    entries.sort(key=lambda entry: entry.span[0])
+    return entries
+
+
+def _select_winners(
+    entries: list[_Winner],
+) -> tuple[dict[str, _Winner], dict[str, _Winner]]:
+    """Per-key latest-wins, tracked separately for servable and skewed records.
+
+    Returns `(servable, skewed)` winner tables. The servable winner is what reads
+    serve (skewed records are invisible to the read path), so it survives even
+    when a newer skewed record exists — dropping it would turn today's hit into
+    a miss. A skewed winner survives only while it is strictly newer than the
+    key's servable winner (which may be a tombstone): it is the newest data for
+    the key, superseded only by a newer servable write."""
+    servable: dict[str, _Winner] = {}
+    skewed: dict[str, _Winner] = {}
+    for entry in entries:
+        table = skewed if entry.skewed else servable
+        cur = table.get(entry.rec.key)
+        if cur is None or entry.rec.store_time >= cur.rec.store_time:
+            table[entry.rec.key] = entry
+    for key, skewed_winner in list(skewed.items()):
+        newest_servable = servable.get(key)
+        if (
+            newest_servable is not None
+            and newest_servable.rec.store_time >= skewed_winner.rec.store_time
+        ):
+            del skewed[key]  # superseded by a servable record or tombstone
+    return servable, skewed
 
 
 def _warn_recovered(path: Path, scan: _ScanResult) -> None:
@@ -916,20 +1040,25 @@ class LogCache:
             return
         now = time.time()
         with self._writer_lock(prefix):
-            scan = _read_records(path)
-            latest: dict[str, _Record] = {}
-            for rec in scan.records:
-                cur = latest.get(rec.key)
-                if cur is None or rec.store_time >= cur.store_time:
-                    latest[rec.key] = rec
-            keep = [r for r in latest.values() if self._live(r, now)]
+            # One consistent read: the spans stay valid under the held flock.
+            data = path.read_bytes()
+            scan = _scan_bytes(data)
+            servable, skewed = _select_winners(_scan_entries(scan, path.name))
+            keep = [w for w in servable.values() if self._live(w.rec, now)]
             if self.size_limit is not None:
-                keep = self._trim_to_limit(keep, lambda rec: rec)
-            keep.sort(key=lambda r: r.store_time)
+                keep = self._trim_to_limit(keep, lambda w: w.rec)
+            # Skewed winners ride along byte-verbatim, exempt from the size trim:
+            # their true value size is in bytes we must not unpickle, and dropping
+            # the newest data for a key to satisfy a best-effort bound would be
+            # silent loss (`size_limit` already documents itself as best-effort).
+            keep += [w for w in skewed.values() if self._live(w.rec, now)]
+            keep.sort(key=lambda w: w.rec.store_time)
             tmp = path.with_name(path.name + ".compact.tmp")
             with open(tmp, "wb") as out:
-                for rec in keep:
-                    out.write(_frame(rec))
+                out.writelines(
+                    data[w.span[0] : w.span[1]] if w.skewed else _frame(w.rec)
+                    for w in keep
+                )
             os.replace(tmp, path)
         # a real mid-log tear was healed; a benign final tear stays quiet
         if scan.recovered:
@@ -1135,21 +1264,30 @@ class LogCache:
             # Our rewritten log carries only records WE are responsible for: the
             # per-key winners that live in our own log or in a log being pruned.
             # A winner in an unpruned peer log stays exactly where it is.
-            ours = [
-                (rec, src)
-                for rec, src in keep
-                if src == target.name or src in prune_logs
-            ]
+            ours = [w for w in keep if w.src == target.name or w.src in prune_logs]
+            # A skewed winner in a PRUNED source cannot be folded: a fold moves
+            # bytes verbatim, and only our own log's bytes are pinned under this
+            # flock — a pruned peer log or conflict copy can be replaced by the
+            # syncer mid-pass. Protect the source instead: it survives this
+            # prune and folds on a later pass (once the classes import again),
+            # or never — preservation over tidiness.
+            protected = {w.src for w in ours if w.skewed and w.src != target.name}
+            ours = [w for w in ours if not (w.skewed and w.src != target.name)]
             if self.size_limit is not None:
-                ours = self._trim_to_limit(ours, lambda pair: pair[0])
-            ours.sort(key=lambda pair: pair[0].store_time)
+                trimmed = self._trim_to_limit(
+                    [w for w in ours if not w.skewed], lambda w: w.rec
+                )
+                # Skewed winners are exempt from the trim (see _compact_prefix).
+                ours = trimmed + [w for w in ours if w.skewed]
+            ours.sort(key=lambda w: w.rec.store_time)
             consolidated, failed_adoptions, absent_spill_sources = self._resolve_spills(
                 prefix, ours
             )
             # Logs that must survive the prune despite being fold-eligible:
             # a transient-fault adoption (records dropped from the merge, legacy
-            # bytes still on disk), and a CONFLICT copy whose folded record hit
-            # an absent spill (sync lag: the log arrived before its value). The
+            # bytes still on disk), a CONFLICT copy whose folded record hit
+            # an absent spill (sync lag: the log arrived before its value), and
+            # a pruned source holding a skewed winner (protected above). The
             # copy is that record's only durable carrier — unlike a caller-pruned
             # dead writer's asserted-gone value — so it is kept until the spill
             # lands and a later pass folds it; strictly better than silent loss.
@@ -1157,21 +1295,43 @@ class LogCache:
                 set(unread)
                 | {f"{w}.log" for w in failed_adoptions}
                 | (conflict_logs & absent_spill_sources)
+                | protected
             )
-            self._write_consolidated(target, consolidated)
+            try:
+                # One consistent read of our own bytes for the verbatim skewed
+                # spans (stable: the flock has been held since before the scan).
+                own_data = target.read_bytes()
+            except FileNotFoundError:
+                own_data = b""  # no own log yet → no own skewed spans to carry
+            except OSError as exc:
+                self._consolidated_at[prefix] = time.monotonic()  # cooldown the retry
+                logger.warning(
+                    "emboss.LogCache: could not re-read our own log %s (%s) — "
+                    "aborting the consolidation pass (nothing was changed; it "
+                    "retries later).",
+                    target,
+                    exc,
+                )
+                return
+            self._write_consolidated(target, consolidated, own_data)
             self._prune_consolidated_sources(
                 pdir, snapshot, target.name, keep_sources, prune_logs
             )
             # The pool's reference set spans every log — records staying put in
-            # unpruned peer logs keep their spills exactly as our own do. Failed
+            # unpruned peer logs (or protected pruned sources) keep their spills
+            # exactly as our own do. Failed
             # adoptions do NOT blind the sweep (unlike unreadable logs): legacy
             # references never point into the pool, and every pool-referencing
             # record from those same logs was merged into `consolidated` — so
             # the pool reference set is still complete.
-            kept_spills = {r.spill for r in consolidated if r.spill} | {
-                rec.spill
-                for rec, src in keep
-                if rec.spill and src != target.name and src not in prune_logs
+            kept_spills = {w.rec.spill for w in consolidated if w.rec.spill} | {
+                w.rec.spill
+                for w in keep
+                if w.rec.spill
+                and (
+                    (w.src != target.name and w.src not in prune_logs)
+                    or w.src in protected
+                )
             }
             self._sweep_shared_spills(pdir, kept_spills, unread, now)
             self._sweep_legacy_namespaces(
@@ -1327,17 +1487,20 @@ class LogCache:
         sources: dict[str, tuple[int, int]],
         now: float,
         prune_logs: AbstractSet[str],
-    ) -> tuple[list[tuple[_Record, str]], AbstractSet[str]]:
+    ) -> tuple[list[_Winner], AbstractSet[str]]:
         """Merge all source logs into the live set: latest `store_time` wins per
         key (a newer overwrite/tombstone under ANY writer beats an older one).
         `sorted(sources)` makes the merge order deterministic for tie handling.
+        Servable and skewed records are tracked as separate winner tracks (see
+        `_select_winners`), so the newest skewed data for a key survives without
+        hiding the servable record reads actually serve.
 
-        Returns `(keep, unread)`: the live `(record, source-log name)` winners —
+        Returns `(keep, unread)`: the live provenance-carrying winners —
         provenance decides which records our rewrite may carry and which belong
         to a peer log we must not touch — and the names of source logs that
         could NOT be fully read: a transient read error must not make a log
         prunable, or its unmerged records would be lost."""
-        latest: dict[str, tuple[_Record, str]] = {}
+        entries: list[_Winner] = []
         unread: set[str] = set()
         for name in sorted(sources):
             try:
@@ -1380,17 +1543,16 @@ class LogCache:
                     scan.tear_at,
                     scan.recovered,
                 )
-            for rec in scan.records:
-                cur = latest.get(rec.key)
-                if cur is None or rec.store_time >= cur[0].store_time:
-                    latest[rec.key] = (rec, name)
-        keep = [(r, src) for r, src in latest.values() if self._live(r, now)]
-        keep.sort(key=lambda pair: pair[0].store_time)
+            entries.extend(_scan_entries(scan, name))
+        servable, skewed = _select_winners(entries)
+        keep = [w for w in servable.values() if self._live(w.rec, now)]
+        keep += [w for w in skewed.values() if self._live(w.rec, now)]
+        keep.sort(key=lambda w: w.rec.store_time)
         return keep, unread
 
     def _resolve_spills(
-        self, prefix: str, keep: list[tuple[_Record, str]]
-    ) -> tuple[list[_Record], AbstractSet[str], AbstractSet[str]]:
+        self, prefix: str, keep: list[_Winner]
+    ) -> tuple[list[_Winner], AbstractSet[str], AbstractSet[str]]:
         """Make every kept spill reference point at an existing pool file.
 
         A pool reference is kept when its file exists and dropped when it does
@@ -1419,21 +1581,35 @@ class LogCache:
         arrived before its value). The caller uses the last to protect a
         conflict copy from deletion until its spill lands, so folding it never
         loses the record."""
-        consolidated: list[_Record] = []
+        consolidated: list[_Winner] = []
         failed: set[str] = set()
         absent_spill_sources: set[str] = set()
         migrated = 0
         dropped = 0
-        for rec, src in keep:
+        for w in keep:
+            rec = w.rec
             if not rec.spill:
-                consolidated.append(rec)
+                consolidated.append(w)
+                continue
+            if w.skewed:
+                # A skewed record moves byte-verbatim, so its spill reference
+                # cannot be repointed (that would re-pickle a stubbed value). In
+                # practice this branch is near-dead — a spilled record's frame
+                # holds `value=None`, so module skew cannot arise in it — but a
+                # legacy reference is protected like a failed adoption so the
+                # namespace survives for the pass that can finally migrate it.
+                if not self._is_shared_spill(prefix, rec.spill):
+                    namespace = rec.spill.split("/")[1] if "/" in rec.spill else ""
+                    if namespace.endswith(".spill"):
+                        failed.add(namespace.removesuffix(".spill"))
+                consolidated.append(w)
                 continue
             if self._is_shared_spill(prefix, rec.spill):
                 try:
                     (self.directory / rec.spill).stat()
                 except FileNotFoundError:
                     dropped += 1  # pool file absent (sync lag) → drop, never dangle
-                    absent_spill_sources.add(src)
+                    absent_spill_sources.add(w.src)
                 except OSError as exc:
                     # A transient stat fault is NOT absence: keep the record
                     # (its path also keeps the file out of the sweep); reads
@@ -1444,21 +1620,21 @@ class LogCache:
                         rec.spill,
                         exc,
                     )
-                    consolidated.append(rec)
+                    consolidated.append(w)
                 else:
-                    consolidated.append(rec)
+                    consolidated.append(w)
                 continue
             try:
                 new_rel = self._pool_adopt(prefix, rec.spill)
             except OSError as exc:
-                self._defer_failed_adoption(rec, src, exc, consolidated, failed)
+                self._defer_failed_adoption(w, exc, consolidated, failed)
                 continue
             if new_rel is None:
                 dropped += 1  # legacy spill absent (sync lag) → drop, never dangle
-                absent_spill_sources.add(src)
+                absent_spill_sources.add(w.src)
                 continue
             migrated += 1
-            consolidated.append(rec._replace(spill=new_rel, value=None))
+            consolidated.append(w._replace(rec=rec._replace(spill=new_rel, value=None)))
         if migrated:
             logger.info(
                 "emboss.LogCache: migrated %d legacy per-writer spill(s) in %s/ into the "
@@ -1477,10 +1653,9 @@ class LogCache:
 
     def _defer_failed_adoption(
         self,
-        rec: _Record,
-        src: str,
+        w: _Winner,
         exc: OSError,
-        consolidated: list[_Record],
+        consolidated: list[_Winner],
         failed: MutableSet[str],
     ) -> None:
         """Bookkeeping for a legacy adoption that hit a transient fault.
@@ -1497,35 +1672,42 @@ class LogCache:
         writer anyway, and when an out-of-contract reference names a different
         writer's namespace, both the holding log and the referenced bytes
         must survive for the retry."""
-        assert rec.spill is not None
-        namespace = rec.spill.split("/")[1] if "/" in rec.spill else ""
+        assert w.rec.spill is not None
+        namespace = w.rec.spill.split("/")[1] if "/" in w.rec.spill else ""
         if namespace.endswith(".spill"):
             failed.add(namespace.removesuffix(".spill"))
-        if src == f"{self.writer_id}.log":
-            consolidated.append(rec)  # our rewrite must not shed the record
+        if w.src == f"{self.writer_id}.log":
+            consolidated.append(w)  # our rewrite must not shed the record
             action = "keeping its record un-repointed for a retry on a later pass"
         else:
-            failed.add(src.removesuffix(".log"))
+            failed.add(w.src.removesuffix(".log"))
             action = "keeping its source log and namespace for a retry on a later pass"
         logger.warning(
             "emboss.LogCache: could not adopt legacy spill %s into the pool (%s) — %s.",
-            rec.spill,
+            w.rec.spill,
             exc,
             action,
         )
 
     @staticmethod
-    def _write_consolidated(target: Path, consolidated: list[_Record]) -> None:
+    def _write_consolidated(
+        target: Path, consolidated: list[_Winner], own_data: bytes
+    ) -> None:
         """Write the merged records to our log atomically (fsync + rename). An
         empty result means nothing live remains → drop our log entirely rather
-        than leave a zero-record file lying around."""
+        than leave a zero-record file lying around. A skewed winner — only ever
+        from our OWN log here (see `_consolidate_prefix`) — is copied
+        byte-verbatim out of `own_data` via its span; re-framing it would
+        pickle its stubbed value."""
         if not consolidated:
             target.unlink(missing_ok=True)
             return
         tmp = target.with_name(target.name + ".consolidate.tmp")
         with open(tmp, "wb") as out:
-            for rec in consolidated:
-                out.write(_frame(rec))
+            out.writelines(
+                own_data[w.span[0] : w.span[1]] if w.skewed else _frame(w.rec)
+                for w in consolidated
+            )
             out.flush()
             os.fsync(out.fileno())
         os.replace(tmp, target)

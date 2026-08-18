@@ -274,6 +274,202 @@ def test_compaction_of_benign_final_tear_stays_quiet(tmp_path, caplog):
     assert {r.key for r in scan.records} == {"a", "b"}
 
 
+def _skewed_frame(key, value_state=None, store_time=None):
+    """A framed record whose pickled value references a module that no longer
+    imports — module skew: the frame is intact, only THIS process can't decode
+    the value. Returns the raw frame bytes."""
+    import sys
+    import types
+
+    mod = types.ModuleType("emboss_gone_mod")
+
+    class Gone:
+        def __init__(self, state=None):
+            self.state = state
+
+    Gone.__module__ = "emboss_gone_mod"
+    Gone.__qualname__ = "Gone"
+    mod.Gone = Gone
+    sys.modules["emboss_gone_mod"] = mod
+    try:
+        rec = _Record(
+            key, Gone(value_state), None, store_time or time.time(), False, None
+        )
+        return _frame(rec)
+    finally:
+        del sys.modules["emboss_gone_mod"]
+
+
+def test_skewed_record_is_not_a_tear(tmp_path, caplog):
+    """An intact frame whose value class no longer imports is module skew, not
+    corruption: no tear, no warning, and the record lands in `skewed` with its span."""
+    log = tmp_path / "00" / "A.log"
+    _write_log(log, _rec("a", "A"))
+    size_before = log.stat().st_size
+    skew = _skewed_frame("gone-key")
+    with open(log, "ab") as f:
+        f.write(skew + _frame(_rec("c", "C")))
+    with caplog.at_level("WARNING"):
+        scan = _read_records(log)
+    assert scan.tear_at is None and scan.recovered == 0
+    assert [r.key for r in scan.records] == ["a", "c"]
+    assert [(r.key, span) for r, span in scan.skewed] == [
+        ("gone-key", (size_before, size_before + len(skew)))
+    ]
+    assert not any("torn/corrupt frame" in r.message for r in caplog.records)
+
+
+def test_skewed_record_invisible_to_reads(tmp_path):
+    """A skewed record must never be served (its value is stubs) — reads miss it,
+    and an older servable record for the same key keeps serving."""
+    c = LogCache(tmp_path / "c", writer_id="A", prefix_width=1, index_ttl=0)
+    first, second = _colliding_keys(c, 2)
+    prefix = c._prefix(first)
+    log = tmp_path / "c" / prefix / "A.log"
+    _write_log(log, _rec(first, "old-servable"))
+    with open(log, "ab") as f:
+        f.write(_skewed_frame(first))  # newer, unservable here
+        f.write(_skewed_frame(second))  # only record for its key
+    assert c.get(first) == "old-servable"
+    assert c.get(second, "MISS") == "MISS"
+
+
+def test_compaction_preserves_skewed_frames_verbatim(tmp_path):
+    """Compaction must carry intact-but-unimportable frames byte-for-byte: they are
+    genuine data any correctly-provisioned process can read. (Before this, a rewrite
+    from a skewed environment silently deleted them — observed destroying-if-run
+    ~60k records per production stream.)"""
+    c = LogCache(tmp_path / "c", writer_id="A", prefix_width=1, index_ttl=0)
+    first, second = _colliding_keys(c, 2)
+    prefix = c._prefix(first)
+    log = tmp_path / "c" / prefix / "A.log"
+    _write_log(log, _rec(first, "old-servable"))
+    newer_skew = _skewed_frame(first, store_time=time.time() + 5)
+    lone_skew = _skewed_frame(second)
+    with open(log, "ab") as f:
+        f.write(newer_skew + lone_skew)
+
+    c.compact(prefix)
+    data = log.read_bytes()
+    assert newer_skew in data  # newest data for `first`, kept verbatim
+    assert lone_skew in data
+    scan = _read_records(log)
+    assert scan.tear_at is None
+    assert [r.key for r in scan.records] == [first]  # servable record still serves
+    assert c.get(first) == "old-servable"
+
+
+def test_compaction_drops_skewed_superseded_by_newer_write(tmp_path):
+    """A skewed record older than a servable write for the same key is genuinely
+    dead — latest-wins applies across both tracks."""
+    c = LogCache(tmp_path / "c", writer_id="A", prefix_width=1, index_ttl=0)
+    (key,) = _colliding_keys(c, 1)
+    prefix = c._prefix(key)
+    log = tmp_path / "c" / prefix / "A.log"
+    old_skew = _skewed_frame(key, store_time=time.time() - 5)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_bytes(old_skew)
+    c.set(key, "newer-servable")
+    c.compact(prefix)
+    data = log.read_bytes()
+    assert old_skew not in data
+    scan = _read_records(log)
+    assert not scan.skewed
+    assert c.get(key) == "newer-servable"
+
+
+def test_consolidation_preserves_own_skewed_frames(tmp_path):
+    """The consolidation rewrite of our own log must carry our skewed frames
+    verbatim, exactly like compaction."""
+    c = LogCache(tmp_path / "c", writer_id="A", prefix_width=1, index_ttl=0)
+    (key,) = _colliding_keys(c, 1)
+    prefix = c._prefix(key)
+    c.set(key, "servable")
+    log = tmp_path / "c" / prefix / "A.log"
+    skew = _skewed_frame("gone-key")
+    with open(log, "ab") as f:
+        f.write(skew)
+    c.consolidate(prefix)
+    assert skew in log.read_bytes()
+    assert c.get(key) == "servable"
+
+
+def test_prune_keeps_log_holding_a_skewed_winner(tmp_path):
+    """A pruned writer's log holding a skewed WINNER is that record's only durable
+    carrier — the prune must keep the file (its servable records still fold)."""
+    c = LogCache(tmp_path / "c", writer_id="A", prefix_width=1, index_ttl=0)
+    first, second = _colliding_keys(c, 2)
+    prefix = c._prefix(first)
+    peer_log = tmp_path / "c" / prefix / "B.log"
+    _write_log(peer_log, _rec(first, "from-B"))
+    skew = _skewed_frame(second)
+    with open(peer_log, "ab") as f:
+        f.write(skew)
+    c.consolidate(prefix, prune_writer_ids={"B"})
+    assert peer_log.exists()  # protected: the skewed winner lives only here
+    assert skew in peer_log.read_bytes()
+    assert c.get(first) == "from-B"  # B's servable record still folded into ours
+    own = _read_records(tmp_path / "c" / prefix / "A.log")
+    assert first in {r.key for r in own.records}
+
+
+def test_prune_folds_log_whose_skewed_records_are_superseded(tmp_path):
+    """A pruned log whose skewed records are all superseded by newer servable
+    writes has no protected content — it folds and is deleted as usual."""
+    c = LogCache(tmp_path / "c", writer_id="A", prefix_width=1, index_ttl=0)
+    (key,) = _colliding_keys(c, 1)
+    prefix = c._prefix(key)
+    peer_log = tmp_path / "c" / prefix / "B.log"
+    peer_log.parent.mkdir(parents=True, exist_ok=True)
+    peer_log.write_bytes(_skewed_frame(key, store_time=time.time() - 5))
+    c.set(key, "newer-servable")
+    c.consolidate(prefix, prune_writer_ids={"B"})
+    assert not peer_log.exists()
+    assert c.get(key) == "newer-servable"
+
+
+def test_heal_on_sight_not_armed_by_skew(tmp_path):
+    """Module skew must NOT trigger the tear heal: the frames are intact, and a
+    rewrite storm on every skewed prefix would churn the whole corpus."""
+    c = LogCache(tmp_path / "c", writer_id="A", prefix_width=1, index_ttl=0)
+    first, second = _colliding_keys(c, 2)
+    prefix = c._prefix(first)
+    log = tmp_path / "c" / prefix / "A.log"
+    _write_log(log, _rec(first, "v1"))
+    with open(log, "ab") as f:
+        f.write(_skewed_frame("gone-key"))
+    original = log.read_bytes()
+
+    assert c.get(first) == "v1"
+    assert prefix not in c._needs_tear_heal
+    c.set(second, "v2")
+    # append-only: no compaction ran, the original bytes are still the file's head
+    assert log.read_bytes().startswith(original)
+
+
+def test_heal_on_sight_drops_tear_but_keeps_skew(tmp_path):
+    """A genuine structural tear next to skewed frames: the heal drops the torn
+    bytes and preserves the skewed frames verbatim."""
+    c = LogCache(tmp_path / "c", writer_id="A", prefix_width=1, index_ttl=0)
+    first, second = _colliding_keys(c, 2)
+    prefix = c._prefix(first)
+    log = tmp_path / "c" / prefix / "A.log"
+    offs = _write_log(log, _rec(first, "v1"), _rec("torn", "x"))
+    raw = bytearray(log.read_bytes())
+    bs = offs[1] + _HEADER.size
+    raw[bs : bs + 3] = b"\xff\xff\xff"  # structural tear mid-log
+    skew = _skewed_frame("gone-key")
+    log.write_bytes(bytes(raw) + skew)
+
+    assert c.get(first) == "v1"  # arms the heal
+    c.set(second, "v2")  # heals
+    data = log.read_bytes()
+    scan = _read_records(log)
+    assert scan.tear_at is None
+    assert skew in data
+    assert {r.key for r in scan.records} == {first, second}
+
+
 def _colliding_keys(cache, count):
     """`count` distinct keys that share one prefix shard of `cache`."""
     by_prefix: dict[str, list[str]] = {}
