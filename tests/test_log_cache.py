@@ -6,8 +6,10 @@ import logging
 import os
 import pickle
 import shutil
+import sys
 import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,7 @@ from emboss._log_cache import (
     _frame,
     _is_conflict_log,
     _iter_records,
+    _OpaqueValue,
     _parse_frame,
     _read_records,
     _Record,
@@ -279,6 +282,124 @@ def test_read_records_propagates_oserror(tmp_path):
     on the OSError to mark a source unread and never prune it."""
     with pytest.raises(OSError):
         _read_records(tmp_path / "does-not-exist" / "x.log")
+
+
+# ── import-skew (opaque) records ──────────────────────────────────────────────
+# A record's value can reference classes that no longer import in the reading
+# environment (deleted experiment code, another branch). That is NOT a tear:
+# scans must not report it as corruption, reads treat it as a miss, and every
+# rewrite must carry the original bytes verbatim so a capable environment can
+# still read the value.
+
+_GHOST_MODULE = "emboss_test_ghost"
+
+
+def _install_ghost():
+    """Create an importable-only-via-sys.modules module holding a Ghost class."""
+    mod = types.ModuleType(_GHOST_MODULE)
+    exec(  # noqa: S102 — builds the throwaway ghost class from trusted literal source
+        "class Ghost:\n"
+        "    def __init__(self, x):\n"
+        "        self.x = x\n"
+        "    def __eq__(self, other):\n"
+        "        return isinstance(other, Ghost) and other.x == self.x\n",
+        mod.__dict__,
+    )
+    sys.modules[_GHOST_MODULE] = mod
+    return mod
+
+
+@pytest.fixture
+def ghost_module():
+    mod = _install_ghost()
+    yield mod
+    sys.modules.pop(_GHOST_MODULE, None)
+
+
+def test_unimportable_value_is_not_a_tear(tmp_path, caplog, ghost_module):
+    log = tmp_path / "00" / "test.log"
+    _write_log(
+        log, _rec("a", "A"), _rec("g", ghost_module.Ghost(3)), _rec("c", "C")
+    )
+    sys.modules.pop(_GHOST_MODULE)
+
+    with caplog.at_level("WARNING"):
+        scan = _read_records(log)
+    assert scan.tear_at is None and scan.recovered == 0
+    assert [r.key for r in scan.records] == ["a", "g", "c"]
+    opaque = scan.records[1].value
+    assert isinstance(opaque, _OpaqueValue)
+    assert f"{_GHOST_MODULE}.Ghost" in opaque.missing
+    assert not any("torn/corrupt frame" in r.message for r in caplog.records)
+
+
+def test_unimportable_value_reads_as_warned_miss(tmp_path, caplog, ghost_module):
+    c = LogCache(tmp_path / "c", writer_id="A")
+    c.set("k", ghost_module.Ghost(7))
+    sys.modules.pop(_GHOST_MODULE)
+
+    reader = LogCache(tmp_path / "c", writer_id="B")
+    with caplog.at_level("WARNING"):
+        assert reader.get("k", default="fb") == "fb"
+    assert any("importables missing" in r.message for r in caplog.records)
+
+
+def test_compaction_preserves_unimportable_frame_verbatim(tmp_path, ghost_module):
+    c = LogCache(tmp_path / "c", writer_id="A")
+    c.set("k", ghost_module.Ghost(3))
+    prefix = c._prefix("k")
+    log = c._log_path(prefix)
+    original = log.read_bytes()
+    sys.modules.pop(_GHOST_MODULE)
+
+    LogCache(tmp_path / "c", writer_id="A").compact(prefix)
+    assert log.read_bytes() == original  # the frame round-tripped byte-identically
+
+    sys.modules[_GHOST_MODULE] = ghost_module  # a capable environment reads it back
+    assert LogCache(tmp_path / "c", writer_id="B").get("k") == ghost_module.Ghost(3)
+
+
+def test_superseded_unimportable_frame_is_compacted_away(tmp_path, ghost_module):
+    c = LogCache(tmp_path / "c", writer_id="A")
+    c.set("k", ghost_module.Ghost(3))
+    prefix = c._prefix("k")
+    sys.modules.pop(_GHOST_MODULE)
+
+    # The natural upgrade path: a recompute supersedes the unreadable record,
+    # after which compaction drops it like any other superseded record.
+    writer = LogCache(tmp_path / "c", writer_id="A")
+    writer.set("k", "recomputed")
+    writer.compact(prefix)
+
+    scan = _read_records(c._log_path(prefix))
+    assert scan.tear_at is None
+    assert [(r.key, r.value) for r in scan.records] == [("k", "recomputed")]
+
+
+def test_consolidation_preserves_unimportable_frame(tmp_path, ghost_module):
+    c = LogCache(tmp_path / "c", writer_id="A")
+    c.set("k", ghost_module.Ghost(9))
+    prefix = c._prefix("k")
+    sys.modules.pop(_GHOST_MODULE)
+
+    LogCache(tmp_path / "c", writer_id="A").consolidate(prefix)
+
+    sys.modules[_GHOST_MODULE] = ghost_module
+    assert LogCache(tmp_path / "c", writer_id="B").get("k") == ghost_module.Ghost(9)
+
+
+def test_unimportable_spill_reads_as_warned_miss(tmp_path, caplog, ghost_module):
+    c = LogCache(tmp_path / "c", writer_id="A", min_file_size=1)  # spill everything
+    c.set("k", ghost_module.Ghost(5))
+    sys.modules.pop(_GHOST_MODULE)
+
+    reader = LogCache(tmp_path / "c", writer_id="B", min_file_size=1)
+    with caplog.at_level("WARNING"):
+        assert reader.get("k") is None
+    assert any(
+        "importables missing" in r.message and "spill" in r.message
+        for r in caplog.records
+    )
 
 
 def test_corrupt_spill_is_a_warned_miss(tmp_path, caplog):
