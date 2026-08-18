@@ -33,6 +33,10 @@ def transfer(source: Any, destination: Any, *, clear_source: bool = False) -> in
         environment (import skew) and perfectly readable elsewhere. Deleting the
         only copy of what wasn't transferred is never safe, so the source is
         kept for the caller to clear once the skipped keys are accounted for.
+        The refusal can only guard keys the source actually *yielded* — a source
+        that cannot read part of its own storage must surface that itself
+        (`LogCache` warns per unreadable log, and its `clear()` keeps any log it
+        could not read).
     :return: number of entries copied.
     """
     count = 0
@@ -42,13 +46,15 @@ def transfer(source: Any, destination: Any, *, clear_source: bool = False) -> in
         if value is _MISSING:  # expired mid-transfer, or unreadable here (import skew)
             skipped += 1
             continue
-        destination.set(key, value)
+        if destination.set(key, value) is False:  # e.g. diskcache returns False on Timeout
+            skipped += 1
+            continue
         count += 1
     if skipped:
         logger.warning(
-            "emboss.transfer: %d key(s) iterated as live but read as a miss "
-            "(expired mid-transfer, or values unreadable in this environment — "
-            "import skew)%s.",
+            "emboss.transfer: %d key(s) were not copied (expired mid-transfer, "
+            "values unreadable in this environment — import skew — or a "
+            "destination write refused)%s.",
             skipped,
             "; clear_source skipped to preserve them" if clear_source else "",
         )

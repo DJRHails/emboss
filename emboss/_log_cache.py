@@ -223,8 +223,10 @@ class _OpaqueValue:
     `blob` preserves the ORIGINAL frame blob byte-for-byte so compaction and
     consolidation carry the record verbatim instead of dropping it as corrupt —
     an environment that still imports the classes reads the value back untouched.
-    The frozen dataclass enforces that: every safety argument below rests on
-    `blob` never being anything but the bytes `_salvage_opaque` recovered.
+    `frozen` prevents rebinding `blob` after construction; the stronger
+    invariant the rewrite safety rests on — `blob` is always exactly the bytes
+    `_salvage_opaque` recovered — rests on `_salvage_opaque` being the sole
+    construction site.
     Point reads in this environment treat the record as a miss (a recompute
     supersedes it naturally). Before this salvage pass existed these frames were
     indistinguishable from torn frames: a 2026-08-18 forensic pass over a
@@ -832,7 +834,8 @@ class LogCache:
                 return 0
         if isinstance(rec.value, _OpaqueValue):
             # The whole frame blob (envelope included) — the value's own bytes
-            # can't be isolated without decoding; overcounts by tens of bytes.
+            # can't be isolated without decoding; overcounts by the envelope
+            # (~35 bytes plus the key).
             return len(rec.value.blob)
         return len(pickle.dumps(rec.value, protocol=pickle.HIGHEST_PROTOCOL))
 
@@ -987,8 +990,10 @@ class LogCache:
                         "emboss.LogCache: value for key %r references importables "
                         "missing from this environment (%s); treating as a miss — a "
                         "recompute supersedes it, and compaction/consolidation "
-                        "preserve the original record verbatim. (Warned once per "
-                        "key per process.)",
+                        "preserve the original record verbatim. (Import skew is the "
+                        "likely cause, though corrupt bytes inside a pickled global "
+                        "name would salvage identically. Warned once per key per "
+                        "cache instance.)",
                         key,
                         ", ".join(rec.value.missing),
                     )
@@ -1007,30 +1012,25 @@ class LogCache:
                 exc,
             )
             return _MISSING
-        except (ImportError, AttributeError) as exc:
+        except Exception as exc:  # noqa: BLE001 — undecodable HERE: skew or corruption
             # Likely the same import skew as an inline `_OpaqueValue`, hit
-            # lazily. Unlike the inline path there is no salvage verification
-            # here, so intactness is a likelihood, not a fact — corrupt bytes
-            # forming a garbage GLOBAL opcode raise ImportError too.
+            # lazily — keyed on any decode failure, not the exception type, so a
+            # module whose import-time code raises (the CUDA-gated pattern)
+            # classifies the same as a deleted one. Unlike the inline path there
+            # is no salvage verification here, so intactness is a likelihood,
+            # not a fact — a corrupt spill raises the same way.
             if key not in self._warned_opaque:
                 self._warned_opaque.add(key)
                 logger.warning(
-                    "emboss.LogCache: spill file %s for key %r references "
-                    "importables missing from this environment (%s); treating as "
-                    "a miss — if the file is intact, it is readable where those "
-                    "imports exist. (Warned once per key per process.)",
+                    "emboss.LogCache: spill file %s for key %r failed to decode "
+                    "(%r); treating as a miss — likely importables missing from "
+                    "this environment (the file is then readable where they "
+                    "exist), though a corrupt spill raises identically. (Warned "
+                    "once per key per cache instance.)",
                     rec.spill,
                     key,
                     exc,
                 )
-            return _MISSING
-        except Exception:  # noqa: BLE001 — corrupt/unpicklable spill: warn, miss (don't crash)
-            logger.warning(
-                "emboss.LogCache: spill file %s for key %r is present but "
-                "unreadable (corrupt/partial write); treating as a miss.",
-                rec.spill,
-                key,
-            )
             return _MISSING
 
     # ── append / compaction ────────────────────────────────────────────────────
@@ -1084,14 +1084,18 @@ class LogCache:
                 for rec in keep:
                     out.write(_frame(rec))
             os.replace(tmp, path)
-        # a real mid-log tear was healed; a benign final tear stays quiet
-        if scan.recovered:
+        # Unlike a read (where a benign truncated final write stays quiet), a
+        # compaction's drop is permanent — surface every tear, tail included: a
+        # record that is intact on disk but fails salvage here (an importable
+        # constructor rejecting a stub argument, a legacy non-builtin in the
+        # envelope) looks exactly like a truncated final write.
+        if scan.tear_at is not None:
             logger.warning(
-                "emboss.LogCache: compacted %s past a torn frame at byte %d — dropped the "
-                "malformed frame(s) permanently and resynced %d later record(s).",
+                "emboss.LogCache: compacted %s past torn/corrupt frame(s) starting at "
+                "byte %d — dropped them permanently%s.",
                 path,
                 scan.tear_at,
-                scan.recovered,
+                f"; resynced {scan.recovered} later record(s)" if scan.recovered else "",
             )
         self._index.pop(prefix, None)  # force rebuild
         self._sig.pop(prefix, None)
@@ -1922,13 +1926,17 @@ class LogCache:
                     except FileNotFoundError:
                         pass  # most prefixes hold no log for this writer
                     except OSError as exc:
+                        # Deleting a log we could not read would destroy records
+                        # invisibly (same keep-on-OSError policy as consolidation's
+                        # source scan) — leave it for a later clear() to retry.
                         logger.warning(
                             "emboss.LogCache: could not read our own log %s during "
-                            "clear() (%s) — deleting it anyway; the returned count "
-                            "under-reports.",
+                            "clear() (%s) — keeping it; the returned count excludes "
+                            "its records.",
                             own_log,
                             exc,
                         )
+                        continue
                     own_log.unlink(missing_ok=True)
                     (pdir / f"{self.writer_id}.lock").unlink(missing_ok=True)
                     shutil.rmtree(pdir / f"{self.writer_id}.spill", ignore_errors=True)
@@ -1969,11 +1977,20 @@ class LogCache:
                 continue
             latest: dict[str, _Record] = {}
             for log in sorted(pdir.glob("*.log")):
-                with contextlib.suppress(OSError):
+                try:
                     for rec in _iter_records(log):
                         cur = latest.get(rec.key)
                         if cur is None or rec.store_time >= cur.store_time:
                             latest[rec.key] = rec
+                except OSError as exc:
+                    # Never silently: a consumer like `transfer()` decides whether
+                    # the source may be cleared based on what iteration yielded.
+                    logger.warning(
+                        "emboss.LogCache: could not read log %s during a scan (%s) — "
+                        "its records are invisible to this iteration/len()/volume().",
+                        log,
+                        exc,
+                    )
             for rec in latest.values():
                 if self._live(rec, now):
                     yield rec

@@ -259,6 +259,45 @@ def test_schema_drift_recomputes_instead_of_returning_dict(cache, caplog):
     assert isinstance(f(), Score)
 
 
+def test_model_schema_drift_recomputes_instead_of_crashing(cache, caplog):
+    """A stored field dict that no longer validates against the BaseModel (a
+    required field added/renamed since it was cached) is a warned miss that
+    recomputes — never a ValidationError leaking out of a warm hit. Same
+    contract as the dataclass drift path."""
+
+    @cached(cache)
+    def f() -> M:
+        return M(name="fresh", n=1)
+
+    f()
+    key = next(iter(cache))
+    cache.set(key, {"renamed_away": True})  # predates M's required `name`
+
+    with caplog.at_level("WARNING"):
+        r = f()
+    assert r == M(name="fresh", n=1)
+    assert any("treating as a miss" in rec.message for rec in caplog.records)
+    assert isinstance(f(), M)  # store healed
+
+
+def test_schema_drift_warns_once_per_key(cache, caplog):
+    """Drift warnings dedupe per key per decorated function — under cache_only
+    or a read-only cache nothing heals the store, and one stale sweep must not
+    warn on every call."""
+
+    @cached(cache)
+    def f() -> Score:
+        return Score(value=1.0)
+
+    f()
+    key = next(iter(cache))
+    with caplog.at_level("WARNING"):
+        for _ in range(2):
+            cache.set(key, {"value": 1.0, "removed_field": 3})
+            assert isinstance(f(), Score)  # recomputes both times
+    assert sum("treating as a miss" in r.message for r in caplog.records) == 1
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class Refusal:
     error: str
