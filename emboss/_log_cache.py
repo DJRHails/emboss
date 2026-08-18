@@ -67,6 +67,12 @@ sharing a node-log are serialised by the per-writer lock file. Inodes are bounde
   swept file a lagging peer references degrades to a miss-and-recompute — the
   module's standing eventual-consistency contract).
 - **Deletes** append a tombstone.
+- **Module skew is not corruption.** An intact frame whose value references
+  classes THIS process cannot import (deleted or branch-only caller code) is
+  unservable here — reads miss it (an older importable record for the key keeps
+  serving) — but it is genuine data to a correctly-provisioned process, so every
+  log rewrite carries it byte-verbatim until a newer servable write supersedes
+  it. Only structural damage counts as a torn frame.
 - **Compaction** rewrites *this node's own* log (under its lock, atomic rename),
   dropping superseded / tombstoned / expired records. It never touches spill
   files (they are shared) or a peer's files. Auto-runs past `max_log_bytes` — a
