@@ -274,6 +274,80 @@ def test_compaction_of_benign_final_tear_stays_quiet(tmp_path, caplog):
     assert {r.key for r in scan.records} == {"a", "b"}
 
 
+def _colliding_keys(cache, count):
+    """`count` distinct keys that share one prefix shard of `cache`."""
+    by_prefix: dict[str, list[str]] = {}
+    for i in range(100000):
+        k = f"key{i}"
+        group = by_prefix.setdefault(cache._prefix(k), [])
+        group.append(k)
+        if len(group) == count:
+            return group
+    raise AssertionError("no colliding prefix found")
+
+
+def test_own_log_mid_tear_heals_on_next_write(tmp_path):
+    """Heal-on-sight: a mid-log tear in OUR OWN log, seen at index build, is dropped from disk
+    by the compaction the next write to that prefix triggers — small logs never reach the
+    `max_log_bytes` auto-compaction, so without this the tear (and its resync warning on every
+    rebuild) is permanent."""
+    c = LogCache(tmp_path / "c", writer_id="A", prefix_width=1, index_ttl=0)
+    first, second, third = _colliding_keys(c, 3)
+    prefix = c._prefix(first)
+    log = tmp_path / "c" / prefix / "A.log"
+    offs = _write_log(log, _rec(first, "v1"), _rec("torn", "x"), _rec(second, "v2"))
+    raw = bytearray(log.read_bytes())
+    bs = offs[1] + _HEADER.size
+    raw[bs : bs + 3] = b"\xff\xff\xff"  # corrupt the middle frame in place
+    log.write_bytes(bytes(raw))
+
+    assert c.get(first) == "v1"  # the build that arms the heal flag
+    c.set(third, "v3")  # the write that heals
+    scan = _read_records(log)
+    assert scan.tear_at is None and scan.recovered == 0  # torn frame gone from disk
+    assert {r.key for r in scan.records} == {first, second, third}  # nothing live lost
+
+
+def test_own_log_trailing_tear_heals_on_next_write(tmp_path):
+    """A trailing crash artifact in our own log is healed too — the next append would
+    otherwise bury it as a permanent mid-log tear."""
+    c = LogCache(tmp_path / "c", writer_id="A", prefix_width=1, index_ttl=0)
+    first, second = _colliding_keys(c, 2)
+    prefix = c._prefix(first)
+    log = tmp_path / "c" / prefix / "A.log"
+    _write_log(log, _rec(first, "v1"))
+    with open(log, "ab") as f:
+        f.write(_HEADER.pack(4096) + b"partial")  # claims 4 KB, supplies 7 bytes
+
+    assert c.get(first) == "v1"
+    c.set(second, "v2")
+    scan = _read_records(log)
+    assert scan.tear_at is None
+    assert {r.key for r in scan.records} == {first, second}
+
+
+def test_peer_log_tear_never_arms_heal(tmp_path):
+    """A tear in a PEER's log is expected mid-sync replica state: the owner holds the complete
+    original and heals its own. Our writes must leave the peer's bytes exactly as they are."""
+    c = LogCache(tmp_path / "c", writer_id="A", prefix_width=1, index_ttl=0)
+    first, second = _colliding_keys(c, 2)
+    prefix = c._prefix(first)
+    peer_log = tmp_path / "c" / prefix / "B.log"
+    offs = _write_log(
+        peer_log, _rec(first, "v1"), _rec("torn", "x"), _rec("peer-tail", "v2")
+    )
+    raw = bytearray(peer_log.read_bytes())
+    bs = offs[1] + _HEADER.size
+    raw[bs : bs + 3] = b"\xff\xff\xff"
+    peer_log.write_bytes(bytes(raw))
+    torn_bytes = peer_log.read_bytes()
+
+    assert c.get(first) == "v1"  # reads resync past the peer's tear
+    assert prefix not in c._needs_tear_heal
+    c.set(second, "v2")  # our write must not rewrite the peer's log
+    assert peer_log.read_bytes() == torn_bytes
+
+
 def test_read_records_propagates_oserror(tmp_path):
     """`_read_records` must NOT swallow a read error into an empty result — consolidation relies
     on the OSError to mark a source unread and never prune it."""

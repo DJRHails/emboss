@@ -45,6 +45,10 @@ sharing a node-log are serialised by the per-writer lock file. Inodes are bounde
   digests cannot give back, so they scan the logs directly and never touch (or
   build) the index — they are admin operations, not hot paths.
 - **Writes** append a length-framed record; a torn tail from a crash is ignored.
+  A torn/corrupt frame seen in OUR OWN log at index build arms heal-on-sight:
+  the next write to that prefix compacts the log, dropping the malformed
+  frame(s) permanently (a tear in a peer's log is expected mid-sync replica
+  state — the owner heals its own — and is never rewritten here).
 - **Large values spill to a shared, content-addressed pool** (`min_file_size`,
   default 32 KB): the record holds a filename reference instead of the value,
   keeping the log small (so a 100 MB value doesn't balloon the append log). The
@@ -518,6 +522,15 @@ class LogCache:
         # itself never handles the legacy layout. A peer's legacy dir is the peer's
         # to migrate and never arms the flag.
         self._needs_migration: set[str] = set()
+        # Prefixes whose OWN log was seen carrying a torn/corrupt frame at index
+        # build: the next write compacts the log, dropping the malformed frame(s)
+        # permanently (heal-on-sight, mirroring the migration flag). Only our own
+        # log arms it — a tear in a peer's log is expected mid-sync replica state
+        # (the owner holds the complete original and heals its own), never ours
+        # to rewrite. Without this, a small log's tear outlives every read: the
+        # size-triggered compaction never fires below `max_log_bytes`, so the
+        # resync (and its warning) re-runs on every index build forever.
+        self._needs_tear_heal: set[str] = set()
 
     # ── layout ────────────────────────────────────────────────────────────────
 
@@ -733,10 +746,16 @@ class LogCache:
         wall_now = time.time()
         pdir = self.directory / prefix
         if pdir.is_dir():
+            own_log_name = self._log_path(prefix).name
             for log in sorted(pdir.glob("*.log")):
                 with contextlib.suppress(OSError):
                     scan = _read_records(log)
                     _warn_recovered(log, scan)
+                    if scan.tear_at is not None and log.name == own_log_name:
+                        # Heal-on-sight: our own log holds a torn frame (a mid-log
+                        # tear, or a trailing crash artifact the next append would
+                        # bury mid-log). The next write to this prefix compacts it.
+                        self._needs_tear_heal.add(prefix)
                     log_id = len(logs)
                     logs.append(log.name)
                     # `strict=True` is load-bearing: `records` and `spans` are appended
@@ -923,6 +942,7 @@ class LogCache:
             )
         self._index.pop(prefix, None)  # force rebuild
         self._sig.pop(prefix, None)
+        self._needs_tear_heal.discard(prefix)  # the rewrite dropped any torn frames
 
     # ── consolidation (cross-writer GC) ────────────────────────────────────────
 
@@ -1174,6 +1194,7 @@ class LogCache:
         self._sig.pop(prefix, None)
         self._checked.pop(prefix, None)
         self._needs_migration.discard(prefix)
+        self._needs_tear_heal.discard(prefix)  # the rewrite dropped any torn frames
         self._consolidated_at[prefix] = time.monotonic()
 
     # A shared-pool file must outlive any in-flight `set()` that wrote it before its
@@ -1684,6 +1705,17 @@ class LogCache:
                 # `consolidate(prune_writer_ids=...)`.) The cooldown stops the
                 # trigger from storming when the namespace resists removal.
                 self._consolidate_prefix(prefix)
+            elif prefix in self._needs_tear_heal and cooled_down:
+                # Heal-on-sight: the index build saw a torn/corrupt frame in OUR
+                # OWN log (armed in `_ensure_index`; a peer's tear never arms it).
+                # Compaction rewrites the log without the malformed frame(s), so
+                # the tear — and its every-rebuild resync warning — ends here
+                # instead of replicating fleet-wide until the log outgrows
+                # `max_log_bytes`. The cooldown bounds the pathological case (a
+                # log that keeps re-tearing, e.g. under an unhealable I/O fault)
+                # to one rewrite per window.
+                self._compact_prefix(prefix)
+                self._consolidated_at[prefix] = time.monotonic()
         return True
 
     def delete(self, key: Any) -> bool:
