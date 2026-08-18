@@ -259,16 +259,22 @@ def _dataclass_hints(cls: type) -> Mapping[str, Any] | None:
 def _union_codec_members(args: tuple[Any, ...]) -> tuple[Any, ...] | None:
     """The union's codec-relevant members, or `None` when the union is ambiguous.
 
-    A stored dict (or container) must map back to exactly one member on decode:
-    two model/dataclass members (`SmushRationale | RationaleRefusal`), or two
-    members sharing a container origin (`list[A] | list[B]`), cannot be told
-    apart once dict-encoded — such a union stays on the raw-pickle passthrough,
-    exactly the pre-codec behaviour for it."""
-    class_members = [a for a in args if _is_basemodel_class(a) or _codable_dataclass(a)]
-    if len(class_members) > 1:
-        return None
-    origins = [o for o in map(typing.get_origin, args) if o in (list, tuple, dict)]
-    if len(origins) != len(set(origins)):
+    A stored value must map back to exactly one member by shape. Model and
+    rebuildable-dataclass members store as dicts, so they collide with each
+    other (`SmushRationale | RationaleRefusal`) and with any member whose
+    runtime value is itself a dict (`Model | dict[str, X]`, TypedDicts); two
+    members sharing a container origin (`list[A] | list[B]`) collide the same
+    way. Such unions stay on the raw-pickle passthrough, exactly the pre-codec
+    behaviour for them."""
+    shapes = []
+    for a in args:
+        if _is_basemodel_class(a) or _codable_dataclass(a) or typing.is_typeddict(a):
+            shapes.append(dict)
+            continue
+        origin = typing.get_origin(a) or (a if a in (list, tuple, dict) else None)
+        if origin in (list, tuple, dict):
+            shapes.append(origin)
+    if len(shapes) != len(set(shapes)):
         return None
     return tuple(a for a in args if a is not type(None))
 

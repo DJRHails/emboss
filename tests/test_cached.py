@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import typing
 
 import diskcache
 import pytest
@@ -249,6 +250,37 @@ def test_union_of_class_and_its_list_disambiguates_by_shape(cache):
     assert f(True) == [Score(value=4.0)] and isinstance(f(True)[0], Score)
     stored = _stored_values(cache)
     assert all(isinstance(v, (dict, list)) for v in stored)  # dict-encoded, no instances
+
+
+def test_union_with_dict_member_stays_raw_pickle(cache):
+    """`A | dict[...]` is dict-shape ambiguous: the class member itself stores as
+    a dict, so a stored dict could be either member — decode would rebuild a
+    plain-dict return as the class on the warm hit. Such unions must stay on the
+    raw-pickle passthrough."""
+
+    @cached(cache)
+    def f(ok: bool) -> Refusal | dict[str, str]:
+        return Refusal(error="bad") if ok else {"error": "just a dict"}
+
+    assert isinstance(f(True), Refusal) and isinstance(f(True), Refusal)  # cold + warm
+    assert f(False) == {"error": "just a dict"}
+    assert isinstance(f(False), dict)  # warm hit: still the dict, not a Refusal
+
+
+def test_union_with_typeddict_member_stays_raw_pickle(cache):
+    """A TypedDict member is a plain dict at runtime, so it collides with a
+    class member's dict encoding just like `dict[...]` does."""
+
+    class ScoreTD(typing.TypedDict):
+        value: float
+
+    @cached(cache)
+    def f(ok: bool) -> Score | ScoreTD:
+        return Score(value=1.0) if ok else {"value": 2.0}
+
+    assert isinstance(f(True), Score) and isinstance(f(True), Score)
+    assert f(False) == {"value": 2.0}
+    assert isinstance(f(False), dict) and not isinstance(f(False), Score)
 
 
 def test_value_not_matching_annotation_passes_through(cache):
