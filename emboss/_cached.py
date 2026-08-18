@@ -223,7 +223,7 @@ def _is_basemodel_class(cls: Any) -> bool:
     return BaseModel is not None and isinstance(cls, type) and issubclass(cls, BaseModel)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _dataclass_rebuildable(cls: type) -> bool:
     """True when `cls(**field_dict)` reconstructs an instance from its stored
     fields: every stored field is settable through `__init__` and the constructor
@@ -246,7 +246,7 @@ def _codable_dataclass(cls: Any) -> bool:
     )
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _dataclass_hints(cls: type) -> Mapping[str, Any] | None:
     """Resolved field annotations for recursive encode/decode of nested fields;
     `None` when a hint cannot be resolved (the field then passes through raw)."""
