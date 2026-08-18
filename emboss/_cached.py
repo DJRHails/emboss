@@ -273,6 +273,40 @@ def _wants_codec(anno: Any, _depth: int = 0) -> bool:
     return False
 
 
+def _resolve_return_annotation(func: Callable[..., Any], anno: Any) -> Any:
+    """Resolve a string / forward-ref return annotation to real types.
+
+    Under `from __future__ import annotations` every annotation arrives as a
+    string, and without it a nested quoted name (`-> list["M"]`) arrives holding
+    a `ForwardRef` — either way `_wants_codec` cannot see the model in it and
+    the value would pickle by class reference, dying with the defining code.
+    Resolution is scoped to the RETURN annotation via a stub function so an
+    unresolvable *parameter* annotation (the common TYPE_CHECKING-gated client
+    type) cannot disable the codec. A return annotation that itself fails to
+    resolve (e.g. behind TYPE_CHECKING, or a class defined below the decorated
+    function) keeps the raw-pickle passthrough — with a warning, because any
+    model/dataclass it names will then be stored by class reference."""
+    stub = types.FunctionType((lambda: None).__code__, getattr(func, "__globals__", {}))
+    stub.__annotations__ = {"return": anno}
+    try:
+        return typing.get_type_hints(stub).get("return", inspect.Parameter.empty)
+    except Exception as exc:  # noqa: BLE001 — unresolvable annotation → passthrough
+        logger.warning(
+            "emboss.cached: return annotation %r of %s() did not resolve (%s); "
+            "annotation-driven encoding stays off, so a model/dataclass return "
+            "would pickle by class reference and die with its defining code.",
+            anno,
+            getattr(func, "__qualname__", func),
+            exc,
+        )
+        return inspect.Parameter.empty
+
+
+class _SchemaDrift(Exception):
+    """A stored field dict no longer matches its dataclass constructor — the
+    cached value predates a field rename/removal in the class definition."""
+
+
 def _runtime_matches(value: Any, anno: Any) -> bool:
     """Does `value` plausibly inhabit union member `anno`? Used only to pick which
     member of a Union to encode/decode through."""
@@ -338,14 +372,10 @@ def _decode(value: Any, anno: Any) -> Any:
         kwargs = {k: _decode(v, hints.get(k)) for k, v in value.items()}
         try:
             return anno(**kwargs)
-        except TypeError:
-            logger.warning(
-                "emboss: cached value for %s no longer matches its constructor "
-                "(fields changed since it was stored?); returning the raw field "
-                "dict.",
-                anno.__qualname__,
-            )
-            return value
+        except TypeError as exc:
+            # Serving the raw field dict would hand the caller a wrong type on
+            # a warm hit; the wrapper treats drift as a miss and recomputes.
+            raise _SchemaDrift(f"{anno.__qualname__}: {exc}") from exc
     origin = typing.get_origin(anno)
     args = typing.get_args(anno)
     if origin in (Union, types.UnionType):
@@ -566,21 +596,11 @@ def cached(
             return_anno = inspect.signature(func).return_annotation
         except (TypeError, ValueError):
             return_anno = inspect.Parameter.empty
-        if isinstance(return_anno, str):
-            # PEP 563 (`from __future__ import annotations`) delivers the annotation
-            # as a string `_model_info` cannot see a BaseModel in — silently
-            # disabling the model_dump encoding for every function in such a module
-            # (its models then pickle by class reference and die with the defining
-            # code). `get_type_hints` resolves it (including nested forward refs);
-            # a name unresolvable at decoration time (e.g. behind TYPE_CHECKING, in
-            # this or any parameter annotation) falls back to no model encoding, as
-            # before.
-            try:
-                return_anno = typing.get_type_hints(func).get(
-                    "return", inspect.Parameter.empty
-                )
-            except Exception:  # noqa: BLE001 — unresolvable annotation → passthrough
-                return_anno = inspect.Parameter.empty
+        if return_anno is not inspect.Parameter.empty and not _wants_codec(return_anno):
+            # PEP 563 strings and nested forward refs hide models from the codec
+            # gate; resolve the return annotation alone (never the parameters —
+            # see `_resolve_return_annotation`) before giving up on encoding.
+            return_anno = _resolve_return_annotation(func, return_anno)
         codec_anno = return_anno if _wants_codec(return_anno) else None
         is_async = asyncio.iscoroutinefunction(func)
 
@@ -626,14 +646,27 @@ def cached(
             key, accept_keys = _keys(args, kwargs)
             raw = _lookup(key, accept_keys)
             if raw is not _MISSING:
-                decoded = _decode(raw, codec_anno)
-                if is_async:
+                try:
+                    decoded = _decode(raw, codec_anno)
+                except _SchemaDrift as drift:
+                    # The hit exists but cannot rehydrate under the CURRENT class
+                    # definition; fall through to recompute — the fresh store
+                    # supersedes the stale shape (under cache_only this raises
+                    # CacheMiss below, naming the key honestly).
+                    logger.warning(
+                        "emboss: cached value for %s() no longer matches its "
+                        "constructor (%s); treating as a miss and recomputing.",
+                        info.name,
+                        drift,
+                    )
+                else:
+                    if is_async:
 
-                    async def return_cached():
-                        return decoded
+                        async def return_cached():
+                            return decoded
 
-                    return return_cached()  # type: ignore[return-value]
-                return decoded  # type: ignore[return-value]
+                        return return_cached()  # type: ignore[return-value]
+                    return decoded  # type: ignore[return-value]
 
             if is_async:
 

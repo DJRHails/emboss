@@ -25,7 +25,9 @@ from emboss._log_cache import (
     _parse_frame,
     _read_records,
     _Record,
+    _salvage_opaque,
 )
+from emboss._transfer import transfer
 
 
 @pytest.fixture
@@ -400,6 +402,99 @@ def test_unimportable_spill_reads_as_warned_miss(tmp_path, caplog, ghost_module)
         "importables missing" in r.message and "spill" in r.message
         for r in caplog.records
     )
+
+
+def test_corrupt_bytes_raising_on_unpickle_stay_tears(ghost_module):
+    """The salvage rejection gates: a blob that raises on strict unpickle but is
+    not an intact record must stay a tear (`_parse_frame` -> None), whichever
+    gate catches it — a relaxed gate would seat poison records in the index."""
+    ghost = ghost_module.Ghost(1)
+    # no record envelope: salvages (missing non-empty) but fails the envelope check
+    bare = pickle.dumps(ghost, protocol=pickle.HIGHEST_PROTOCOL)
+    # a stubbed class in the ENVELOPE itself: store_time fails the typing check
+    bad_envelope = pickle.dumps(
+        ("k", "v", None, ghost, False, None), protocol=pickle.HIGHEST_PROTOCOL
+    )
+    # trailing bytes under an inflated length header: fails the exact-length check
+    record_blob = pickle.dumps(
+        tuple(_rec("k", ghost)), protocol=pickle.HIGHEST_PROTOCOL
+    )
+    inflated = _HEADER.pack(len(record_blob) + 3) + record_blob + b"xyz"
+    sys.modules.pop(_GHOST_MODULE)
+
+    for blob in (bare, bad_envelope):
+        assert _parse_frame(_HEADER.pack(len(blob)) + blob, 0) is None
+    assert _parse_frame(inflated, 0) is None
+
+
+def test_salvage_requires_a_missing_import():
+    """A blob that decodes cleanly without a single stub substitution failed
+    strict parsing for some other reason — it must not become an opaque record."""
+    blob = pickle.dumps(tuple(_rec("k", "plain")), protocol=pickle.HIGHEST_PROTOCOL)
+    assert _salvage_opaque(blob) is None
+
+
+def test_module_raising_on_import_is_skew_not_tear(tmp_path, monkeypatch, ghost_module):
+    """A module whose import-time code raises (the CUDA-gated-package pattern:
+    `raise RuntimeError("CUDA required")` on a CPU box) is as unimportable here
+    as a deleted one — the record must salvage to opaque, not tear."""
+    log = tmp_path / "00" / "test.log"
+    _write_log(log, _rec("g", ghost_module.Ghost(3)))
+    sys.modules.pop(_GHOST_MODULE)
+    (tmp_path / f"{_GHOST_MODULE}.py").write_text('raise RuntimeError("CUDA required")\n')
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    scan = _read_records(log)
+    assert scan.tear_at is None and scan.recovered == 0
+    opaque = scan.records[0].value
+    assert isinstance(opaque, _OpaqueValue)
+    assert f"{_GHOST_MODULE}.Ghost" in opaque.missing
+
+
+def test_expire_time_is_builtin_float(tmp_path):
+    """A float-subclass `expire` (np.float64, say) must not seat a non-builtin
+    in the record envelope — a reader without the defining package would
+    salvage-and-reject the whole record as a tear."""
+
+    class FancyFloat(float):
+        pass
+
+    c = LogCache(tmp_path / "c", writer_id="A")
+    c.set("k", "v", expire=FancyFloat(60.0))
+    scan = _read_records(c._log_path(c._prefix("k")))
+    assert type(scan.records[0].expire_time) is float
+
+
+def test_opaque_miss_warns_once_per_key(tmp_path, caplog, ghost_module):
+    c = LogCache(tmp_path / "c", writer_id="A")
+    c.set("k", ghost_module.Ghost(7))
+    sys.modules.pop(_GHOST_MODULE)
+
+    reader = LogCache(tmp_path / "c", writer_id="B")
+    with caplog.at_level("WARNING"):
+        assert reader.get("k") is None
+        assert reader.get("k") is None
+    assert sum("importables missing" in r.message for r in caplog.records) == 1
+
+
+def test_transfer_skips_unreadable_records_and_keeps_source(tmp_path, caplog, ghost_module):
+    """`transfer()` cannot copy a record it cannot decode: it must warn, skip it,
+    and refuse `clear_source` so the only copy survives for environments that
+    can still read it."""
+    src = LogCache(tmp_path / "src", writer_id="A")
+    src.set("plain", "value")
+    src.set("ghost", ghost_module.Ghost(5))
+    sys.modules.pop(_GHOST_MODULE)
+
+    dst = LogCache(tmp_path / "dst", writer_id="A")
+    with caplog.at_level("WARNING"):
+        copied = transfer(src, dst, clear_source=True)
+    assert copied == 1
+    assert dst.get("plain") == "value"
+    assert any("clear_source skipped" in r.message for r in caplog.records)
+
+    sys.modules[_GHOST_MODULE] = ghost_module  # a capable environment still reads it
+    assert LogCache(tmp_path / "src", writer_id="C").get("ghost") == ghost_module.Ghost(5)
 
 
 def test_corrupt_spill_is_a_warned_miss(tmp_path, caplog):
