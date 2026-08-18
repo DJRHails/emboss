@@ -45,6 +45,10 @@ sharing a node-log are serialised by the per-writer lock file. Inodes are bounde
   digests cannot give back, so they scan the logs directly and never touch (or
   build) the index — they are admin operations, not hot paths.
 - **Writes** append a length-framed record; a torn tail from a crash is ignored.
+  A record whose value can't be *unpickled in this environment* (its classes were
+  deleted or live on another branch) is not treated as torn: reads treat it as a
+  miss, and every rewrite carries its original bytes verbatim, so the value
+  survives for environments that can still decode it.
 - **Large values spill to a shared, content-addressed pool** (`min_file_size`,
   default 32 KB): the record holds a filename reference instead of the value,
   keeping the log small (so a 100 MB value doesn't balloon the append log). The
@@ -200,6 +204,91 @@ def _digest(key: str) -> bytes:
     return hashlib.md5(key.encode()).digest()
 
 
+class _OpaqueValue:
+    """Sentinel value for a record whose pickled value cannot be decoded in THIS
+    environment: the blob references importables (modules/attributes) that do not
+    exist here — typically a cached return type whose defining code was deleted or
+    lives on another branch. The frame is structurally intact; the envelope fields
+    (key, times, flags, spill) are plain builtins and decode fine — only the value
+    is unreadable, and only *here*.
+
+    `blob` preserves the ORIGINAL frame blob byte-for-byte so compaction and
+    consolidation carry the record verbatim instead of dropping it as corrupt —
+    an environment that still imports the classes reads the value back untouched.
+    Reads in this environment treat the record as a miss (a recompute supersedes
+    it naturally). Before 0.11 these frames were indistinguishable from torn
+    frames: a 2026-08-18 forensic pass over a production corpus found 99.8% of
+    reported "tears" were intact records like these, which a compaction from the
+    skewed environment would have deleted permanently."""
+
+    __slots__ = ("blob", "missing")
+
+    def __init__(self, blob: bytes, missing: tuple[str, ...]) -> None:
+        self.blob = blob
+        self.missing = missing
+
+
+class _AnyStub:
+    """Stand-in for an unimportable global during envelope salvage. Tolerates every
+    construction/state protocol pickle can drive an object through, so the salvage
+    pass can finish decoding the stream; the resulting object is discarded (only
+    the envelope fields are kept)."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def __setstate__(self, state: Any) -> None:
+        pass
+
+    def append(self, item: Any) -> None:
+        pass
+
+    def extend(self, items: Any) -> None:
+        pass
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        pass
+
+
+class _SalvageUnpickler(pickle.Unpickler):
+    """`find_class` that substitutes `_AnyStub` for any unimportable global and
+    records what was missing, so a structurally intact blob whose strict unpickle
+    died on an import can still be decoded far enough to recover the envelope."""
+
+    def __init__(self, file: io.BytesIO, missing: set[str]) -> None:
+        super().__init__(file)
+        self._missing = missing
+
+    def find_class(self, module: str, name: str) -> Any:
+        try:
+            return super().find_class(module, name)
+        except (ImportError, AttributeError):
+            self._missing.add(f"{module}.{name}")
+            return _AnyStub
+
+
+def _salvage_opaque(blob: bytes) -> _Record | None:
+    """Recover the record envelope from a blob whose strict unpickle failed on a
+    missing import. Returns an opaque record (`value` is an `_OpaqueValue` holding
+    the raw blob) or `None` when the blob is genuinely corrupt — the exact-length
+    and envelope checks reject a torn frame that happens to raise an import error.
+    `missing` must be non-empty: a blob that salvages without a single stub
+    substitution failed strict parsing for some other reason and is not import
+    skew."""
+    reader = io.BytesIO(blob)
+    missing: set[str] = set()
+    try:
+        obj = _SalvageUnpickler(reader, missing).load()
+    except Exception:  # noqa: BLE001 — genuinely corrupt; caller treats it as a tear
+        return None
+    if reader.tell() != len(blob) or not missing or not _valid_envelope(obj):
+        return None
+    key, _value, expire_time, store_time, deleted, spill = obj
+    return _Record(
+        key, _OpaqueValue(blob, tuple(sorted(missing))), expire_time, store_time, deleted, spill
+    )
+
+
 class _PackedIndex:
     """One prefix's in-memory index: a sorted packed digest array plus a write overlay.
 
@@ -254,20 +343,25 @@ def _record_from(obj: Any) -> _Record | None:
     Admitting one would seat a poison record in the index whose mistyped
     `store_time`/`expire_time` raises `TypeError` on the read path — the exact
     'a corrupt log breaks reads' outcome resync exists to prevent."""
+    return _Record(*obj) if _valid_envelope(obj) else None
+
+
+def _valid_envelope(obj: Any) -> bool:
+    """True when `obj` is a 6-tuple whose non-value fields carry the right types.
+    The value field is deliberately unchecked — it may be anything, including the
+    `_AnyStub` placeholders a salvage pass substitutes for unimportable globals."""
     if not (isinstance(obj, tuple) and len(obj) == 6):
-        return None
+        return False
     key, _value, expire_time, store_time, deleted, spill = obj
     if not isinstance(key, str):
-        return None
+        return False
     if expire_time is not None and not isinstance(expire_time, (int, float)):
-        return None
+        return False
     if not isinstance(store_time, (int, float)):
-        return None
+        return False
     if not isinstance(deleted, bool):
-        return None
-    if spill is not None and not isinstance(spill, str):
-        return None
-    return _Record(*obj)
+        return False
+    return spill is None or isinstance(spill, str)
 
 
 def _parse_frame(data: bytes, pos: int) -> tuple[_Record, int] | None:
@@ -278,7 +372,12 @@ def _parse_frame(data: bytes, pos: int) -> tuple[_Record, int] | None:
     The exact-length check is what makes `_resync` trustworthy: a genuine frame's
     blob is a single pickle with no trailing bytes, so any false anchor whose
     `length` header overshoots the real pickle is rejected here rather than seated
-    as a spurious record."""
+    as a spurious record.
+
+    A structurally intact frame whose value references importables missing from
+    this environment is NOT a parse failure: it comes back as an opaque record
+    (`value` is an `_OpaqueValue` carrying the raw blob) so scans don't misreport
+    it as a tear and rewrites don't drop it."""
     if pos + _HEADER.size > len(data):
         return None
     (length,) = _HEADER.unpack(data[pos : pos + _HEADER.size])
@@ -289,6 +388,13 @@ def _parse_frame(data: bytes, pos: int) -> tuple[_Record, int] | None:
     reader = io.BytesIO(data[blob_start:blob_end])
     try:
         obj = pickle.Unpickler(reader).load()
+    except (ImportError, AttributeError):
+        # The blob may be intact but reference importables this environment no
+        # longer has (deleted experiment code, another branch's classes): NOT a
+        # tear. Salvage the envelope and carry the raw bytes as an opaque value;
+        # genuinely corrupt bytes fail the salvage too and stay a tear.
+        rec = _salvage_opaque(data[blob_start:blob_end])
+        return (rec, blob_end) if rec is not None else None
     except Exception:  # noqa: BLE001 — torn/corrupt frame; caller resyncs
         return None
     if reader.tell() != length:
@@ -333,6 +439,10 @@ def _read_records(path: Path) -> _ScanResult:
     record past the tear: invisible to reads, so each silently re-executes and re-bills forever.
     Here a bad frame is skipped (resynced via the PROTO-opcode anchor). A benign truncated *final*
     write (the documented crash-mid-append case) recovers nothing past it (`recovered == 0`).
+
+    A frame whose value merely fails to *import* in this environment is not a tear at all — it
+    parses to an opaque record (see `_OpaqueValue`) and lands in `records` like any other, so
+    `tear_at`/`recovered` report only genuine byte damage.
 
     `OSError` from the read propagates — a caller that must not treat an unreadable log as empty
     (consolidation, which would then prune it) relies on that."""
@@ -386,6 +496,11 @@ def _iter_records(path: Path) -> Iterator[_Record]:
 
 
 def _frame(rec: _Record) -> bytes:
+    if isinstance(rec.value, _OpaqueValue):
+        # Byte-verbatim round-trip: a rewrite (compact/consolidate) must never
+        # re-encode a value it could not decode — the original blob already
+        # carries this exact envelope.
+        return _HEADER.pack(len(rec.value.blob)) + rec.value.blob
     blob = pickle.dumps(tuple(rec), protocol=pickle.HIGHEST_PROTOCOL)
     return _HEADER.pack(len(blob)) + blob
 
@@ -692,6 +807,8 @@ class LogCache:
                 return (self.directory / rec.spill).stat().st_size
             except OSError:
                 return 0
+        if isinstance(rec.value, _OpaqueValue):
+            return len(rec.value.blob)
         return len(pickle.dumps(rec.value, protocol=pickle.HIGHEST_PROTOCOL))
 
     # ── index ─────────────────────────────────────────────────────────────────
@@ -838,6 +955,16 @@ class LogCache:
         if not self._live(rec, now):
             return _MISSING
         if not rec.spill:
+            if isinstance(rec.value, _OpaqueValue):
+                logger.warning(
+                    "emboss.LogCache: value for key %r references importables missing "
+                    "from this environment (%s); treating as a miss — a recompute "
+                    "supersedes it, and compaction/consolidation preserve the original "
+                    "record verbatim.",
+                    key,
+                    ", ".join(rec.value.missing),
+                )
+                return _MISSING
             return rec.value
         try:
             return self._spill_read(rec.spill)
@@ -847,6 +974,18 @@ class LogCache:
             logger.warning(
                 "emboss.LogCache: spill file %s for key %r could not be read "
                 "(%s); treating as a miss.",
+                rec.spill,
+                key,
+                exc,
+            )
+            return _MISSING
+        except (ImportError, AttributeError) as exc:
+            # Same import skew as an inline `_OpaqueValue`, hit lazily: the spill
+            # file is intact and readable where those imports exist.
+            logger.warning(
+                "emboss.LogCache: spill file %s for key %r references importables "
+                "missing from this environment (%s); treating as a miss — the file "
+                "is intact and readable where those imports exist.",
                 rec.spill,
                 key,
                 exc,

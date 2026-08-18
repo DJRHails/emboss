@@ -6,6 +6,7 @@ import ast
 import asyncio
 import contextlib
 import contextvars
+import dataclasses
 import functools
 import hashlib
 import inspect
@@ -222,58 +223,150 @@ def _is_basemodel_class(cls: Any) -> bool:
     return BaseModel is not None and isinstance(cls, type) and issubclass(cls, BaseModel)
 
 
-def _model_info(annotation: Any) -> tuple[type | None, str]:
-    """Return `(Model class, container)` extracted from a return annotation.
-
-    `container` is one of `"none"` (single value), `"list"`, or `"dict"`.
-    Returns `(None, "none")` when no BaseModel is in play (decorator falls back
-    to pass-through encode/decode).
-    """
-    if BaseModel is None or annotation is inspect.Parameter.empty or annotation is None:
-        return None, "none"
-    if _is_basemodel_class(annotation):
-        return annotation, "none"
-
-    origin = typing.get_origin(annotation)
-    if origin in (Union, types.UnionType):
-        for arg in typing.get_args(annotation):
-            if _is_basemodel_class(arg):
-                return arg, "none"
-        return None, "none"
-    if origin is list:
-        args = typing.get_args(annotation)
-        if args and _is_basemodel_class(args[0]):
-            return args[0], "list"
-    if origin is dict:
-        args = typing.get_args(annotation)
-        if len(args) == 2 and _is_basemodel_class(args[1]):
-            return args[1], "dict"
-    return None, "none"
+@functools.cache
+def _dataclass_rebuildable(cls: type) -> bool:
+    """True when `cls(**field_dict)` reconstructs an instance from its stored
+    fields: every stored field is settable through `__init__` and the constructor
+    takes nothing else (no `init=False` fields, no `InitVar` init-only params).
+    Anything else keeps the raw-pickle passthrough — storing a dict we could not
+    rebuild would hand callers a silently wrong type on the warm hit."""
+    stored = {f.name for f in dataclasses.fields(cls)}
+    if any(not f.init for f in dataclasses.fields(cls)):
+        return False
+    try:
+        params = inspect.signature(cls).parameters
+    except (TypeError, ValueError):
+        return False
+    return set(params) == stored
 
 
-def _encode(value: Any, model_cls: type | None, container: str) -> Any:
-    """Convert pydantic models to plain dicts before pickling."""
-    if value is None or model_cls is None:
+def _codable_dataclass(cls: Any) -> bool:
+    return (
+        isinstance(cls, type) and dataclasses.is_dataclass(cls) and _dataclass_rebuildable(cls)
+    )
+
+
+@functools.cache
+def _dataclass_hints(cls: type) -> Mapping[str, Any] | None:
+    """Resolved field annotations for recursive encode/decode of nested fields;
+    `None` when a hint cannot be resolved (the field then passes through raw)."""
+    try:
+        return typing.get_type_hints(cls)
+    except Exception:  # noqa: BLE001 — unresolvable hints → passthrough fields
+        return None
+
+
+def _wants_codec(anno: Any, _depth: int = 0) -> bool:
+    """Decoration-time gate: does the annotation mention a BaseModel or a
+    rebuildable dataclass anywhere a value walk could reach one? Functions whose
+    returns can't contain either stay on the zero-overhead passthrough path."""
+    if _depth > 8 or anno is inspect.Parameter.empty or anno is None:
+        return False
+    if _is_basemodel_class(anno) or _codable_dataclass(anno):
+        return True
+    if typing.get_origin(anno) in (Union, types.UnionType, list, tuple, dict):
+        return any(
+            _wants_codec(arg, _depth + 1)
+            for arg in typing.get_args(anno)
+            if arg is not Ellipsis
+        )
+    return False
+
+
+def _runtime_matches(value: Any, anno: Any) -> bool:
+    """Does `value` plausibly inhabit union member `anno`? Used only to pick which
+    member of a Union to encode/decode through."""
+    if _is_basemodel_class(anno) or _codable_dataclass(anno):
+        return isinstance(value, anno)
+    origin = typing.get_origin(anno)
+    return origin in (list, tuple, dict) and isinstance(value, origin)
+
+
+def _encode(value: Any, anno: Any) -> Any:
+    """Convert BaseModels and rebuildable dataclasses reachable through `anno`
+    into plain dicts before pickling, recursing through `list`/`tuple`/`dict`
+    containers and dataclass fields — so the stored bytes carry no class
+    references, which would make the value unreadable once the defining code is
+    gone. A value that doesn't match the annotation passes through untouched
+    (the old raw-pickle behaviour)."""
+    if value is None or anno is None:
         return value
-    if container == "list":
-        return [v.model_dump() if isinstance(v, model_cls) else v for v in value]
-    if container == "dict":
-        return {k: (v.model_dump() if isinstance(v, model_cls) else v) for k, v in value.items()}
-    if isinstance(value, model_cls):
-        return value.model_dump()
+    if _is_basemodel_class(anno):
+        return value.model_dump() if isinstance(value, anno) else value
+    if _codable_dataclass(anno):
+        if not isinstance(value, anno):
+            return value
+        hints = _dataclass_hints(anno) or {}
+        return {
+            f.name: _encode(getattr(value, f.name), hints.get(f.name))
+            for f in dataclasses.fields(value)
+        }
+    origin = typing.get_origin(anno)
+    args = typing.get_args(anno)
+    if origin in (Union, types.UnionType):
+        for arg in args:
+            if arg is type(None):
+                continue
+            if _wants_codec(arg) and _runtime_matches(value, arg):
+                return _encode(value, arg)
+        return value
+    if origin is list and args and isinstance(value, list):
+        return [_encode(v, args[0]) for v in value]
+    if origin is tuple and args and isinstance(value, tuple):
+        if len(args) == 2 and args[1] is Ellipsis:
+            return tuple(_encode(v, args[0]) for v in value)
+        if len(args) == len(value):
+            return tuple(_encode(v, a) for v, a in zip(value, args))
+        return value
+    if origin is dict and len(args) == 2 and isinstance(value, dict):
+        return {k: _encode(v, args[1]) for k, v in value.items()}
     return value
 
 
-def _decode(value: Any, model_cls: type | None, container: str) -> Any:
-    """Rehydrate dicts into pydantic models on cache hit."""
-    if value is None or model_cls is None:
+def _decode(value: Any, anno: Any) -> Any:
+    """Rehydrate dicts back into models/dataclasses on a cache hit, mirroring
+    `_encode`'s walk; anything that doesn't match the expected shape passes
+    through untouched."""
+    if value is None or anno is None:
         return value
-    if container == "list":
-        return [model_cls.model_validate(v) if isinstance(v, dict) else v for v in value]
-    if container == "dict":
-        return {k: (model_cls.model_validate(v) if isinstance(v, dict) else v) for k, v in value.items()}
-    if isinstance(value, dict):
-        return model_cls.model_validate(value)
+    if _is_basemodel_class(anno):
+        return anno.model_validate(value) if isinstance(value, dict) else value
+    if _codable_dataclass(anno):
+        if not isinstance(value, dict):
+            return value
+        hints = _dataclass_hints(anno) or {}
+        kwargs = {k: _decode(v, hints.get(k)) for k, v in value.items()}
+        try:
+            return anno(**kwargs)
+        except TypeError:
+            logger.warning(
+                "emboss: cached value for %s no longer matches its constructor "
+                "(fields changed since it was stored?); returning the raw field "
+                "dict.",
+                anno.__qualname__,
+            )
+            return value
+    origin = typing.get_origin(anno)
+    args = typing.get_args(anno)
+    if origin in (Union, types.UnionType):
+        for arg in args:
+            if arg is type(None):
+                continue
+            if (_is_basemodel_class(arg) or _codable_dataclass(arg)) and isinstance(value, dict):
+                return _decode(value, arg)
+            if _wants_codec(arg) and _runtime_matches(value, arg):
+                return _decode(value, arg)
+        return value
+    if origin is list and args and isinstance(value, list):
+        return [_decode(v, args[0]) for v in value]
+    if origin is tuple and args and isinstance(value, tuple):
+        if len(args) == 2 and args[1] is Ellipsis:
+            return tuple(_decode(v, args[0]) for v in value)
+        if len(args) == len(value):
+            return tuple(_decode(v, a) for v, a in zip(value, args))
+        return value
+    if origin is dict and len(args) == 2 and isinstance(value, dict):
+        return {k: _decode(v, args[1]) for k, v in value.items()}
     return value
 
 
@@ -424,9 +517,14 @@ def cached(
     it on every behaviour change. `also_accept` still works alongside it
     (e.g. to migrate source-keyed entries into a manual-key identity).
 
-    Detects `BaseModel` / `list[Model]` / `dict[str, Model]` return annotations
-    and stores them as dicts (rehydrated on read) so model classes defined in
-    `__main__` round-trip across script invocations.
+    Return annotations that mention a pydantic `BaseModel` or a rebuildable
+    dataclass — directly, inside `list`/`tuple`/`dict` containers (nested to any
+    depth), in a union, or in dataclass fields — have those values stored as
+    plain dicts and rehydrated on read, so the cached bytes carry no class
+    references: classes defined in `__main__` round-trip across script
+    invocations, and a value outlives the module that defined its class. A
+    dataclass with `init=False` fields or `InitVar` params can't be rebuilt from
+    its field dict and keeps the raw-pickle passthrough.
 
     When no `cache` is passed, a default `emboss.SqliteCache` is created at the
     directory named by the `EMBOSS_CACHE_DIR` environment variable; if unset, it
@@ -468,7 +566,22 @@ def cached(
             return_anno = inspect.signature(func).return_annotation
         except (TypeError, ValueError):
             return_anno = inspect.Parameter.empty
-        model_cls, container = _model_info(return_anno)
+        if isinstance(return_anno, str):
+            # PEP 563 (`from __future__ import annotations`) delivers the annotation
+            # as a string `_model_info` cannot see a BaseModel in — silently
+            # disabling the model_dump encoding for every function in such a module
+            # (its models then pickle by class reference and die with the defining
+            # code). `get_type_hints` resolves it (including nested forward refs);
+            # a name unresolvable at decoration time (e.g. behind TYPE_CHECKING, in
+            # this or any parameter annotation) falls back to no model encoding, as
+            # before.
+            try:
+                return_anno = typing.get_type_hints(func).get(
+                    "return", inspect.Parameter.empty
+                )
+            except Exception:  # noqa: BLE001 — unresolvable annotation → passthrough
+                return_anno = inspect.Parameter.empty
+        codec_anno = return_anno if _wants_codec(return_anno) else None
         is_async = asyncio.iscoroutinefunction(func)
 
         def _keys(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> tuple[str, list[str]]:
@@ -513,7 +626,7 @@ def cached(
             key, accept_keys = _keys(args, kwargs)
             raw = _lookup(key, accept_keys)
             if raw is not _MISSING:
-                decoded = _decode(raw, model_cls, container)
+                decoded = _decode(raw, codec_anno)
                 if is_async:
 
                     async def return_cached():
@@ -530,7 +643,7 @@ def cached(
                     if _cache_only_active():
                         raise CacheMiss(func_name=info.name, cache_id=info.cache_id, key=key)
                     result = await func(*args, **kwargs)  # type: ignore[misc]
-                    _store(key, _encode(result, model_cls, container))
+                    _store(key, _encode(result, codec_anno))
                     return result
 
                 return execute()  # type: ignore[return-value]
@@ -538,7 +651,7 @@ def cached(
             if _cache_only_active():
                 raise CacheMiss(func_name=info.name, cache_id=info.cache_id, key=key)
             result = func(*args, **kwargs)
-            _store(key, _encode(result, model_cls, container))
+            _store(key, _encode(result, codec_anno))
             return result
 
         wrapper.__emboss__ = info  # type: ignore[attr-defined]

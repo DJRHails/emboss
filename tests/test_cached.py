@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import diskcache
 import pytest
 from pydantic import BaseModel
@@ -49,6 +51,35 @@ def test_basemodel_round_trip(cache):
     assert calls["n"] == 1
 
 
+def test_string_annotation_still_encodes_model(cache):
+    """PEP 563 (`from __future__ import annotations`) turns the return annotation
+    into a string. Detection must resolve it — otherwise the model pickles by
+    class reference and the cached value dies with the defining module."""
+
+    @cached(cache)
+    def f() -> "M":  # noqa: UP037 — the string annotation IS the test subject
+        return M(name="stringy", n=2)
+
+    r1 = f()
+    assert isinstance(r1, M) and r1.name == "stringy"
+    # the STORED value is the model_dump dict, not a pickled M instance
+    stored = cache[next(iter(cache))]
+    assert isinstance(stored, dict) and stored["name"] == "stringy"
+    assert isinstance(f(), M)  # decoded back to a model on a warm hit
+
+
+def test_unresolvable_string_annotation_falls_back(cache):
+    """A string annotation naming something not importable at decoration time
+    (e.g. behind TYPE_CHECKING) must not raise — encoding just stays off."""
+
+    @cached(cache)
+    def f() -> "NotDefinedAnywhere":  # noqa: F821, UP037 — deliberately unresolvable
+        return {"plain": True}
+
+    assert f() == {"plain": True}
+    assert f() == {"plain": True}
+
+
 def test_list_of_basemodel_round_trip(cache):
     calls = {"n": 0}
 
@@ -74,6 +105,115 @@ def test_dict_of_basemodel_round_trip(cache):
     assert f() == f()
     assert calls["n"] == 1
     assert isinstance(f()["x"], M)
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class Score:
+    value: float
+    tags: tuple[int, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class Wrapped:
+    inner: Score
+    label: str
+
+
+def _stored_values(cache):
+    return [cache[k] for k in cache]
+
+
+def test_dataclass_round_trip_stores_dict(cache):
+    @cached(cache)
+    def f() -> Score:
+        return Score(value=0.5, tags=(1, 2))
+
+    r = f()
+    assert isinstance(r, Score) and r == Score(value=0.5, tags=(1, 2))
+    stored = _stored_values(cache)[0]
+    assert isinstance(stored, dict) and stored == {"value": 0.5, "tags": (1, 2)}
+    assert isinstance(f(), Score)  # warm hit rehydrates
+
+
+def test_nested_dataclass_fields_rehydrate(cache):
+    @cached(cache)
+    def f() -> Wrapped:
+        return Wrapped(inner=Score(value=1.0), label="w")
+
+    assert f() == f() == Wrapped(inner=Score(value=1.0), label="w")
+    assert isinstance(f().inner, Score)
+    stored = _stored_values(cache)[0]
+    assert stored == {"inner": {"value": 1.0, "tags": ()}, "label": "w"}
+
+
+def test_variadic_tuple_of_models_round_trip(cache):
+    @cached(cache)
+    def f() -> tuple[M, ...]:
+        return (M(name="a"), M(name="b"))
+
+    r = f()
+    assert isinstance(r, tuple) and all(isinstance(m, M) for m in r)
+    assert [m.name for m in f()] == ["a", "b"]
+    stored = _stored_values(cache)[0]
+    assert all(isinstance(v, dict) for v in stored)
+
+
+def test_fixed_tuple_mixed_elements_round_trip(cache):
+    @cached(cache)
+    def f() -> tuple[M, int]:
+        return (M(name="pair", n=1), 7)
+
+    m, n = f()
+    assert isinstance(m, M) and n == 7
+    stored = _stored_values(cache)[0]
+    assert isinstance(stored[0], dict) and stored[1] == 7
+
+
+def test_list_of_dataclass_round_trip(cache):
+    @cached(cache)
+    def f() -> list[Score]:
+        return [Score(value=2.0)]
+
+    assert f() == [Score(value=2.0)]
+    assert isinstance(f()[0], Score)
+
+
+def test_optional_dataclass_round_trip(cache):
+    @cached(cache)
+    def f(x: int) -> Score | None:
+        return Score(value=float(x)) if x else None
+
+    assert f(0) is None
+    assert f(3) == Score(value=3.0) and isinstance(f(3), Score)
+
+
+@dataclasses.dataclass
+class NotRebuildable:
+    x: int
+    derived: int = dataclasses.field(init=False, default=0)
+
+
+def test_non_rebuildable_dataclass_keeps_raw_pickle(cache):
+    """A dataclass whose field dict can't drive its constructor must NOT be
+    dict-encoded — the warm hit would hand back a dict where the caller expects
+    the dataclass. It stays on the raw-pickle passthrough."""
+
+    @cached(cache)
+    def f() -> NotRebuildable:
+        return NotRebuildable(x=1)
+
+    assert isinstance(f(), NotRebuildable)
+    assert isinstance(f(), NotRebuildable)  # warm hit too
+    assert isinstance(_stored_values(cache)[0], NotRebuildable)
+
+
+def test_value_not_matching_annotation_passes_through(cache):
+    @cached(cache)
+    def f() -> Score:
+        return {"already": "a dict"}  # type: ignore[return-value] — deliberate lie
+
+    assert f() == {"already": "a dict"}
+    assert f() == {"already": "a dict"}
 
 
 def test_optional_basemodel_none_caches(cache):
