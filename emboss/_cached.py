@@ -256,6 +256,23 @@ def _dataclass_hints(cls: type) -> Mapping[str, Any] | None:
         return None
 
 
+def _union_codec_members(args: tuple[Any, ...]) -> tuple[Any, ...] | None:
+    """The union's codec-relevant members, or `None` when the union is ambiguous.
+
+    A stored dict (or container) must map back to exactly one member on decode:
+    two model/dataclass members (`SmushRationale | RationaleRefusal`), or two
+    members sharing a container origin (`list[A] | list[B]`), cannot be told
+    apart once dict-encoded — such a union stays on the raw-pickle passthrough,
+    exactly the pre-codec behaviour for it."""
+    class_members = [a for a in args if _is_basemodel_class(a) or _codable_dataclass(a)]
+    if len(class_members) > 1:
+        return None
+    origins = [o for o in map(typing.get_origin, args) if o in (list, tuple, dict)]
+    if len(origins) != len(set(origins)):
+        return None
+    return tuple(a for a in args if a is not type(None))
+
+
 def _wants_codec(anno: Any, _depth: int = 0) -> bool:
     """Decoration-time gate: does the annotation mention a BaseModel or a
     rebuildable dataclass anywhere a value walk could reach one? Functions whose
@@ -264,7 +281,11 @@ def _wants_codec(anno: Any, _depth: int = 0) -> bool:
         return False
     if _is_basemodel_class(anno) or _codable_dataclass(anno):
         return True
-    if typing.get_origin(anno) in (Union, types.UnionType, list, tuple, dict):
+    origin = typing.get_origin(anno)
+    if origin in (Union, types.UnionType):
+        members = _union_codec_members(typing.get_args(anno))
+        return members is not None and any(_wants_codec(a, _depth + 1) for a in members)
+    if origin in (list, tuple, dict):
         return any(
             _wants_codec(arg, _depth + 1)
             for arg in typing.get_args(anno)
@@ -304,9 +325,8 @@ def _encode(value: Any, anno: Any) -> Any:
     origin = typing.get_origin(anno)
     args = typing.get_args(anno)
     if origin in (Union, types.UnionType):
-        for arg in args:
-            if arg is type(None):
-                continue
+        members = _union_codec_members(args)
+        for arg in members or ():
             if _wants_codec(arg) and _runtime_matches(value, arg):
                 return _encode(value, arg)
         return value
@@ -349,9 +369,8 @@ def _decode(value: Any, anno: Any) -> Any:
     origin = typing.get_origin(anno)
     args = typing.get_args(anno)
     if origin in (Union, types.UnionType):
-        for arg in args:
-            if arg is type(None):
-                continue
+        members = _union_codec_members(args)
+        for arg in members or ():
             if (_is_basemodel_class(arg) or _codable_dataclass(arg)) and isinstance(value, dict):
                 return _decode(value, arg)
             if _wants_codec(arg) and _runtime_matches(value, arg):

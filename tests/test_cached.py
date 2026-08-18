@@ -207,6 +207,50 @@ def test_non_rebuildable_dataclass_keeps_raw_pickle(cache):
     assert isinstance(_stored_values(cache)[0], NotRebuildable)
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class Refusal:
+    error: str
+
+
+def test_ambiguous_union_stays_raw_pickle(cache):
+    """`A | B` with two codable members can't be told apart once dict-encoded —
+    the decode of a stored dict couldn't pick the member. Such unions must stay
+    on the raw-pickle passthrough (the pre-codec behaviour), instances intact."""
+
+    @cached(cache)
+    def f(ok: bool) -> Score | Refusal:
+        return Score(value=1.0) if ok else Refusal(error="nope")
+
+    assert isinstance(f(True), Score) and isinstance(f(False), Refusal)
+    assert isinstance(f(True), Score) and isinstance(f(False), Refusal)  # warm hits
+    assert all(isinstance(v, (Score, Refusal)) for v in _stored_values(cache))
+
+
+def test_list_of_ambiguous_union_stays_raw_pickle(cache):
+    @cached(cache)
+    def f() -> list[Score | Refusal]:
+        return [Score(value=2.0), Refusal(error="mid"), Score(value=3.0)]
+
+    cold = f()
+    warm = f()
+    assert warm == cold
+    assert isinstance(warm[1], Refusal) and isinstance(warm[2], Score)
+
+
+def test_union_of_class_and_its_list_disambiguates_by_shape(cache):
+    """`A | list[A]` IS unambiguous — a dict is the class, a list is the list —
+    so both shapes encode and rehydrate."""
+
+    @cached(cache)
+    def f(many: bool) -> Score | list[Score]:
+        return [Score(value=4.0)] if many else Score(value=5.0)
+
+    assert f(False) == Score(value=5.0) and isinstance(f(False), Score)
+    assert f(True) == [Score(value=4.0)] and isinstance(f(True)[0], Score)
+    stored = _stored_values(cache)
+    assert all(isinstance(v, (dict, list)) for v in stored)  # dict-encoded, no instances
+
+
 def test_value_not_matching_annotation_passes_through(cache):
     @cached(cache)
     def f() -> Score:
