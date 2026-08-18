@@ -1,8 +1,11 @@
 """emboss — On-Disk Input-keyed Cache.
 
 Dependency-free disk-backed memoization, with auto-detection of pydantic v2
-`BaseModel` return types (encoded via `model_dump`, decoded via `model_validate`)
-so models defined in `__main__` round-trip across script invocations.
+`BaseModel` and dataclass return types — directly or nested in
+`list`/`tuple`/`dict` containers and dataclass fields — stored as plain dicts
+and rehydrated on read, so the cached bytes carry no class references: models
+defined in `__main__` round-trip across script invocations, and a cached value
+outlives the module that defined its class.
 
 Three backends, all satisfying the `Cache` protocol:
 
