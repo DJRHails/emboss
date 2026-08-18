@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import typing
+from collections.abc import Mapping
 
 import diskcache
 import pytest
@@ -213,6 +214,10 @@ class Refusal:
     error: str
 
 
+class WrappedDict(dict):
+    """Module-level so raw-pickled instances round-trip by class reference."""
+
+
 def test_ambiguous_union_stays_raw_pickle(cache):
     """`A | B` with two codable members can't be told apart once dict-encoded —
     the decode of a stored dict couldn't pick the member. Such unions must stay
@@ -281,6 +286,46 @@ def test_union_with_typeddict_member_stays_raw_pickle(cache):
     assert isinstance(f(True), Score) and isinstance(f(True), Score)
     assert f(False) == {"value": 2.0}
     assert isinstance(f(False), dict) and not isinstance(f(False), Score)
+
+
+def test_union_with_mapping_member_stays_raw_pickle(cache):
+    """`Mapping[...]` members are dict-shaped at runtime even though their
+    origin is `collections.abc.Mapping`, not `dict` — a stored dict could be
+    either member, so the union must stay on the raw-pickle passthrough."""
+
+    @cached(cache)
+    def f(ok: bool) -> Refusal | Mapping[str, str]:
+        return Refusal(error="bad") if ok else {"error": "just a dict"}
+
+    assert isinstance(f(True), Refusal) and isinstance(f(True), Refusal)
+    assert f(False) == {"error": "just a dict"}
+    assert isinstance(f(False), dict) and not isinstance(f(False), Refusal)
+
+
+def test_union_with_dict_subclass_member_stays_raw_pickle(cache):
+    """A `dict` subclass member is claimed by `isinstance(value, dict)` on
+    decode just like a plain dict, so it collides with a class member."""
+
+    @cached(cache)
+    def f(ok: bool) -> Refusal | WrappedDict:
+        return Refusal(error="bad") if ok else WrappedDict({"error": "just a dict"})
+
+    assert isinstance(f(True), Refusal) and isinstance(f(True), Refusal)
+    assert f(False) == {"error": "just a dict"}
+    assert not isinstance(f(False), Refusal)
+
+
+def test_union_with_any_member_stays_raw_pickle(cache):
+    """An `Any` member can hold a dict at runtime, so it collides with a class
+    member's dict encoding — the union stays on the raw-pickle passthrough."""
+
+    @cached(cache)
+    def f(ok: bool) -> Refusal | typing.Any:
+        return Refusal(error="bad") if ok else {"error": "just a dict"}
+
+    assert isinstance(f(True), Refusal) and isinstance(f(True), Refusal)
+    assert f(False) == {"error": "just a dict"}
+    assert isinstance(f(False), dict) and not isinstance(f(False), Refusal)
 
 
 def test_value_not_matching_annotation_passes_through(cache):
