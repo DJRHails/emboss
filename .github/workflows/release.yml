@@ -18,7 +18,15 @@ permissions:
 jobs:
   check:
     name: Detect version bump
-    runs-on: ubuntu-latest
+    # taffy's self-hosted pool — GitHub-hosted minutes are billed, and this job
+    # runs on every push to main while the publish below only fires on a version
+    # bump. No fork guard is needed: this workflow has no pull_request trigger,
+    # so only pushes to main and manual dispatches reach it, both trusted.
+    # Escape hatch: set the CI_FALLBACK repo variable to 'true'.
+    runs-on: >-
+      ${{ vars.CI_FALLBACK == 'true'
+      && 'ubuntu-latest'
+      || fromJSON('["self-hosted", "linux", "x64", "taffy"]') }}
     outputs:
       version: ${{ steps.v.outputs.version }}
       publish: ${{ steps.v.outputs.publish }}
@@ -46,6 +54,12 @@ jobs:
     name: Build + publish to PyPI
     needs: check
     if: needs.check.outputs.publish == 'true'
+    # DELIBERATELY GitHub-hosted, unlike `check` above. This job mints an OIDC
+    # token that PyPI exchanges for publish rights to `emboss`. taffy is a
+    # persistent host running 18 other repos' CI as the same `actions` user, so a
+    # publishing credential — even a short-lived one — should not live there
+    # alongside unrelated jobs. It fires only on a version bump, so the paid
+    # minutes are rare and buy real isolation.
     runs-on: ubuntu-latest
     environment:
       name: pypi
