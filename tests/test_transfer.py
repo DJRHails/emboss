@@ -37,6 +37,30 @@ def test_transfer_across_backends(tmp_path):
     src.close()
 
 
+def test_refused_destination_write_counts_as_skipped(caplog):
+    """A destination whose `set()` returns False (diskcache does, on Timeout)
+    did NOT store the value — it must count as skipped, not copied, so the
+    reported count is honest and `clear_source` cannot delete the only copy."""
+
+    class RefusingDest:
+        def __init__(self):
+            self.store = {}
+
+        def set(self, key, value):
+            if key == "b":
+                return False
+            self.store[key] = value
+            return True
+
+    src = {"a": 1, "b": 2}
+    dst = RefusingDest()
+    with caplog.at_level("WARNING"):
+        copied = transfer(src, dst)
+    assert copied == 1
+    assert dst.store == {"a": 1}
+    assert any("were not copied" in r.message for r in caplog.records)
+
+
 def test_transfer_clears_source(tmp_path):
     src = LogCache(tmp_path / "src", writer_id="a")
     dst = SqliteCache(tmp_path / "dst")

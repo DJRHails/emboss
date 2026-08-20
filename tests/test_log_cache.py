@@ -25,7 +25,9 @@ from emboss._log_cache import (
     _parse_frame,
     _read_records,
     _Record,
+    _salvage_opaque,
 )
+from emboss._transfer import transfer
 
 
 @pytest.fixture
@@ -246,7 +248,7 @@ def test_compaction_drops_torn_frame_permanently_and_warns(tmp_path, caplog):
     c = LogCache(tmp_path, writer_id="A")
     with caplog.at_level("WARNING"):
         c.compact("00")
-    assert any("dropped the malformed frame" in r.message for r in caplog.records)
+    assert any("dropped them permanently" in r.message for r in caplog.records)
     # After the rewrite the log is clean: no tear, only the two good records, and reads without
     # having to recover anything past a tear.
     scan = _read_records(log)
@@ -396,10 +398,198 @@ def test_unimportable_spill_reads_as_warned_miss(tmp_path, caplog, ghost_module)
     reader = LogCache(tmp_path / "c", writer_id="B", min_file_size=1)
     with caplog.at_level("WARNING"):
         assert reader.get("k") is None
-    assert any(
-        "importables missing" in r.message and "spill" in r.message
-        for r in caplog.records
+        assert reader.get("k") is None  # warn-once gate covers the spill path too
+    assert (
+        sum(
+            "importables missing" in r.message and "spill" in r.message
+            for r in caplog.records
+        )
+        == 1
     )
+
+
+def test_corrupt_bytes_raising_on_unpickle_stay_tears(ghost_module):
+    """The salvage rejection gates: a blob that raises on strict unpickle but is
+    not an intact record must stay a tear (`_parse_frame` -> None), whichever
+    gate catches it — a relaxed gate would seat poison records in the index."""
+    ghost = ghost_module.Ghost(1)
+    # no record envelope: salvages (missing non-empty) but fails the envelope check
+    bare = pickle.dumps(ghost, protocol=pickle.HIGHEST_PROTOCOL)
+    # a stubbed class in the ENVELOPE itself: store_time fails the typing check
+    bad_envelope = pickle.dumps(
+        ("k", "v", None, ghost, False, None), protocol=pickle.HIGHEST_PROTOCOL
+    )
+    # trailing bytes under an inflated length header: fails the exact-length check
+    record_blob = pickle.dumps(
+        tuple(_rec("k", ghost)), protocol=pickle.HIGHEST_PROTOCOL
+    )
+    inflated = _HEADER.pack(len(record_blob) + 3) + record_blob + b"xyz"
+    sys.modules.pop(_GHOST_MODULE)
+
+    for blob in (bare, bad_envelope):
+        assert _parse_frame(_HEADER.pack(len(blob)) + blob, 0) is None
+    assert _parse_frame(inflated, 0) is None
+
+
+def test_salvage_requires_a_missing_import():
+    """A blob that decodes cleanly without a single stub substitution failed
+    strict parsing for some other reason — it must not become an opaque record."""
+    blob = pickle.dumps(tuple(_rec("k", "plain")), protocol=pickle.HIGHEST_PROTOCOL)
+    assert _salvage_opaque(blob) is None
+
+
+def test_module_raising_on_import_is_skew_not_tear(tmp_path, monkeypatch, ghost_module):
+    """A module whose import-time code raises (the CUDA-gated-package pattern:
+    `raise RuntimeError("CUDA required")` on a CPU box) is as unimportable here
+    as a deleted one — the record must salvage to opaque, not tear."""
+    log = tmp_path / "00" / "test.log"
+    _write_log(log, _rec("g", ghost_module.Ghost(3)))
+    sys.modules.pop(_GHOST_MODULE)
+    (tmp_path / f"{_GHOST_MODULE}.py").write_text('raise RuntimeError("CUDA required")\n')
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    scan = _read_records(log)
+    assert scan.tear_at is None and scan.recovered == 0
+    opaque = scan.records[0].value
+    assert isinstance(opaque, _OpaqueValue)
+    assert f"{_GHOST_MODULE}.Ghost" in opaque.missing
+
+
+def test_expire_time_is_builtin_float(tmp_path):
+    """A float-subclass `expire` (np.float64, say) must not seat a non-builtin
+    in the record envelope — a reader without the defining package would
+    salvage-and-reject the whole record as a tear."""
+
+    class FancyFloat(float):
+        # Mirror np.float64: without __radd__, `time.time() + FancyFloat(60)`
+        # falls to float.__add__ and returns builtin float — leaving this test
+        # green even with the coercion removed (it was mutation-caught vacuous).
+        def __radd__(self, other):
+            return FancyFloat(float(other) + float(self))
+
+    c = LogCache(tmp_path / "c", writer_id="A")
+    c.set("k", "v", expire=FancyFloat(60.0))
+    scan = _read_records(c._log_path(c._prefix("k")))
+    assert type(scan.records[0].expire_time) is float
+
+
+def test_opaque_miss_warns_once_per_key(tmp_path, caplog, ghost_module):
+    c = LogCache(tmp_path / "c", writer_id="A")
+    c.set("k", ghost_module.Ghost(7))
+    c.set("k2", ghost_module.Ghost(8))
+    sys.modules.pop(_GHOST_MODULE)
+
+    reader = LogCache(tmp_path / "c", writer_id="B")
+    with caplog.at_level("WARNING"):
+        assert reader.get("k") is None
+        assert reader.get("k") is None
+        assert reader.get("k2") is None  # a fresh key still warns: per key, not per instance
+    assert sum("importables missing" in r.message for r in caplog.records) == 2
+
+
+def test_spill_module_raising_on_import_is_warned_skew_miss(
+    tmp_path, monkeypatch, caplog, ghost_module
+):
+    """The spill path keys skew on decode failure, not exception type: a module
+    whose import-time code raises (the CUDA-gated pattern) is a deduped warned
+    miss naming the exception — not a "corrupt spill" misdiagnosis."""
+    c = LogCache(tmp_path / "c", writer_id="A", min_file_size=1)  # spill everything
+    c.set("k", ghost_module.Ghost(5))
+    sys.modules.pop(_GHOST_MODULE)
+    (tmp_path / f"{_GHOST_MODULE}.py").write_text('raise RuntimeError("CUDA required")\n')
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    reader = LogCache(tmp_path / "c", writer_id="B", min_file_size=1)
+    with caplog.at_level("WARNING"):
+        assert reader.get("k") is None
+        assert reader.get("k") is None
+    matching = [
+        r.message
+        for r in caplog.records
+        if "failed to decode" in r.message and "CUDA required" in r.message
+    ]
+    assert len(matching) == 1  # named exception, warned once
+
+
+def test_scan_warns_and_clear_keeps_unreadable_log(tmp_path, caplog, monkeypatch):
+    """An unreadable log must not be silently invisible — `transfer()`'s
+    clear_source guard depends on iteration being honest — and `clear()` must
+    never delete a log it could not read (that destroys records invisibly)."""
+    import emboss._log_cache as log_cache_mod
+
+    c = LogCache(tmp_path / "c", writer_id="A")
+    c.set("k", "v")
+    log_path = c._log_path(c._prefix("k"))
+    real_read = log_cache_mod._read_records
+
+    def failing_read(path):
+        if path == log_path:
+            raise OSError("simulated EACCES")
+        return real_read(path)
+
+    monkeypatch.setattr(log_cache_mod, "_read_records", failing_read)
+    with caplog.at_level("WARNING"):
+        assert list(iter(c)) == []  # invisible to the scan, but warned
+        assert c.clear() == 0  # refuses to delete what it could not read
+    assert any("could not read log" in r.message for r in caplog.records)
+    assert any("keeping it" in r.message for r in caplog.records)
+    assert log_path.exists()
+
+    monkeypatch.undo()
+    assert LogCache(tmp_path / "c", writer_id="B").get("k") == "v"  # survived
+
+
+def test_compaction_warns_before_dropping_tail_tear(tmp_path, caplog):
+    """A compaction's drop is permanent — even a trailing tear is surfaced,
+    because an intact-but-unsalvageable record looks identical to the benign
+    truncated final write that reads keep quiet about."""
+    c = LogCache(tmp_path / "c", writer_id="A")
+    c.set("k", "v")
+    log = c._log_path(c._prefix("k"))
+    with open(log, "ab") as f:
+        f.write(b"\x00\x00\x10\x00garbage-tail")  # claims 4 KB, supplies a few bytes
+
+    with caplog.at_level("WARNING"):
+        c.compact(c._prefix("k"))
+    assert any("dropped them permanently" in r.message for r in caplog.records)
+    assert c.get("k") == "v"  # the intact record survived the rewrite
+
+
+def test_transfer_warns_on_skipped_keys_without_clear_source(tmp_path, caplog, ghost_module):
+    """The skip warning and the copied count must not depend on `clear_source`:
+    a plain copy that left keys behind still says so (without the refusal note)."""
+    src = LogCache(tmp_path / "src", writer_id="A")
+    src.set("plain", "value")
+    src.set("ghost", ghost_module.Ghost(5))
+    sys.modules.pop(_GHOST_MODULE)
+
+    dst = LogCache(tmp_path / "dst", writer_id="A")
+    with caplog.at_level("WARNING"):
+        copied = transfer(src, dst, clear_source=False)
+    assert copied == 1
+    warn = next(r.message for r in caplog.records if "were not copied" in r.message)
+    assert "clear_source skipped" not in warn
+    assert src.get("plain") == "value"  # source untouched
+
+
+def test_transfer_skips_unreadable_records_and_keeps_source(tmp_path, caplog, ghost_module):
+    """`transfer()` cannot copy a record it cannot decode: it must warn, skip it,
+    and refuse `clear_source` so the only copy survives for environments that
+    can still read it."""
+    src = LogCache(tmp_path / "src", writer_id="A")
+    src.set("plain", "value")
+    src.set("ghost", ghost_module.Ghost(5))
+    sys.modules.pop(_GHOST_MODULE)
+
+    dst = LogCache(tmp_path / "dst", writer_id="A")
+    with caplog.at_level("WARNING"):
+        copied = transfer(src, dst, clear_source=True)
+    assert copied == 1
+    assert dst.get("plain") == "value"
+    assert any("clear_source skipped" in r.message for r in caplog.records)
+
+    sys.modules[_GHOST_MODULE] = ghost_module  # a capable environment still reads it
+    assert LogCache(tmp_path / "src", writer_id="C").get("ghost") == ghost_module.Ghost(5)
 
 
 def test_corrupt_spill_is_a_warned_miss(tmp_path, caplog):
@@ -414,7 +604,7 @@ def test_corrupt_spill_is_a_warned_miss(tmp_path, caplog):
     fresh = LogCache(tmp_path / "c", writer_id="A", min_file_size=1, index_ttl=0)
     with caplog.at_level("WARNING"):
         assert fresh.get("k", "MISS") == "MISS"
-    assert any("unreadable" in r.message for r in caplog.records)
+    assert any("failed to decode" in r.message for r in caplog.records)
 
 
 def test_missing_spill_is_a_quiet_miss(tmp_path, caplog):
@@ -2547,12 +2737,12 @@ def test_clear_with_only_peer_logs_is_a_safe_noop(tmp_path):
     assert pool_file.exists()  # the shared pool is never clear()'s to touch
 
 
-def test_clear_warns_but_still_removes_unreadable_own_log(
-    tmp_path, monkeypatch, caplog
-):
-    """A read fault on our own log during clear() must be surfaced — the
-    returned count under-reports — while the deletion (the requested
-    operation) still proceeds."""
+def test_clear_keeps_unreadable_own_log(tmp_path, monkeypatch, caplog):
+    """A read fault on our own log during clear() must be surfaced AND the log
+    kept — deleting what could not be read destroys records invisibly (and
+    silently defeats `transfer(clear_source=True)`'s left-behind guard). Same
+    keep-on-OSError policy as consolidation's source scan; a later clear()
+    retries once the fault passes."""
     root = tmp_path / "c"
     a = LogCache(root, writer_id="A", prefix_width=1)
     a.set("k", "v")
@@ -2568,8 +2758,12 @@ def test_clear_warns_but_still_removes_unreadable_own_log(
     with caplog.at_level("WARNING"):
         assert a.clear() == 0  # the unreadable log's records go uncounted
 
-    assert not own_log.exists()
+    assert own_log.exists()  # never delete what could not be read
     assert any("during clear()" in r.message for r in caplog.records)
+
+    monkeypatch.undo()
+    assert a.clear() == 1  # fault passed: the retry counts and drops it
+    assert not own_log.exists()
 
 
 def test_pruned_log_tear_is_warned(tmp_path, caplog):
