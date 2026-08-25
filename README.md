@@ -2,7 +2,7 @@
 
 **O**n-**D**isk **I**nput-keyed **C**ache — disk-backed memoization with pydantic-aware encoding.
 
-Version: 0.11.1
+Version: 0.12.0
 
 ```bash
 pip install emboss              # core — zero runtime dependencies (stdlib only)
@@ -85,7 +85,7 @@ The previous behaviour (skip-cache-on-None) is replaced by a `_MISSING` sentinel
 
 ## Cache key
 
-Arguments are converted via `safe_jsonable_encoder` (recursive JSON-friendly conversion handling sets, bytes, dates, `Path`, BaseModel, and objects with `__dict__`), then hashed with the function source + name. Re-decorating the same function body → same key; changing the function body → new key (transparent cache invalidation on code change).
+Arguments are converted via `safe_jsonable_encoder` (recursive JSON-friendly conversion handling sets, bytes, dates, `Path`, BaseModel, and objects with `__dict__`), then hashed with the function source + name. Re-decorating the same function body → same key; changing the function body → new key (transparent cache invalidation on code change). The source hash is AST-canonical **and docstring-agnostic**: formatting, comments, and docstrings — which document behaviour rather than implement it — never invalidate the cache; any other source change does. One exception: a function whose source reads `__doc__` (docstring-as-prompt, doctest-style dispatch) implements behaviour *with* its docstrings, so it keeps the docstring-sensitive keying and a docstring edit still invalidates. Detection is syntactic — an indirect read like `inspect.getdoc(f)` isn't caught; pin such functions with `unsafe_manual_key`.
 
 ### Custom or strict encoder (`default=`)
 
@@ -119,7 +119,7 @@ from emboss import cache_id
 def fetch_user(uid: int) -> dict:
     ...
 
-cache_id(fetch_user)   # "fetch_user:3f2a9c..." (32-hex hash of the AST-canonical source)
+cache_id(fetch_user)   # "fetch_user:3f2a9c..." (32-hex hash of the AST-canonical, docstring-stripped source)
 ```
 
 The `emboss id` CLI prints the same token without writing a script — handy for capturing an identity before (or after) an edit:
@@ -145,6 +145,8 @@ def get_user(uid: int) -> dict:
 ```
 
 Different arguments still miss as usual — migration only redirects keys, never serves a value computed for other inputs. Malformed tokens (anything not `"name:body_hash"`) raise `ValueError` at decoration time.
+
+One migration is built in: entries written by emboss < 0.12 were keyed on docstring-*sensitive* source, so the decorator always accepts that identity as an implicit fallback (tried after any explicit `also_accept` tokens) and copies hits forward — upgrading keeps the cache warm with no action needed. The fallback is derived from the source **as it exists now**, so it only matches entries written under a byte-identical docstring: upgrade first and run once (entries migrate forward), *then* edit docstrings. Any source change to a docstring-bearing function made in the same step as crossing the < 0.12 boundary — a rename, a body refactor, or the docstring edit itself — misses the fallback, and `emboss id --rev <old-rev>` can't recover the old token because it computes the *current* (docstring-stripped) scheme. To migrate those entries, derive the token by hand: `"oldname:" + md5` of `ast.unparse(ast.parse(textwrap.dedent(inspect.getsource(f))))` of the old source *without* docstring stripping — `getsource` of the decorated function, so the `@cached(...)` lines are part of the hash.
 
 ### `unsafe_manual_key` — opt out of source-based invalidation
 
