@@ -2,7 +2,7 @@
 
 **O**n-**D**isk **I**nput-keyed **C**ache — disk-backed memoization with pydantic-aware encoding.
 
-Version: 0.11.1
+Version: 0.12.0
 
 ```bash
 pip install emboss              # core — zero runtime dependencies (stdlib only)
