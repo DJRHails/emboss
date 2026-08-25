@@ -221,3 +221,29 @@ def test_docstring_only_body_keys_like_pass(cache):
         pass
 
     assert cache_key(f) == doc_only_key
+
+
+def test_doc_reading_function_keeps_docstring_sensitive_keying(cache):
+    """A source reading `__doc__` implements behaviour with its docstring — edits invalidate."""
+    from emboss import cache_keys
+
+    calls = []
+
+    @cached(cache)
+    def prompt(x: int) -> str:
+        """You are terse."""
+        calls.append(x)
+        return f"{prompt.__doc__}|{x}"
+
+    assert prompt(1) == "You are terse.|1"
+    _key, accept_keys = cache_keys(prompt, 1)
+    assert accept_keys == []  # docstring stays in the hash → identities coincide, no fallback
+
+    @cached(cache)
+    def prompt(x: int) -> str:  # noqa: F811 — intentional redef with an edited docstring
+        """You are verbose."""
+        calls.append(x)
+        return f"{prompt.__doc__}|{x}"
+
+    assert prompt(1) == "You are verbose.|1"  # MISS — this docstring is load-bearing
+    assert calls == [1, 1]

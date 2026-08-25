@@ -265,3 +265,102 @@ def test_undocumented_function_has_no_implicit_fallback(cache):
 
     _key, accept_keys = cache_keys(f, 1)
     assert accept_keys == []
+
+
+def test_async_docstring_edit_keeps_hit_and_implicit_fallback(cache):
+    """The `ast.AsyncFunctionDef` branch: async docstrings strip and get the fallback too."""
+    from emboss import cache_keys
+
+    calls = []
+
+    @cached(cache)
+    async def f(x: int) -> int:
+        """Original async docstring."""
+        calls.append(x)
+        return x * 3
+
+    assert asyncio.run(f(2)) == 6
+    _key, accept_keys = cache_keys(f, 2)
+    assert len(accept_keys) == 1  # exactly the implicit docstring-sensitive fallback
+
+    @cached(cache)
+    async def f(x: int) -> int:  # noqa: F811 — intentional redef with an edited docstring
+        """Rewritten async docstring."""
+        calls.append(x)
+        return x * 3
+
+    assert asyncio.run(f(2)) == 6  # HIT — the docstring edit doesn't re-key
+    assert calls == [2]
+
+
+def test_explicit_and_implicit_fallbacks_coexist(cache):
+    """A documented function carries the explicit `also_accept` tokens AND the implicit fallback."""
+    from emboss import cache_keys
+
+    calls = []
+
+    @cached(cache)
+    def old_name(x: int) -> int:
+        """Docstring shared by both definitions."""
+        calls.append(x)
+        return x + 7
+
+    old_identity = cache_id(old_name)
+    assert old_name(1) == 8
+
+    @cached(cache, also_accept=[old_identity])
+    def new_name(x: int) -> int:
+        """Docstring shared by both definitions."""
+        calls.append(x)
+        return x + 7
+
+    key, accept_keys = cache_keys(new_name, 1)
+    assert len(accept_keys) == 2  # explicit token first, implicit pre-0.12 fallback after it
+    assert accept_keys[0] == _key_for(old_identity, [1])
+    assert new_name(1) == 8  # rename migration hits via the explicit token
+    assert calls == [1]  # body never re-ran
+    assert cache.get(key) == 8  # and the hit migrated forward to the current key
+
+
+def test_unsafe_manual_key_with_docstring_has_no_implicit_fallback(cache):
+    """A manual key pins the identity completely — no source-derived fallback sneaks in."""
+    from emboss import cache_keys
+
+    @cached(cache, unsafe_manual_key="pinned-v1")
+    def f(x: int) -> int:
+        """Docstring that must not create a fallback identity."""
+        return x
+
+    _key, accept_keys = cache_keys(f, 1)
+    assert accept_keys == []
+
+
+def test_fallback_hit_survives_migration_write_failure(cache, caplog):
+    """The migration write-through is best-effort — a failing `set` must not eat the hit."""
+    from emboss import cache_keys
+
+    class ReadOnlyCache:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def get(self, key, default=None):
+            return self._inner.get(key, default=default)
+
+        def set(self, key, value):
+            raise RuntimeError("attempt to write a readonly database")
+
+    calls = []
+
+    @cached(ReadOnlyCache(cache))
+    def f(x: int) -> int:
+        """Docstring so the implicit fallback exists."""
+        calls.append(x)
+        return x * 2
+
+    _key, accept_keys = cache_keys(f, 5)
+    cache.set(accept_keys[0], 10)  # plant a pre-0.12 entry, bypassing the read-only wrapper
+
+    with caplog.at_level("WARNING", logger="emboss._cached"):
+        assert f(5) == 10  # served from the fallback despite the failed migration write
+    assert calls == []  # body never ran
+    assert any("failed" in record.getMessage() for record in caplog.records)

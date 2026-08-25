@@ -389,6 +389,25 @@ def _decode(value: Any, anno: Any) -> Any:
     return value
 
 
+def _references_doc(tree: ast.Module) -> bool:
+    """True when the source reads `__doc__` anywhere — its docstrings are load-bearing.
+
+    A function that consumes its own (or a nested def/class's) docstring at
+    runtime — the docstring-as-prompt / docstring-as-data pattern — *implements*
+    behaviour with it, so stripping would let a docstring edit change behaviour
+    without changing the key (a silent stale hit). Detection is syntactic:
+    an attribute or name read spelled `__doc__`. Indirect reads
+    (`inspect.getdoc(f)`, `getattr(f, "__doc__")`) are not detected — pin such
+    functions with `unsafe_manual_key` if their docstrings are load-bearing.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == "__doc__":
+            return True
+        if isinstance(node, ast.Name) and node.id == "__doc__":
+            return True
+    return False
+
+
 def _strip_docstrings(tree: ast.Module) -> ast.Module:
     """Remove the docstring statement from the module and every def/class in it.
 
@@ -418,7 +437,9 @@ def _canonical_source(raw_source: str, *, strip_docstrings: bool = True) -> str:
     trailing commas, comments, quote style — and, by default, drops docstrings,
     which document behaviour but don't implement it. All other string-literal
     *contents* are preserved (so two functions whose only difference is the
-    spaces inside a returned string still get distinct keys).
+    spaces inside a returned string still get distinct keys). Exception: when
+    the source reads `__doc__` (see `_references_doc`), docstrings *are* the
+    implementation, so they stay in the hash and edits invalidate as before.
 
     `strip_docstrings=False` reproduces the pre-0.12 docstring-sensitive
     canonicalization — the identity under which older caches were written. The
@@ -432,7 +453,7 @@ def _canonical_source(raw_source: str, *, strip_docstrings: bool = True) -> str:
     """
     try:
         tree = ast.parse(textwrap.dedent(raw_source))
-        if strip_docstrings:
+        if strip_docstrings and not _references_doc(tree):
             tree = _strip_docstrings(tree)
         return ast.unparse(tree)
     except (SyntaxError, ValueError, TypeError, RecursionError):
@@ -445,9 +466,11 @@ class EmbossInfo:
 
     `cache_id` is `f"{name}:{body_hash}"` — the function's identity in the
     keying scheme (`key = md5(name + body_hash + arg_hash)`), where `body_hash`
-    is the md5 of the AST-canonical source, or the `unsafe_manual_key` when one
-    was pinned. `also_accept` echoes the raw fallback identities passed at
-    decoration time.
+    is the md5 of the AST-canonical, docstring-stripped source, or the
+    `unsafe_manual_key` when one was pinned. `also_accept` echoes the raw
+    fallback identities passed at decoration time — the implicit pre-0.12
+    docstring-sensitive fallback is *not* included; `cache_keys()` is the
+    authority for the full fallback set the wrapper reads.
     """
 
     name: str
@@ -481,7 +504,8 @@ def cache_keys(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> tuple[
     """Return `(current key, fallback keys)` for a `@cached` call.
 
     The fallback keys are the explicit `also_accept` identities followed by the
-    implicit pre-0.12 docstring-sensitive identity (when the function has one).
+    implicit pre-0.12 docstring-sensitive identity (when any docstring — the
+    function's own or a nested def/class's — makes the two identities differ).
     The keys come from the wrapper's own keying closure (attached at decoration
     time), so they are byte-identical to what the wrapper reads and writes —
     including the decorator's `default=` encoder setting. `func` is
@@ -553,7 +577,11 @@ def cached(
 
     Keying ignores docstrings as well as comments and formatting — they
     document behaviour, they don't implement it — so editing a docstring never
-    invalidates a warm cache. Entries written by emboss < 0.12, keyed on the
+    invalidates a warm cache. Exception: a source that reads `__doc__` (the
+    docstring-as-prompt pattern) implements behaviour *with* its docstrings,
+    so it keeps the docstring-sensitive keying and docstring edits invalidate
+    as before; indirect reads (`inspect.getdoc`) aren't detected — pin those
+    with `unsafe_manual_key`. Entries written by emboss < 0.12, keyed on the
     docstring-*sensitive* source, are still read via an implicit fallback
     identity and copied forward to the current key on first hit, so the
     upgrade itself keeps the cache warm.
@@ -653,7 +681,7 @@ def cached(
         is_async = asyncio.iscoroutinefunction(func)
 
         def _keys(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> tuple[str, list[str]]:
-            """`(current key, also_accept fallback keys)` for one call's arguments."""
+            """`(current key, fallback keys)` for one call's arguments."""
             json_args = [safe_jsonable_encoder(arg, default=default) for arg in args]
             json_kwargs = {
                 k: safe_jsonable_encoder(v, default=default) for k, v in kwargs.items()
@@ -669,9 +697,10 @@ def cached(
             return key, accept_keys
 
         def _lookup(key: str, accept_keys: list[str]) -> Any:
-            """Read the current key; on miss, try each `also_accept` fallback key
-            in order and migrate the first hit forward to the current key so
-            later reads hit directly."""
+            """Read the current key; on miss, try each fallback key (explicit
+            `also_accept`, then the implicit pre-0.12 identity) in order and
+            migrate the first hit forward to the current key so later reads
+            hit directly."""
             raw = cache.get(key, default=_MISSING)
             if raw is not _MISSING:
                 return raw
@@ -680,13 +709,26 @@ def cached(
                     continue
                 raw = cache.get(accept_key, default=_MISSING)
                 if raw is not _MISSING:
-                    cache.set(key, raw)
+                    try:
+                        cache.set(key, raw)
+                    except Exception:  # noqa: BLE001 — migration is best-effort
+                        # The hit is already in hand; failing to copy it forward
+                        # (read-only backend, disk full) must not turn a cache
+                        # hit into a crash. The next call retries the migration.
+                        logger.warning(
+                            "emboss: %s hit under fallback key %s but migrating it "
+                            "to %s failed; serving the hit, the next call will retry",
+                            info.cache_id,
+                            accept_key,
+                            key,
+                            exc_info=True,
+                        )
                     return raw
             return _MISSING
 
         def _store(key: str, encoded: Any) -> None:
             """Write back under the current key only — old identities are read
-            (and migrated) via `also_accept`, never written to."""
+            and migrated on hit, never written to."""
             cache.set(key, encoded)
 
         @functools.wraps(func)
