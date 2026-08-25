@@ -389,14 +389,41 @@ def _decode(value: Any, anno: Any) -> Any:
     return value
 
 
-def _canonical_source(raw_source: str) -> str:
+def _strip_docstrings(tree: ast.Module) -> ast.Module:
+    """Remove the docstring statement from the module and every def/class in it.
+
+    Only the docstring proper is dropped — the *first* statement of a body when
+    it is a bare string constant. A body left empty by the removal gets `pass`
+    so the tree still unparses. Mutates and returns `tree`.
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        body = node.body
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            node.body = body[1:] or [ast.Pass()]
+    return tree
+
+
+def _canonical_source(raw_source: str, *, strip_docstrings: bool = True) -> str:
     """Normalize function source so cosmetic edits don't change the cache key.
 
     Round-trips through the AST (`ast.unparse(ast.parse(...))`), which discards
     formatting that never affects behaviour — indentation, line breaks, spacing,
-    trailing commas, comments, quote style — while preserving everything that
-    does, including string-literal *contents* (so two functions whose only
-    difference is the spaces inside a string still get distinct keys).
+    trailing commas, comments, quote style — and, by default, drops docstrings,
+    which document behaviour but don't implement it. All other string-literal
+    *contents* are preserved (so two functions whose only difference is the
+    spaces inside a returned string still get distinct keys).
+
+    `strip_docstrings=False` reproduces the pre-0.12 docstring-sensitive
+    canonicalization — the identity under which older caches were written. The
+    decorator accepts that identity as an implicit read fallback so a docstring
+    edit (or the 0.12 upgrade itself) doesn't orphan warm entries.
 
     Falls back to the raw source when it can't be parsed (e.g. the source is
     unavailable, or a decorator references names not importable at parse time),
@@ -404,7 +431,10 @@ def _canonical_source(raw_source: str) -> str:
     than crashing.
     """
     try:
-        return ast.unparse(ast.parse(textwrap.dedent(raw_source)))
+        tree = ast.parse(textwrap.dedent(raw_source))
+        if strip_docstrings:
+            tree = _strip_docstrings(tree)
+        return ast.unparse(tree)
     except (SyntaxError, ValueError, TypeError, RecursionError):
         return raw_source
 
@@ -448,8 +478,10 @@ def cache_id(func: Callable[..., Any]) -> str:
 
 
 def cache_keys(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> tuple[str, list[str]]:
-    """Return `(current key, also_accept fallback keys)` for a `@cached` call.
+    """Return `(current key, fallback keys)` for a `@cached` call.
 
+    The fallback keys are the explicit `also_accept` identities followed by the
+    implicit pre-0.12 docstring-sensitive identity (when the function has one).
     The keys come from the wrapper's own keying closure (attached at decoration
     time), so they are byte-identical to what the wrapper reads and writes —
     including the decorator's `default=` encoder setting. `func` is
@@ -519,14 +551,21 @@ def cached(
     `str` preserves the loose 0.1 behaviour; pass `default=None` for strict
     mode that raises on unknown argument types.
 
+    Keying ignores docstrings as well as comments and formatting — they
+    document behaviour, they don't implement it — so editing a docstring never
+    invalidates a warm cache. Entries written by emboss < 0.12, keyed on the
+    docstring-*sensitive* source, are still read via an implicit fallback
+    identity and copied forward to the current key on first hit, so the
+    upgrade itself keeps the cache warm.
+
     `also_accept` lists *old* cache identities — `cache_id` strings of the
     form `"name:body_hash"` — whose entries are still honoured. On a miss
-    under the current key, each accepted identity is tried in order and a hit
-    is copied forward to the current key (write-through), so a
-    behaviour-preserving rename or body refactor keeps its warm cache.
-    Capture the identity with `emboss.cache_id(func)` before editing, or
-    recover it afterwards with the `emboss id --rev <rev>` CLI. Malformed
-    tokens raise `ValueError` at decoration time.
+    under the current key, each accepted identity is tried in order (then the
+    implicit pre-0.12 fallback) and a hit is copied forward to the current key
+    (write-through), so a behaviour-preserving rename or body refactor keeps
+    its warm cache. Capture the identity with `emboss.cache_id(func)` before
+    editing, or recover it afterwards with the `emboss id --rev <rev>` CLI.
+    Malformed tokens raise `ValueError` at decoration time.
 
     `unsafe_manual_key` replaces the source-derived body hash with a fixed,
     caller-managed string. **WARNING — this opts out of emboss's
@@ -568,13 +607,23 @@ def cached(
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         # The function's identity is `name:body_hash`. The body hash is the
-        # AST-canonical source (whitespace/comment-agnostic), unless
-        # `unsafe_manual_key` pins it to a caller-managed string instead.
+        # AST-canonical source (whitespace/comment/docstring-agnostic), unless
+        # `unsafe_manual_key` pins it to a caller-managed string instead. The
+        # pre-0.12 docstring-sensitive identity is accepted as an implicit read
+        # fallback (after any explicit `also_accept` tokens) so entries written
+        # under the old keying survive the change and migrate forward on hit.
+        implicit_fallbacks: tuple[tuple[str, str], ...] = ()
         if unsafe_manual_key is not None:
             body_hash = unsafe_manual_key
         else:
             raw_source = inspect.getsource(func)
             body_hash = hashlib.md5(_canonical_source(raw_source).encode()).hexdigest()
+            docful_hash = hashlib.md5(
+                _canonical_source(raw_source, strip_docstrings=False).encode()
+            ).hexdigest()
+            if docful_hash != body_hash:
+                implicit_fallbacks = ((func.__name__, docful_hash),)
+        accepted = accepted_identities + implicit_fallbacks
         info = EmbossInfo(
             name=func.__name__,
             body_hash=body_hash,
@@ -615,7 +664,7 @@ def cached(
             key = hashlib.md5(f"{func.__name__}{body_hash}{arg_hash}".encode()).hexdigest()
             accept_keys = [
                 hashlib.md5(f"{name}{accepted_hash}{arg_hash}".encode()).hexdigest()
-                for name, accepted_hash in accepted_identities
+                for name, accepted_hash in accepted
             ]
             return key, accept_keys
 

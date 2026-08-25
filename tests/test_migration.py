@@ -208,3 +208,60 @@ def test_async_also_accept_and_manual_key(cache):
 
     assert asyncio.run(h(2)) == 10  # HIT under the pinned key despite the body edit
     assert calls["n"] == 2
+
+
+def test_pre_docless_entries_migrate_forward(cache):
+    """Entries keyed under the pre-0.12 docstring-sensitive identity still hit and migrate."""
+    from emboss import cache_keys
+
+    calls = []
+
+    @cached(cache)
+    def f(x: int) -> int:
+        """A docstring, so the docful identity differs from the primary one."""
+        calls.append(x)
+        return x * 2
+
+    key, accept_keys = cache_keys(f, 5)
+    assert len(accept_keys) == 1  # exactly the implicit docstring-sensitive fallback
+    cache.set(accept_keys[0], 10)  # simulate an entry written by emboss < 0.12
+
+    assert f(5) == 10
+    assert calls == []  # served from the fallback key, body never ran
+    assert cache.get(key) == 10  # and migrated forward to the current key
+
+
+def test_docful_fallback_key_matches_pre_0_12_formula(cache):
+    """The implicit fallback key is byte-identical to what emboss < 0.12 wrote."""
+    import ast
+    import inspect
+    import textwrap
+
+    from emboss import cache_keys
+
+    @cached(cache)
+    def g(x: int) -> int:
+        """Docstring that participates in the pre-0.12 hash."""
+        return x + 3
+
+    # Reproduce the pre-0.12 keying exactly: AST round-trip WITHOUT docstring stripping.
+    raw_source = inspect.getsource(g.__wrapped__)
+    docful_canon = ast.unparse(ast.parse(textwrap.dedent(raw_source)))
+    docful_hash = hashlib.md5(docful_canon.encode()).hexdigest()
+    arg_hash = hashlib.md5((json.dumps([4]) + json.dumps({})).encode()).hexdigest()
+    pre_0_12_key = hashlib.md5(f"g{docful_hash}{arg_hash}".encode()).hexdigest()
+
+    _key, accept_keys = cache_keys(g, 4)
+    assert accept_keys == [pre_0_12_key]
+
+
+def test_undocumented_function_has_no_implicit_fallback(cache):
+    """No docstring → docful and docless identities coincide → no extra fallback key."""
+    from emboss import cache_keys
+
+    @cached(cache)
+    def f(x: int) -> int:
+        return x - 1
+
+    _key, accept_keys = cache_keys(f, 1)
+    assert accept_keys == []

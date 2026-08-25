@@ -128,3 +128,96 @@ def test_legacy_raw_source_key_no_longer_read(cache):
 
     assert f(5) == 50  # MISS — the planted raw-source entry is ignored, body recomputes
     assert calls == [5]
+
+
+def test_docstring_edit_does_not_invalidate(cache):
+    """Docstrings document behaviour, they don't implement it — editing one keeps the hit."""
+    calls = []
+
+    @cached(cache)
+    def f(x: int) -> int:
+        """Original docstring."""
+        calls.append(x)
+        return x + 1
+
+    assert f(10) == 11
+    assert calls == [10]
+
+    @cached(cache)
+    def f(x: int) -> int:  # noqa: F811 — intentional redef with a rewritten docstring
+        """A completely rewritten docstring that must not change the key."""
+        calls.append(x)
+        return x + 1
+
+    assert f(10) == 11  # cache HIT despite the docstring rewrite
+    assert calls == [10]  # body never re-ran
+
+
+def test_adding_a_docstring_does_not_invalidate(cache):
+    """Going from no docstring to a docstring (or back) keeps the hit."""
+    calls = []
+
+    @cached(cache)
+    def f(x: int) -> int:
+        calls.append(x)
+        return x * 2
+
+    assert f(4) == 8
+
+    @cached(cache)
+    def f(x: int) -> int:  # noqa: F811 — intentional redef, docstring added
+        """Newly added docstring."""
+        calls.append(x)
+        return x * 2
+
+    assert f(4) == 8  # HIT — the docless canonical source is unchanged
+    assert calls == [4]
+
+
+def test_nested_docstrings_are_ignored(cache):
+    """Docstrings of nested defs/classes are stripped too, at every level."""
+    calls = []
+
+    @cached(cache)
+    def f(x: int) -> int:
+        """Outer docstring."""
+
+        def inner(y: int) -> int:
+            """Inner docstring."""
+            return y + 1
+
+        calls.append(x)
+        return inner(x)
+
+    assert f(1) == 2
+
+    @cached(cache)
+    def f(x: int) -> int:  # noqa: F811 — intentional redef, nested docstring edited
+        """Outer docstring, edited."""
+
+        def inner(y: int) -> int:
+            """Inner docstring, also edited."""
+            return y + 1
+
+        calls.append(x)
+        return inner(x)
+
+    assert f(1) == 2  # HIT — nested docstring edits don't change the key
+    assert calls == [1]
+
+
+def test_docstring_only_body_keys_like_pass(cache):
+    """A body reduced to nothing by docstring-stripping keys identically to `pass`."""
+    from emboss import cache_key
+
+    @cached(cache)
+    def f() -> None:
+        """Only a docstring."""
+
+    doc_only_key = cache_key(f)
+
+    @cached(cache)
+    def f() -> None:  # noqa: F811 — intentional redef
+        pass
+
+    assert cache_key(f) == doc_only_key
