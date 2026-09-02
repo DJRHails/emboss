@@ -15,9 +15,11 @@ import logging
 import os
 import tempfile
 import textwrap
+import threading
 import types
 import typing
-from collections.abc import Callable, Iterator, Mapping
+import weakref
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, TypeVar, Union
 
@@ -160,6 +162,122 @@ class CacheMiss(RuntimeError):
 def _rebuild_cache_miss(func_name: str, cache_id: str, key: str) -> CacheMiss:
     """Reconstruct a `CacheMiss` from pickle/copy (see `CacheMiss.__reduce__`)."""
     return CacheMiss(func_name=func_name, cache_id=cache_id, key=key)
+
+
+class _InflightLatch:
+    """Per-key compute-once latch for the threads of ONE process.
+
+    A `@cached` miss holds its key's latch while it computes and stores, so a
+    concurrent caller of the same key waits and then re-reads the cache instead
+    of computing its own copy. Without it a fan-out that dispatches one key
+    twice (a duplicated item, two arms sharing a cell) computes it twice and the
+    later `set` supersedes the earlier — harmless for a deterministic function,
+    but for a non-deterministic one (an LLM draw with no API seed) the value the
+    first caller returned is silently replaced under every later reader (the
+    touchstone keep-latest drift census measured 92% of its 43,852 conflicting
+    cells as exactly this same-writer race, superseded within a minute).
+
+    Locks are refcounted and dropped when the last holder leaves, so the table
+    is bounded by the number of keys in flight, not the number ever seen. The
+    per-key lock is re-entrant: a cached function that (mistakenly) recurses
+    into its own key on the same thread hits the same `RecursionError` it did
+    before, not a deadlock. Cross-process callers are NOT latched — that window
+    is closed (best-effort) by the re-check before store in the wrapper.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._locks: dict[str, tuple[threading.RLock, int]] = {}
+
+    @contextlib.contextmanager
+    def hold(self, key: str) -> Iterator[None]:
+        with self._guard:
+            lock, refs = self._locks.get(key) or (threading.RLock(), 0)
+            self._locks[key] = (lock, refs + 1)
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+            with self._guard:
+                lock, refs = self._locks[key]
+                if refs == 1:
+                    del self._locks[key]
+                else:
+                    self._locks[key] = (lock, refs - 1)
+
+    def in_flight(self) -> int:
+        """Number of keys currently latched (diagnostics and tests)."""
+        with self._guard:
+            return len(self._locks)
+
+
+@dataclass
+class _AsyncSlot:
+    lock: asyncio.Lock
+    refs: int = 0
+    holder: asyncio.Task[Any] | None = None
+
+
+class _AsyncInflightLatch:
+    """The asyncio twin of `_InflightLatch`: one latch table per event loop.
+
+    Coroutines on one loop interleave only at `await`s, so the table needs no
+    lock of its own; `asyncio.Lock` does the waiting. The holder task is
+    recorded so a same-task re-entry (a cached coroutine awaiting its own key)
+    passes through instead of deadlocking on a non-reentrant `asyncio.Lock`.
+    Tables are keyed weakly on the loop, so a loop that goes away takes its
+    table with it.
+    """
+
+    def __init__(self) -> None:
+        self._per_loop: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop, dict[str, _AsyncSlot]
+        ] = weakref.WeakKeyDictionary()
+
+    @contextlib.asynccontextmanager
+    async def hold(self, key: str) -> AsyncIterator[None]:
+        slots = self._per_loop.setdefault(asyncio.get_running_loop(), {})
+        slot = slots.get(key)
+        if slot is None:
+            slot = slots[key] = _AsyncSlot(lock=asyncio.Lock())
+        me = asyncio.current_task()
+        if slot.holder is not None and slot.holder is me:
+            yield  # re-entrant: this task already holds the key
+            return
+        slot.refs += 1
+        await slot.lock.acquire()
+        slot.holder = me
+        try:
+            yield
+        finally:
+            slot.holder = None
+            slot.lock.release()
+            slot.refs -= 1
+            if slot.refs == 0 and slots.get(key) is slot:
+                del slots[key]
+
+    def in_flight(self) -> int:
+        """Number of keys latched on the running loop (diagnostics and tests)."""
+        try:
+            slots = self._per_loop.get(asyncio.get_running_loop())
+        except RuntimeError:
+            return 0
+        return len(slots) if slots else 0
+
+
+_LATCH = _InflightLatch()
+_ASYNC_LATCH = _AsyncInflightLatch()
+
+
+def _same_value(stored: Any, fresh: Any) -> bool:
+    """Best-effort equality for the supersede notice — anything that cannot be compared
+    (an array whose `==` is elementwise, a class raising in `__eq__`) counts as different, so
+    the notice errs loud rather than quiet."""
+    try:
+        return bool(stored == fresh)
+    except Exception:  # noqa: BLE001 — comparison failure is "not provably equal"
+        return False
 
 
 def safe_jsonable_encoder(
@@ -702,6 +820,20 @@ def cached(
     `emboss.cache_only()` block), a call whose key — and every `also_accept`
     fallback — misses raises `CacheMiss` instead of executing the function
     (see `cache_only`).
+
+    Concurrent misses on one key compute once, and the first write wins. A
+    miss holds a per-key in-flight latch (per process; threads and asyncio
+    tasks alike) while it computes and stores, so a second caller of the same
+    key waits and then reads the stored value instead of computing its own.
+    Before storing, the miss re-reads the key: a value another writer landed
+    while this call computed — a process or node the latch cannot see — is
+    served instead and this call's result is discarded, with a warning when the
+    two values differ (an info line when they are identical). For a
+    deterministic function this only saves work; for a non-deterministic one
+    (an LLM draw with no API seed) it is what keeps the value a caller returned
+    from being silently replaced under every later reader. The cross-process
+    half is best-effort: a peer's write inside the backend's index staleness,
+    or one not yet synced in from another node, still supersedes on read.
     """
     if cache is None:
         cache_dir = os.environ.get("EMBOSS_CACHE_DIR") or tempfile.mkdtemp(prefix="emboss-")
@@ -796,65 +928,107 @@ def cached(
                     return raw
             return _MISSING
 
-        def _store(key: str, encoded: Any) -> None:
-            """Write back under the current key only — old identities are read
-            and migrated on hit, never written to."""
-            cache.set(key, encoded)
-
         # Drift keys already warned about: the recompute normally heals the
         # store, but under `cache_only` (or a read-only cache directory)
         # nothing supersedes the drifted entry — warn once per key, not per
         # call (same policy as LogCache's opaque-miss warnings).
         warned_drift: set[str] = set()
 
+        def _serve(key: str, accept_keys: list[str]) -> Any:
+            """The decoded cached value, or `_MISSING` — a hit that no longer
+            rehydrates under the CURRENT class definition reads as a warned
+            miss so the recompute heals the stale shape (under cache_only that
+            raises CacheMiss downstream, naming the key honestly)."""
+            raw = _lookup(key, accept_keys)
+            if raw is _MISSING:
+                return _MISSING
+            try:
+                return _decode(raw, codec_anno)
+            except _SchemaDrift as drift:
+                if key not in warned_drift:
+                    warned_drift.add(key)
+                    logger.warning(
+                        "emboss: cached value for %s() no longer matches its "
+                        "constructor (%s); treating as a miss and recomputing. "
+                        "(Warned once per key per decorated function.)",
+                        info.name,
+                        drift,
+                    )
+                return _MISSING
+
+        def _settle(key: str, accept_keys: list[str], result: T) -> T:
+            """First write wins: re-read the key before storing, and if another
+            writer landed a value while this call computed, serve THAT value and
+            discard this call's result — `set` would otherwise supersede it under
+            every later reader. The in-process latch makes this exact for the
+            threads of one process; across processes and nodes it is best-effort
+            (a peer's write within the backend's index staleness, or one not yet
+            synced in, is still superseded). A stored value that no longer
+            rehydrates is not a competing write — the fresh result heals it."""
+            stored = _serve(key, accept_keys)
+            if stored is not _MISSING:
+                if _same_value(stored, result):
+                    logger.info(
+                        "emboss: %s() key %s was stored by another writer while this call "
+                        "computed an identical value; serving the stored one.",
+                        info.name,
+                        _short_hash(key),
+                    )
+                else:
+                    logger.warning(
+                        "emboss: %s() key %s was stored by another writer while this call "
+                        "computed, and the two values differ; keeping the first-written "
+                        "value and discarding this call's result (a non-deterministic draw "
+                        "would otherwise be replaced under every later reader).",
+                        info.name,
+                        _short_hash(key),
+                    )
+                return stored  # type: ignore[no-any-return]
+            # Write back under the current key only — old identities are read
+            # and migrated on hit, never written to.
+            cache.set(key, _encode(result, codec_anno))
+            return result
+
+        def _compute(key: str, accept_keys: list[str], args: Any, kwargs: Any) -> T:
+            """The latched miss path: re-check under the key's latch (a waiter
+            finds the holder's write), then compute, then settle first-write-wins."""
+            with _LATCH.hold(key):
+                served = _serve(key, accept_keys)
+                if served is not _MISSING:
+                    return served  # type: ignore[no-any-return]
+                if _cache_only_active():
+                    raise CacheMiss(func_name=info.name, cache_id=info.cache_id, key=key)
+                return _settle(key, accept_keys, func(*args, **kwargs))
+
+        async def _compute_async(
+            key: str, accept_keys: list[str], args: Any, kwargs: Any
+        ) -> T:
+            async with _ASYNC_LATCH.hold(key):
+                served = _serve(key, accept_keys)
+                if served is not _MISSING:
+                    return served  # type: ignore[no-any-return]
+                # Checked here — when the coroutine runs — not at call time, so
+                # the raise pairs with the execution it prevents.
+                if _cache_only_active():
+                    raise CacheMiss(func_name=info.name, cache_id=info.cache_id, key=key)
+                result = await func(*args, **kwargs)  # type: ignore[misc]
+                return _settle(key, accept_keys, result)
+
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> T:
             key, accept_keys = _keys(args, kwargs)
-            raw = _lookup(key, accept_keys)
-            if raw is not _MISSING:
-                try:
-                    decoded = _decode(raw, codec_anno)
-                except _SchemaDrift as drift:
-                    # The hit exists but cannot rehydrate under the CURRENT class
-                    # definition; fall through to recompute — the fresh store
-                    # supersedes the stale shape (under cache_only this raises
-                    # CacheMiss below, naming the key honestly).
-                    if key not in warned_drift:
-                        warned_drift.add(key)
-                        logger.warning(
-                            "emboss: cached value for %s() no longer matches its "
-                            "constructor (%s); treating as a miss and recomputing. "
-                            "(Warned once per key per decorated function.)",
-                            info.name,
-                            drift,
-                        )
-                else:
-                    if is_async:
+            served = _serve(key, accept_keys)
+            if served is not _MISSING:
+                if is_async:
 
-                        async def return_cached():
-                            return decoded
+                    async def return_cached():
+                        return served
 
-                        return return_cached()  # type: ignore[return-value]
-                    return decoded  # type: ignore[return-value]
-
+                    return return_cached()  # type: ignore[return-value]
+                return served  # type: ignore[no-any-return]
             if is_async:
-
-                async def execute():
-                    # Checked here — when the coroutine runs — not at call
-                    # time, so the raise pairs with the execution it prevents.
-                    if _cache_only_active():
-                        raise CacheMiss(func_name=info.name, cache_id=info.cache_id, key=key)
-                    result = await func(*args, **kwargs)  # type: ignore[misc]
-                    _store(key, _encode(result, codec_anno))
-                    return result
-
-                return execute()  # type: ignore[return-value]
-
-            if _cache_only_active():
-                raise CacheMiss(func_name=info.name, cache_id=info.cache_id, key=key)
-            result = func(*args, **kwargs)
-            _store(key, _encode(result, codec_anno))
-            return result
+                return _compute_async(key, accept_keys, args, kwargs)  # type: ignore[return-value]
+            return _compute(key, accept_keys, args, kwargs)
 
         wrapper.__emboss__ = info  # type: ignore[attr-defined]
         wrapper.__emboss_keys__ = _keys  # type: ignore[attr-defined]
