@@ -256,19 +256,43 @@ def _dataclass_hints(cls: type) -> Mapping[str, Any] | None:
         return None
 
 
+def _member_shapes(a: Any) -> tuple[type, ...]:
+    """The stored shapes (`list`/`tuple`/`dict`) a runtime value of member `a`
+    can take — what `_decode`'s union branch would claim it by. Resolving to an
+    origin type and testing `issubclass` covers TypedDicts and `dict`/`list`/
+    `tuple` subclasses structurally; `Mapping[...]` origins map to the dict
+    shape because their runtime values are (typically) dicts."""
+    origin = typing.get_origin(a) or (a if isinstance(a, type) else None)
+    if not isinstance(origin, type):
+        return ()
+    for shape in (list, tuple, dict):
+        if issubclass(origin, shape):
+            return (shape,)
+    return (dict,) if issubclass(origin, Mapping) else ()
+
+
 def _union_codec_members(args: tuple[Any, ...]) -> tuple[Any, ...] | None:
     """The union's codec-relevant members, or `None` when the union is ambiguous.
 
-    A stored dict (or container) must map back to exactly one member on decode:
-    two model/dataclass members (`SmushRationale | RationaleRefusal`), or two
-    members sharing a container origin (`list[A] | list[B]`), cannot be told
-    apart once dict-encoded — such a union stays on the raw-pickle passthrough,
-    exactly the pre-codec behaviour for it."""
-    class_members = [a for a in args if _is_basemodel_class(a) or _codable_dataclass(a)]
-    if len(class_members) > 1:
-        return None
-    origins = [o for o in map(typing.get_origin, args) if o in (list, tuple, dict)]
-    if len(origins) != len(set(origins)):
+    A stored value must map back to exactly one member by *runtime* shape —
+    `_decode` claims a stored dict for a model/dataclass member and a stored
+    container by `isinstance` against the member's origin. Model and
+    rebuildable-dataclass members store as dicts, so they collide with each
+    other (`SmushRationale | RationaleRefusal`) and with any member whose
+    runtime value can be a dict (`Model | dict[str, X]`, TypedDicts,
+    `Mapping[...]`, `dict` subclasses); two members sharing a container origin
+    (`list[A] | list[B]`) collide the same way, and an `Any`/`object` member
+    can hold every shape at once. Such unions stay on the raw-pickle
+    passthrough, exactly the pre-codec behaviour for them."""
+    shapes: list[type] = []
+    for a in args:
+        if _is_basemodel_class(a) or _codable_dataclass(a):
+            shapes.append(dict)
+        elif a is Any or a is object:
+            shapes.extend((list, tuple, dict))
+        else:
+            shapes.extend(_member_shapes(a))
+    if len(shapes) != len(set(shapes)):
         return None
     return tuple(a for a in args if a is not type(None))
 
