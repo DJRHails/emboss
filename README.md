@@ -2,7 +2,7 @@
 
 **O**n-**D**isk **I**nput-keyed **C**ache — disk-backed memoization with pydantic-aware encoding.
 
-Version: 0.12.1
+Version: 0.12.2
 
 ```bash
 pip install emboss              # core — zero runtime dependencies (stdlib only)
@@ -215,7 +215,7 @@ A cache that folds records keep-latest is only "never a wrong value" for a **det
 
 `@cached` closes that window in two layers:
 
-- **Per-key in-flight latch (per process).** A miss holds its key's latch — threads and asyncio tasks alike — while it computes and stores. A concurrent caller of the same key waits, then reads the stored value instead of computing its own. Distinct keys never serialise; a raising holder releases the latch; a function recursing into its own key gets the `RecursionError` it always did, not a deadlock.
+- **Per-key in-flight latch (per process).** A miss holds its key's latch — threads and asyncio tasks alike — while it computes and stores. A concurrent caller of the same key waits, then reads the stored value instead of computing its own. Distinct keys never serialise; a raising holder releases the latch; a function recursing into its own key gets the `RecursionError` it always did, not a deadlock. A `fork()`ed child starts with an empty latch table (`os.register_at_fork`), so a key a parent thread was computing when the fork happened is computed in the child rather than waited on forever.
 - **Re-check before store (best-effort across processes and nodes).** After computing, the miss re-reads its key. If another writer landed a value meanwhile, that value is served and this call's result is discarded — logged at `WARNING` when the two differ, `INFO` when identical. A peer's write inside the backend's index staleness, or one not yet synced in from another node, can still supersede on read; a stored value that no longer rehydrates under the current class is not a competing write, and the fresh result heals it.
 
 Nothing to configure: this is how every `@cached` miss behaves.
