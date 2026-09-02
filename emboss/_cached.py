@@ -294,6 +294,45 @@ def _wants_codec(anno: Any, _depth: int = 0) -> bool:
     return False
 
 
+def _resolve_return_annotation(func: Callable[..., Any], anno: Any) -> Any:
+    """Resolve a string / forward-ref return annotation to real types.
+
+    Under `from __future__ import annotations` every annotation arrives as a
+    string, and without it a nested quoted name (`-> list["M"]`) arrives holding
+    a `ForwardRef` — either way `_wants_codec` cannot see the model in it and
+    the value would pickle by class reference, dying with the defining code.
+    Resolution is scoped to the RETURN annotation via a stub function so an
+    unresolvable *parameter* annotation (the common TYPE_CHECKING-gated client
+    type) cannot disable the codec. A return annotation that itself fails to
+    resolve (e.g. behind TYPE_CHECKING, or a class defined below the decorated
+    function) keeps the raw-pickle passthrough — with a warning, because any
+    model/dataclass it names will then be stored by class reference."""
+    stub = types.FunctionType((lambda: None).__code__, getattr(func, "__globals__", {}))
+    stub.__annotations__ = {"return": anno}
+    # PEP 695 generics: `def f[T]() -> "list[T]"` resolves T off the function's
+    # own type params, which the stub must inherit or the name never resolves.
+    stub.__type_params__ = getattr(  # ty: ignore[unresolved-attribute] — writable since 3.12
+        func, "__type_params__", ()
+    )
+    try:
+        return typing.get_type_hints(stub).get("return", inspect.Parameter.empty)
+    except Exception as exc:  # noqa: BLE001 — unresolvable annotation → passthrough
+        logger.warning(
+            "emboss.cached: return annotation %r of %s() did not resolve (%s); "
+            "annotation-driven encoding stays off, so a model/dataclass return "
+            "would pickle by class reference and die with its defining code.",
+            anno,
+            getattr(func, "__qualname__", func),
+            exc,
+        )
+        return inspect.Parameter.empty
+
+
+class _SchemaDrift(Exception):
+    """A stored field dict no longer matches its dataclass constructor — the
+    cached value predates a field rename/removal in the class definition."""
+
+
 def _runtime_matches(value: Any, anno: Any) -> bool:
     """Does `value` plausibly inhabit union member `anno`? Used only to pick which
     member of a Union to encode/decode through."""
@@ -345,12 +384,21 @@ def _encode(value: Any, anno: Any) -> Any:
 
 def _decode(value: Any, anno: Any) -> Any:
     """Rehydrate dicts back into models/dataclasses on a cache hit, mirroring
-    `_encode`'s walk; anything that doesn't match the expected shape passes
-    through untouched."""
+    `_encode`'s walk. A value that doesn't match the expected *shape* passes
+    through untouched; a field dict that matches the shape but no longer
+    rehydrates under the current class definition raises `_SchemaDrift` (the
+    wrapper treats it as a miss and recomputes)."""
     if value is None or anno is None:
         return value
     if _is_basemodel_class(anno):
-        return anno.model_validate(value) if isinstance(value, dict) else value
+        if not isinstance(value, dict):
+            return value
+        try:
+            return anno.model_validate(value)
+        except ValueError as exc:  # pydantic.ValidationError subclasses ValueError
+            # Serving the raw field dict would hand the caller a wrong type on
+            # a warm hit; the wrapper treats drift as a miss and recomputes.
+            raise _SchemaDrift(f"{anno.__qualname__}: {exc}") from exc
     if _codable_dataclass(anno):
         if not isinstance(value, dict):
             return value
@@ -358,23 +406,27 @@ def _decode(value: Any, anno: Any) -> Any:
         kwargs = {k: _decode(v, hints.get(k)) for k, v in value.items()}
         try:
             return anno(**kwargs)
-        except TypeError:
-            logger.warning(
-                "emboss: cached value for %s no longer matches its constructor "
-                "(fields changed since it was stored?); returning the raw field "
-                "dict.",
-                anno.__qualname__,
-            )
-            return value
+        except (TypeError, ValueError) as exc:
+            # TypeError: fields renamed/removed since storing. ValueError: a
+            # `__post_init__` that rejects the stored (drifted) values. Either
+            # way the wrapper treats drift as a miss and recomputes.
+            raise _SchemaDrift(f"{anno.__qualname__}: {exc}") from exc
     origin = typing.get_origin(anno)
     args = typing.get_args(anno)
     if origin in (Union, types.UnionType):
         members = _union_codec_members(args)
+        drift: _SchemaDrift | None = None
         for arg in members or ():
             if (_is_basemodel_class(arg) or _codable_dataclass(arg)) and isinstance(value, dict):
-                return _decode(value, arg)
+                try:
+                    return _decode(value, arg)
+                except _SchemaDrift as exc:
+                    drift = exc  # try the remaining members before giving up
+                    continue
             if _wants_codec(arg) and _runtime_matches(value, arg):
                 return _decode(value, arg)
+        if drift is not None:
+            raise drift
         return value
     if origin is list and args and isinstance(value, list):
         return [_decode(v, args[0]) for v in value]
@@ -610,7 +662,11 @@ def cached(
     references: classes defined in `__main__` round-trip across script
     invocations, and a value outlives the module that defined its class. A
     dataclass with `init=False` fields or `InitVar` params can't be rebuilt from
-    its field dict and keeps the raw-pickle passthrough.
+    its field dict and keeps the raw-pickle passthrough. A stored field dict
+    that no longer rehydrates under the current class definition (fields
+    renamed/removed since it was cached) is treated as a warned miss: the
+    function re-executes and the fresh store heals the stale shape (under
+    cache-only mode it raises `CacheMiss` instead).
 
     When no `cache` is passed, a default `emboss.SqliteCache` is created at the
     directory named by the `EMBOSS_CACHE_DIR` environment variable; if unset, it
@@ -662,21 +718,11 @@ def cached(
             return_anno = inspect.signature(func).return_annotation
         except (TypeError, ValueError):
             return_anno = inspect.Parameter.empty
-        if isinstance(return_anno, str):
-            # PEP 563 (`from __future__ import annotations`) delivers the annotation
-            # as a string `_model_info` cannot see a BaseModel in — silently
-            # disabling the model_dump encoding for every function in such a module
-            # (its models then pickle by class reference and die with the defining
-            # code). `get_type_hints` resolves it (including nested forward refs);
-            # a name unresolvable at decoration time (e.g. behind TYPE_CHECKING, in
-            # this or any parameter annotation) falls back to no model encoding, as
-            # before.
-            try:
-                return_anno = typing.get_type_hints(func).get(
-                    "return", inspect.Parameter.empty
-                )
-            except Exception:  # noqa: BLE001 — unresolvable annotation → passthrough
-                return_anno = inspect.Parameter.empty
+        if return_anno is not inspect.Parameter.empty and not _wants_codec(return_anno):
+            # PEP 563 strings and nested forward refs hide models from the codec
+            # gate; resolve the return annotation alone (never the parameters —
+            # see `_resolve_return_annotation`) before giving up on encoding.
+            return_anno = _resolve_return_annotation(func, return_anno)
         codec_anno = return_anno if _wants_codec(return_anno) else None
         is_async = asyncio.iscoroutinefunction(func)
 
@@ -731,19 +777,41 @@ def cached(
             and migrated on hit, never written to."""
             cache.set(key, encoded)
 
+        # Drift keys already warned about: the recompute normally heals the
+        # store, but under `cache_only` (or a read-only cache directory)
+        # nothing supersedes the drifted entry — warn once per key, not per
+        # call (same policy as LogCache's opaque-miss warnings).
+        warned_drift: set[str] = set()
+
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> T:
             key, accept_keys = _keys(args, kwargs)
             raw = _lookup(key, accept_keys)
             if raw is not _MISSING:
-                decoded = _decode(raw, codec_anno)
-                if is_async:
+                try:
+                    decoded = _decode(raw, codec_anno)
+                except _SchemaDrift as drift:
+                    # The hit exists but cannot rehydrate under the CURRENT class
+                    # definition; fall through to recompute — the fresh store
+                    # supersedes the stale shape (under cache_only this raises
+                    # CacheMiss below, naming the key honestly).
+                    if key not in warned_drift:
+                        warned_drift.add(key)
+                        logger.warning(
+                            "emboss: cached value for %s() no longer matches its "
+                            "constructor (%s); treating as a miss and recomputing. "
+                            "(Warned once per key per decorated function.)",
+                            info.name,
+                            drift,
+                        )
+                else:
+                    if is_async:
 
-                    async def return_cached():
-                        return decoded
+                        async def return_cached():
+                            return decoded
 
-                    return return_cached()  # type: ignore[return-value]
-                return decoded  # type: ignore[return-value]
+                        return return_cached()  # type: ignore[return-value]
+                    return decoded  # type: ignore[return-value]
 
             if is_async:
 

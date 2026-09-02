@@ -57,6 +57,27 @@ def test_cached_value_returns_inside_cache_only(cache):
     assert calls["n"] == 1
 
 
+class DriftModel(BaseModel):
+    name: str
+
+
+def test_schema_drift_raises_cache_miss_inside_cache_only(cache):
+    """A stored shape that no longer rehydrates under the current class
+    definition cannot be served, and a sealed sweep must not recompute — the
+    drift is an honest CacheMiss, not a silent wrong-type return."""
+
+    @cached(cache)
+    def f() -> DriftModel:
+        return DriftModel(name="x")
+
+    f()
+    key = next(iter(cache))
+    cache.set(key, {"renamed_away": 1})  # predates DriftModel's required `name`
+
+    with cache_only(), pytest.raises(CacheMiss):
+        f()
+
+
 def test_cache_miss_attributes_and_message(cache):
     @cached(cache)
     def f(token: str) -> str:

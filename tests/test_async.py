@@ -6,6 +6,7 @@ import asyncio
 
 import diskcache
 import pytest
+from pydantic import BaseModel
 
 from emboss import cached
 
@@ -34,6 +35,30 @@ def test_async_round_trip(cache):
     a, b = asyncio.run(run())
     assert a == b == 6
     assert calls["n"] == 1
+
+
+class AsyncModel(BaseModel):
+    name: str
+
+
+def test_async_schema_drift_recomputes(cache):
+    """Drift on an async warm hit falls through to the recompute coroutine —
+    pins that the `_SchemaDrift` guard covers the async path, not just sync."""
+    calls = {"n": 0}
+
+    @cached(cache)
+    async def f() -> AsyncModel:
+        calls["n"] += 1
+        return AsyncModel(name="a")
+
+    assert asyncio.run(f()) == AsyncModel(name="a")
+    key = next(iter(cache))
+    cache.set(key, {"renamed_away": 1})  # predates AsyncModel's required `name`
+
+    assert asyncio.run(f()) == AsyncModel(name="a")  # drift → recompute, not a raise
+    assert calls["n"] == 2
+    assert asyncio.run(f()) == AsyncModel(name="a")  # healed store serves warm
+    assert calls["n"] == 2
 
 
 def test_async_none_caches(cache):

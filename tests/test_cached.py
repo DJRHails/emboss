@@ -68,16 +68,47 @@ def test_string_annotation_still_encodes_model(cache):
     assert isinstance(f(), M)  # decoded back to a model on a warm hit
 
 
-def test_unresolvable_string_annotation_falls_back(cache):
+def test_unresolvable_string_annotation_falls_back(cache, caplog):
     """A string annotation naming something not importable at decoration time
-    (e.g. behind TYPE_CHECKING) must not raise — encoding just stays off."""
+    (e.g. behind TYPE_CHECKING) must not raise — encoding stays off, with a
+    warning naming the function (the values would die with their defining code)."""
+
+    with caplog.at_level("WARNING"):
+
+        @cached(cache)
+        def f() -> "NotDefinedAnywhere":  # noqa: F821, UP037 — deliberately unresolvable
+            return {"plain": True}
+
+    assert any("did not resolve" in r.message for r in caplog.records)
+    assert f() == {"plain": True}
+    assert f() == {"plain": True}
+
+
+def test_unresolvable_param_annotation_keeps_return_codec(cache):
+    """One TYPE_CHECKING-gated *parameter* annotation must not disable the
+    return codec — resolution is scoped to the return annotation alone."""
 
     @cached(cache)
-    def f() -> "NotDefinedAnywhere":  # noqa: F821, UP037 — deliberately unresolvable
-        return {"plain": True}
+    def f(client: "NotImportableAnywhere") -> M:  # noqa: F821, UP037 — the param IS the test
+        return M(name="param-skew", n=1)
 
-    assert f() == {"plain": True}
-    assert f() == {"plain": True}
+    assert isinstance(f(None), M)
+    stored = _stored_values(cache)[0]
+    assert isinstance(stored, dict) and stored["name"] == "param-skew"
+
+
+def test_nested_forward_ref_without_future_import_encodes(cache):
+    """In a module without PEP 563, `-> list["M"]` arrives holding a ForwardRef
+    object (not a string); the codec must still resolve it rather than pickling
+    the models by class reference."""
+    from no_future_annotations_module import NestedRefModel, make_nested_ref_function
+
+    g = make_nested_ref_function(cache)
+    r = g()
+    assert isinstance(r, list) and isinstance(r[0], NestedRefModel)
+    stored = _stored_values(cache)[0]
+    assert isinstance(stored[0], dict) and stored[0] == {"name": "nested"}
+    assert isinstance(g()[0], NestedRefModel)  # warm hit rehydrates
 
 
 def test_list_of_basemodel_round_trip(cache):
@@ -205,6 +236,66 @@ def test_non_rebuildable_dataclass_keeps_raw_pickle(cache):
     assert isinstance(f(), NotRebuildable)
     assert isinstance(f(), NotRebuildable)  # warm hit too
     assert isinstance(_stored_values(cache)[0], NotRebuildable)
+
+
+def test_schema_drift_recomputes_instead_of_returning_dict(cache, caplog):
+    """A stored field dict that no longer matches the dataclass constructor
+    (fields renamed/removed since it was cached) is a warned miss that
+    recomputes — never a raw dict handed to a caller expecting the dataclass."""
+
+    @cached(cache)
+    def f() -> Score:
+        return Score(value=1.0)
+
+    f()
+    key = next(iter(cache))
+    cache.set(key, {"value": 1.0, "removed_field": 3})  # simulate an old schema
+
+    with caplog.at_level("WARNING"):
+        r = f()
+    assert isinstance(r, Score) and r == Score(value=1.0)
+    assert any("treating as a miss" in rec.message for rec in caplog.records)
+    assert _stored_values(cache)[0] == {"value": 1.0, "tags": ()}  # store healed
+    assert isinstance(f(), Score)
+
+
+def test_model_schema_drift_recomputes_instead_of_crashing(cache, caplog):
+    """A stored field dict that no longer validates against the BaseModel (a
+    required field added/renamed since it was cached) is a warned miss that
+    recomputes — never a ValidationError leaking out of a warm hit. Same
+    contract as the dataclass drift path."""
+
+    @cached(cache)
+    def f() -> M:
+        return M(name="fresh", n=1)
+
+    f()
+    key = next(iter(cache))
+    cache.set(key, {"renamed_away": True})  # predates M's required `name`
+
+    with caplog.at_level("WARNING"):
+        r = f()
+    assert r == M(name="fresh", n=1)
+    assert any("treating as a miss" in rec.message for rec in caplog.records)
+    assert isinstance(f(), M)  # store healed
+
+
+def test_schema_drift_warns_once_per_key(cache, caplog):
+    """Drift warnings dedupe per key per decorated function — under cache_only
+    or a read-only cache nothing heals the store, and one stale sweep must not
+    warn on every call."""
+
+    @cached(cache)
+    def f() -> Score:
+        return Score(value=1.0)
+
+    f()
+    key = next(iter(cache))
+    with caplog.at_level("WARNING"):
+        for _ in range(2):
+            cache.set(key, {"value": 1.0, "removed_field": 3})
+            assert isinstance(f(), Score)  # recomputes both times
+    assert sum("treating as a miss" in r.message for r in caplog.records) == 1
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
