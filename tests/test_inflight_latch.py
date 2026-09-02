@@ -199,3 +199,24 @@ def test_async_failed_compute_releases_the_latch(cache):
 
     assert asyncio.run(run()) == 3
     assert calls["n"] == 2
+
+
+def test_async_waiter_cancelled_while_queued_drops_its_latch_ref(cache):
+    """A waiter cancelled while blocked on the latch (a `wait_for` timeout, a
+    TaskGroup sibling failing) must not pin the key in the table for the
+    loop's lifetime: once the holder settles, nothing is in flight."""
+
+    @cached(cache)
+    async def slow(x: int) -> int:
+        await asyncio.sleep(0.1)
+        return x
+
+    async def run():
+        holder = asyncio.create_task(slow(1))
+        await asyncio.sleep(0.01)  # the holder owns the latch before the waiter queues
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(slow(1), timeout=0.01)
+        assert await holder == 1
+        return _ASYNC_LATCH.in_flight()
+
+    assert asyncio.run(run()) == 0
