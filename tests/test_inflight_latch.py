@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -16,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from emboss import CacheMiss, LogCache, cache_key, cache_only, cached
-from emboss._cached import _ASYNC_LATCH, _LATCH
+from emboss._cached import _ASYNC_LATCH, _LATCH, _InflightLatch
 
 
 @pytest.fixture
@@ -138,6 +140,35 @@ def test_self_recursion_is_a_recursion_error_not_a_deadlock(cache):
     with pytest.raises(RecursionError):
         loop(1)
     assert _LATCH.in_flight() == 0
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="signal.pthread_kill is POSIX-only")
+def test_waiter_interrupted_while_queued_drops_its_latch_ref():
+    """A main-thread waiter interrupted while blocked on the latch (Ctrl-C mid-wait)
+    must drop its ref: once the holder leaves, the key is gone from the table."""
+    latch = _InflightLatch()
+    held = threading.Event()
+    release = threading.Event()
+    main_thread = threading.main_thread().ident
+    assert main_thread is not None
+
+    def holder() -> None:
+        with latch.hold("k"):
+            held.set()
+            release.wait()
+
+    def interrupt_then_release() -> None:
+        signal.pthread_kill(main_thread, signal.SIGINT)
+        release.set()
+
+    worker = threading.Thread(target=holder)
+    worker.start()
+    held.wait()
+    threading.Timer(0.05, interrupt_then_release).start()
+    with pytest.raises(KeyboardInterrupt), latch.hold("k"):
+        pass
+    worker.join()
+    assert latch.in_flight() == 0
 
 
 def test_async_concurrent_same_key_awaits_compute_once(cache):
