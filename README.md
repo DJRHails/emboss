@@ -2,7 +2,7 @@
 
 **O**n-**D**isk **I**nput-keyed **C**ache — disk-backed memoization with pydantic-aware encoding.
 
-Version: 0.12.0
+Version: 0.12.1
 
 ```bash
 pip install emboss              # core — zero runtime dependencies (stdlib only)
@@ -208,6 +208,17 @@ CacheMiss: cache-only mode: no cached entry for 'grade' (identity grade:3f2a9c1b
 ```
 
 Async functions raise the same way — `await`ing a missed call inside cache-only mode raises `CacheMiss`. The mode is checked when the coroutine runs, not when it is created: a task started with `asyncio.create_task` inside the block stays sealed, but a bare coroutine created inside the block and only awaited after it exits executes normally.
+
+## Concurrent misses compute once — and the first write wins
+
+A cache that folds records keep-latest is only "never a wrong value" for a **deterministic** function. Wrap an LLM call with no API seed and every redundant recompute of an already-cached key draws a *different* sample — and the newer `set` is what every later reader serves, so the value the first caller returned (and maybe published) silently changes underneath them. In one production corpus 0.29% of 14.9M keys held such conflicting records, 92% of them from one process dispatching the same key twice within a minute.
+
+`@cached` closes that window in two layers:
+
+- **Per-key in-flight latch (per process).** A miss holds its key's latch — threads and asyncio tasks alike — while it computes and stores. A concurrent caller of the same key waits, then reads the stored value instead of computing its own. Distinct keys never serialise; a raising holder releases the latch; a function recursing into its own key gets the `RecursionError` it always did, not a deadlock.
+- **Re-check before store (best-effort across processes and nodes).** After computing, the miss re-reads its key. If another writer landed a value meanwhile, that value is served and this call's result is discarded — logged at `WARNING` when the two differ, `INFO` when identical. A peer's write inside the backend's index staleness, or one not yet synced in from another node, can still supersede on read; a stored value that no longer rehydrates under the current class is not a competing write, and the fresh result heals it.
+
+Nothing to configure: this is how every `@cached` miss behaves.
 
 ## Backends (`Cache` protocol)
 
