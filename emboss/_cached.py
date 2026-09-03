@@ -204,11 +204,16 @@ class _InflightLatch:
         with self._guard:
             lock, refs = self._locks.get(key) or (threading.RLock(), 0)
             self._locks[key] = (lock, refs + 1)
-        lock.acquire()
         try:
-            yield
+            # The acquire sits inside the refcount's `finally`: an interrupted
+            # wait (KeyboardInterrupt on the main thread) must drop its ref, or
+            # the key stays in the table for the life of the process.
+            lock.acquire()
+            try:
+                yield
+            finally:
+                lock.release()
         finally:
-            lock.release()
             with self._guard:
                 lock, refs = self._locks[key]
                 if refs == 1:
@@ -260,13 +265,18 @@ class _AsyncInflightLatch:
             yield  # re-entrant: this task already holds the key
             return
         slot.refs += 1
-        await slot.lock.acquire()
-        slot.holder = me
         try:
-            yield
+            # The acquire sits inside the refcount's `finally`: a waiter
+            # cancelled while queued (a `wait_for` timeout, a TaskGroup sibling
+            # failing) must drop its ref, or the slot outlives every holder.
+            await slot.lock.acquire()
+            slot.holder = me
+            try:
+                yield
+            finally:
+                slot.holder = None
+                slot.lock.release()
         finally:
-            slot.holder = None
-            slot.lock.release()
             slot.refs -= 1
             if slot.refs == 0 and slots.get(key) is slot:
                 del slots[key]
