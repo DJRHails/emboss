@@ -183,9 +183,19 @@ class _InflightLatch:
     into its own key on the same thread hits the same `RecursionError` it did
     before, not a deadlock. Cross-process callers are NOT latched — that window
     is closed (best-effort) by the re-check before store in the wrapper.
+
+    A `fork()`ed child starts with an empty table (`reset` runs via
+    `os.register_at_fork`): the parent's locks are inherited in whatever state
+    the fork caught them, and a key latched by a parent thread that does not
+    exist in the child would otherwise never be released there — the child's
+    first call on that key would wait forever instead of computing.
     """
 
     def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        """Drop every latch and start a fresh table (the after-fork child hook)."""
         self._guard = threading.Lock()
         self._locks: dict[str, tuple[threading.RLock, int]] = {}
 
@@ -236,6 +246,10 @@ class _AsyncInflightLatch:
     """
 
     def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        """Drop every per-loop table (the after-fork child hook; a loop is not fork-safe)."""
         self._per_loop: weakref.WeakKeyDictionary[
             asyncio.AbstractEventLoop, dict[str, _AsyncSlot]
         ] = weakref.WeakKeyDictionary()
@@ -278,6 +292,16 @@ class _AsyncInflightLatch:
 
 _LATCH = _InflightLatch()
 _ASYNC_LATCH = _AsyncInflightLatch()
+
+
+def _reset_latches_after_fork() -> None:
+    """The child of a `fork()` owns none of the parent's in-flight computes."""
+    _LATCH.reset()
+    _ASYNC_LATCH.reset()
+
+
+if hasattr(os, "register_at_fork"):  # POSIX only; Windows has no fork
+    os.register_at_fork(after_in_child=_reset_latches_after_fork)
 
 
 def _same_value(stored: Any, fresh: Any) -> bool:

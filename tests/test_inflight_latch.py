@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import multiprocessing
+import os
 import signal
 import sys
 import threading
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -251,3 +254,40 @@ def test_async_waiter_cancelled_while_queued_drops_its_latch_ref(cache):
         return _ASYNC_LATCH.in_flight()
 
     assert asyncio.run(run()) == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() is POSIX-only")
+def test_forked_child_does_not_inherit_a_held_latch(cache):
+    """A child forked while a parent thread holds a key's latch must compute that key, not wait
+    forever on a lock whose owning thread does not exist in the child."""
+    holding = threading.Event()
+    release = threading.Event()
+
+    @cached(cache)
+    def slow(x: int) -> int:
+        holding.set()
+        release.wait(timeout=10)
+        return x
+
+    holder = threading.Thread(target=slow, args=(1,), daemon=True)
+    holder.start()
+    assert holding.wait(timeout=5), "the holder thread never entered the latched compute"
+
+    def child() -> None:
+        release.set()  # the child's own copy of the event; the parent's holder stays parked
+        os._exit(0 if slow(1) == 1 else 1)
+
+    proc = multiprocessing.get_context("fork").Process(target=child)
+    with warnings.catch_warnings():
+        # Forking a multi-threaded process is the hazard under test, not an accident here.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        proc.start()
+    proc.join(timeout=10)
+    if proc.is_alive():
+        proc.kill()
+        release.set()
+        pytest.fail("the forked child deadlocked on the latch its parent's thread held")
+    release.set()
+    holder.join(timeout=5)
+    assert proc.exitcode == 0
+    assert _LATCH.in_flight() == 0
