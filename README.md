@@ -439,8 +439,9 @@ docstring-agnostic keys in 0.12.0), each time with an automatic migration of old
 - **Only the decorated function's own source is hashed.** Edits to helpers it calls, module
   globals, config files, or installed library versions do not invalidate the cache. Bump
   `unsafe_manual_key` or clear the cache when behaviour changes outside the function body.
-- **The function's source must be retrievable.** A function defined in an interactive REPL or
-  via `exec` raises `OSError: could not get source code` at decoration time.
+- **The function's source must be retrievable.** A function defined via `exec`, or in the
+  interactive REPL of Python 3.12 or earlier, raises `OSError: could not get source code` at
+  decoration time. (Python 3.13's REPL keeps entered source, so decorating there works.)
 - **Loose argument encoding by default.** `default=str` can bake a memory address into a key and
   silently miss every run; use `default=None` (strict) for inputs without a stable `str`. See
   [Custom or strict encoder](#custom-or-strict-encoder-default).
