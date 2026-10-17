@@ -1,14 +1,71 @@
 # emboss
 
 **O**n-**D**isk **I**nput-keyed **C**ache — disk-backed memoization with pydantic-aware encoding.
+(The acronym is from the package's original name, `odic`, renamed to `emboss` on day one.)
 
 Version: 0.12.2
+
+`emboss` is a Python library that provides one decorator, `@cached`: it stores a function's return
+value on disk, keyed on the function's own source code plus its arguments, so a re-run of an
+expensive or paid call (an HTTP request, an LLM call) is served from disk until you edit the
+function. It exists because `functools.lru_cache` dies with the process and naive pickling breaks
+on pydantic models defined in `__main__`. **Status: active, single maintainer, published on PyPI**
+(0.12.2 is the current release; 43 commits from 2026-05-22 to 2026-09-03). The core has no
+runtime dependencies.
 
 ```bash
 pip install emboss              # core — zero runtime dependencies (stdlib only)
 pip install emboss[pydantic]    # + pydantic v2 BaseModel support
 pip install emboss[diskcache]   # + use diskcache.Cache as a backend (now optional)
 ```
+
+## Key takeaways
+
+- **Editing the function invalidates its cache; reformatting it does not.** The key is the
+  decorated function's AST-canonical, docstring-stripped source plus its encoded arguments.
+  [confidence: ~90% — read in `emboss/_cached.py`; 11 tests in `tests/test_keying.py`]
+  → [Cache key](#cache-key)
+- **Only the decorated function's own source is hashed.** Changing a helper it calls, a global
+  it reads, or a library it uses does *not* invalidate the cache. This is the main way to get a
+  stale value. [confidence: ~95% — follows from `inspect.getsource(func)` in `_cached.py`]
+  → [Known limitations](#known-limitations)
+- **Pydantic return values survive a process boundary.** `BaseModel` (and `list`/`dict`/`| None`
+  of one) returns are stored as plain dicts and rehydrated on read. Ambiguous unions fall back to
+  raw pickle. [confidence: ~85% — round-trip and union tests in `tests/test_cached.py`; these
+  run in one process, and no test exercises the cross-process `__main__` case directly]
+  → [Pydantic](#pydantic-basemodel-returns)
+- **Four stdlib-only backends; pick by where the cache lives.** `SqliteCache`/`FanoutCache` for
+  a local disk, `FileCache`/`LogCache` for a network mount or a file-synced directory.
+  → [Backends](#backends-cache-protocol)
+- **Verified by a local test suite, not by CI.** 349 tests pass on Python 3.13 (run in this
+  audit, 2026-10-17). No workflow runs them: `.github/workflows/release.yml` builds and
+  publishes to PyPI on a version bump without running tests. Python 3.10–3.12 (allowed by
+  `requires-python`) were not tested in this audit. → [Status and verification](#status-and-verification)
+- **Used in production by one downstream project.** Commit messages and PR descriptions report
+  emboss as the cache of the author's touchstone fleet (a 14.9M-key corpus; values up to 185 MB). That
+  evidence lives in the other repo and was not re-checked here. [confidence: ~75%]
+  → [Provenance](#provenance-and-research-process)
+
+**What the project's value rests on.** Two design decisions do the work: (1) source-plus-argument
+keying must never return a value computed for different code or different inputs; a wrong key
+fails silently. (2) `LogCache` never has two nodes write the same file, which is what makes it
+safe under a last-write-wins file syncer. About half the test suite covers these two (167 of
+349: `test_keying.py`, `test_migration.py`, and `test_log_cache.py`).
+
+*How to read this:* confidence tags are an assessment of the evidence in this repo (sample sizes,
+seeds, intervals), added in a 2026-10 README audit; they are not new measurements.
+
+## Contents
+
+- [Why](#why) · [Quick start](#quick-start) · [Default cache directory](#default-cache-directory)
+- [Pydantic BaseModel returns](#pydantic-basemodel-returns) · [None caching](#none-caching)
+- [Cache key](#cache-key) · [Cache identity & migration](#cache-identity--migration)
+- [Cache-only mode](#cache-only-mode--prove-a-run-makes-zero-external-calls)
+- [Concurrent misses](#concurrent-misses-compute-once--and-the-first-write-wins)
+- [Backends](#backends-cache-protocol) · [Async support](#async-support) ·
+  [Daily-rolling caches](#daily-rolling-caches)
+- [Status and verification](#status-and-verification) · [Known limitations](#known-limitations) ·
+  [Development](#development) · [Provenance](#provenance-and-research-process)
 
 ## Why
 
@@ -211,7 +268,7 @@ Async functions raise the same way — `await`ing a missed call inside cache-onl
 
 ## Concurrent misses compute once — and the first write wins
 
-A cache that folds records keep-latest is only "never a wrong value" for a **deterministic** function. Wrap an LLM call with no API seed and every redundant recompute of an already-cached key draws a *different* sample — and the newer `set` is what every later reader serves, so the value the first caller returned (and maybe published) silently changes underneath them. In one production corpus 0.29% of 14.9M keys held such conflicting records, 92% of them from one process dispatching the same key twice within a minute.
+A cache that folds records keep-latest is only "never a wrong value" for a **deterministic** function. Wrap an LLM call with no API seed and every redundant recompute of an already-cached key draws a *different* sample — and the newer `set` is what every later reader serves, so the value the first caller returned (and maybe published) silently changes underneath them. In one production corpus 0.29% of 14.9M keys held such conflicting records, 92% of them from one process dispatching the same key twice within a minute. (Source: touchstone's keep-latest drift census, 43,852 of 14.94M keys, quoted in PR #39; the census lives in that repo, not this one.)
 
 `@cached` closes that window in two layers:
 
@@ -231,7 +288,7 @@ class Cache(Protocol):
     def set(self, key: str, value: Any) -> Any: ...
 ```
 
-emboss ships three dependency-free backends; `diskcache.Cache` still works if you `pip install emboss[diskcache]`.
+emboss ships four dependency-free backends; `diskcache.Cache` still works if you `pip install emboss[diskcache]`.
 
 | backend | storage | bounded? | shared across hosts? | use when |
 |---|---|---|---|---|
@@ -241,7 +298,12 @@ emboss ships three dependency-free backends; `diskcache.Cache` still works if yo
 | `LogCache` | per-writer append logs | best-effort | ✅ conflict-free, **few inodes** | **many small entries** on a shared/synced mount |
 | `diskcache.Cache` | SQLite (+ tags, stats) | ✅ | ❌ | you want diskcache's richer feature set |
 
-Throughput (local SSD, 512-byte values, order of magnitude — `python scripts/bench.py`):
+Throughput (local SSD, 512-byte values, order of magnitude — `python scripts/bench.py`). These
+are single runs with no repeats or intervals, so treat them as a rough ranking, not a
+measurement. A re-run in the 2026-10 audit (one run, container host, storage unknown) agreed on
+sets (~10⁴/s; `FileCache` ~4×10³/s) but read lower: `SqliteCache` ~5×10⁴ get/s, `LogCache`
+~2×10⁴ get/s. It reproduced the 512-vs-20,000 file count and the ~8× LRU-rewrite read penalty
+exactly.
 
 | backend | set | get |
 |---|---|---|
@@ -318,7 +380,7 @@ def expensive(x: int) -> dict:
 
 In the benchmark, **20,000 entries used 512 files (vs `FileCache`'s 20,000)** — the inode count is capped at #prefixes × #writers, independent of entry count. A read is an in-memory *location* lookup plus one page-cached frame read (~4×10⁴ get/s — see the benchmark block in `emboss/_log_cache.py` for the canonical numbers), so reads are slower than `SqliteCache`'s. That is a deliberate trade: **the index holds packed frame locations — no values and no keys — so it costs ~30 B per live key regardless of value size**, and a process's footprint no longer scales with the corpus it sweeps (before 0.10.0 a warm sweep over a 53 GB cache held ~30 GB of unpickled values per process). `index_ttl=1.0s` throttles the freshness re-`stat` for peers' appends, at the cost of up to `index_ttl` of staleness on cross-process/node writes (own writes are immediate, and 1 s is well under Syncthing's latency).
 
-**Large values spill to side files** (`min_file_size`, default 32 KB), keeping the append log small — verified on touchstone's real cache, where a **185 MB** value spilled to a side file and the log stayed at **120 bytes**. Spill files live in a per-prefix shared, content-addressed pool (`<prefix>/spill/<sha256>.val` — identical values collapse to one file, and two nodes producing the same name write identical bytes, so sync stays conflict-free) and are collected only by consolidation's mark-and-sweep, never on the write path. A lone-writer prefix sweeps automatically via the `max_log_bytes` trigger; a multi-writer prefix sweeps only on an explicit `consolidate()`.
+**Large values spill to side files** (`min_file_size`, default 32 KB), keeping the append log small — verified on touchstone's real cache, where a **185 MB** value spilled to a side file and the log stayed at **120 bytes** (reported in the commit that added spillover; that check ran against touchstone's data and can't be re-run from this repo). Spill files live in a per-prefix shared, content-addressed pool (`<prefix>/spill/<sha256>.val` — identical values collapse to one file, and two nodes producing the same name write identical bytes, so sync stays conflict-free) and are collected only by consolidation's mark-and-sweep, never on the write path. A lone-writer prefix sweeps automatically via the `max_log_bytes` trigger; a multi-writer prefix sweeps only on an explicit `consolidate()`.
 
 Tunables (`python scripts/bench.py` picked the defaults): `index_ttl` (1.0 s), `prefix_width` (2 → 256 shards; use 3 above ~2M entries), `max_log_bytes` (4 MB), `min_file_size` (32 KB). `writer_id` **must be unique per node** (defaults to the hostname); `prefix_width` must match across writers of a directory.
 
@@ -356,6 +418,75 @@ cache = SqliteCache(f"/tmp/my-cache-{date.today()}")
 ```
 
 Each new day → new dir → effectively fresh cache. Old dirs land in `/tmp` and get reaped by the OS.
+
+## Status and verification
+
+| What | Evidence | Confidence |
+|---|---|---|
+| Library behaves as documented above | 349 tests in `tests/` pass on Python 3.13.16 (local run, 2026-10-17, ~5 s); `test_log_cache.py` holds 139 of them | ~85% for the tested paths |
+| Python 3.10–3.12 support | Declared by `requires-python = ">=3.10"`; not run in this audit, and no CI matrix exists | unverified |
+| Releases are tested | No: `release.yml` builds and publishes to PyPI (trusted publishing) whenever `version` in `pyproject.toml` has no `v<version>` tag. It does not run the test suite | — |
+| Survives production load | Commit messages describe `LogCache` and `@cached` fixes driven by forensics on touchstone's fleet cache; the data is in that repo | ~75% |
+| Cross-host sync safety of `FileCache` / `LogCache` | Follows from the design (atomic rename; one writer per file), plus fault-injection tests in `test_log_cache.py`. Not exercised across real hosts here | ~80% |
+
+Maturity: pre-1.0 and changing quickly (0.1.0 to 0.12.2 in about three and a half months), with
+the cache *keying* scheme changed twice so far (whitespace-agnostic keys in 0.3.0, then
+docstring-agnostic keys in 0.12.0), each time with an automatic migration of old entries; see
+[Cache identity & migration](#cache-identity--migration).
+
+## Known limitations
+
+- **Only the decorated function's own source is hashed.** Edits to helpers it calls, module
+  globals, config files, or installed library versions do not invalidate the cache. Bump
+  `unsafe_manual_key` or clear the cache when behaviour changes outside the function body.
+- **The function's source must be retrievable.** A function defined via `exec`, or in the
+  interactive REPL of Python 3.12 or earlier, raises `OSError: could not get source code` at
+  decoration time. (Python 3.13's REPL keeps entered source, so decorating there works.)
+- **Loose argument encoding by default.** `default=str` can bake a memory address into a key and
+  silently miss every run; use `default=None` (strict) for inputs without a stable `str`. See
+  [Custom or strict encoder](#custom-or-strict-encoder-default).
+- **Docstring-as-behaviour detection is syntactic.** Only a literal `__doc__` read keeps
+  docstring-sensitive keying; `inspect.getdoc(f)` is not detected.
+- **`cache_only()` does not reach worker threads.** Use `EMBOSS_CACHE_ONLY=1` for a threaded run.
+- **SQLite backends are local-disk only.** `SqliteCache`/`FanoutCache` break on NFS; use
+  `FileCache` or `LogCache` on shared or synced storage.
+- **First-write-wins is per-process exact, cross-process best-effort.** A peer's write inside the
+  backend's index staleness, or not yet synced in, can still supersede on read.
+- **`LogCache` files grow with writers.** Peers' logs are never deleted unless you name retired
+  writers in `consolidate(prune_writer_ids=...)`. `writer_id` must be unique per node and
+  `prefix_width` must match across writers.
+- **Performance figures are order-of-magnitude single runs** (see [Backends](#backends-cache-protocol)).
+
+## Development
+
+```bash
+uv venv -p 3.13 .venv
+uv pip install -e '.[dev]'      # pytest, pydantic, diskcache
+.venv/bin/pytest -q             # the full suite, ~5 s
+.venv/bin/python scripts/bench.py   # backend throughput, inode footprint, tunable sweeps
+.venv/bin/emboss id --help      # the CLI entry point
+```
+
+Releases: bump the version with `bumpver` (configured in `pyproject.toml`; it also rewrites the
+`Version:` line in this README, but is not a declared dependency) and merge to `main`;
+`.github/workflows/release.yml` publishes the new version to PyPI and tags it. The repo has no
+linter configuration and no CI test or lint job.
+
+## Provenance and research process
+
+Written by one author between 2026-05-22 and 2026-09-03. Much of the later work hardens
+`LogCache` and `@cached` against problems seen in the cache of the author's touchstone fleet:
+spillover was validated on touchstone's cache; owner-only GC followed the 2026-07-10 fleet-cache
+clobber (a consolidation pass deleted two nodes' logs, losing at least 4,015 cached model draws,
+per the fix commit); module-skew handling came from forensic runs over the fleet corpus; and the
+in-flight latch came from the keep-latest drift census. Commit messages and PR descriptions
+record each fix's verification (test counts, and for several fixes a check that the new tests
+fail on the unfixed source). The production numbers quoted in this README come from those commits and PRs. They
+were measured on touchstone's data and can't be reproduced from this repo.
+
+This README's takeaways, tables and limitations were added in a 2026-10 audit. The audit read
+the source, ran the test suite and the benchmark once on Python 3.13, and ran `emboss --help`. It
+did not test Python 3.10–3.12, NFS, or multi-host sync.
 
 ## License
 
