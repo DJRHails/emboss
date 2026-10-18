@@ -6,6 +6,8 @@ name: Release to PyPI
 # The version-change guard is essential: PyPI rejects duplicate versions, so the
 # publish job only runs when `v<version>` is not already tagged. On publish it
 # cuts the `v<version>` tag + a GitHub release so the next unchanged push skips.
+# Every push runs the test suite (ci.yml) and publishing needs it to pass, so a
+# commit with failing tests cannot be released.
 
 on:
   push:
@@ -50,9 +52,15 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
 
+  tests:
+    name: Tests
+    # `./` not the newer `$/` form: actionlint 1.7.12 rejects `$/`, and this
+    # call has no prior step that could plant a different ci.yml on disk.
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository]
+
   build-and-publish:
     name: Build + publish to PyPI
-    needs: check
+    needs: [check, tests]
     if: needs.check.outputs.publish == 'true'
     # DELIBERATELY GitHub-hosted, unlike `check` above. This job mints an OIDC
     # token that PyPI exchanges for publish rights to `emboss`. taffy is a
