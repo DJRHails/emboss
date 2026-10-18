@@ -37,10 +37,11 @@ pip install emboss[diskcache]   # + use diskcache.Cache as a backend (now option
 - **Four stdlib-only backends; pick by where the cache lives.** `SqliteCache`/`FanoutCache` for
   a local disk, `FileCache`/`LogCache` for a network mount or a file-synced directory.
   → [Backends](#backends-cache-protocol)
-- **Verified by a local test suite, not by CI.** 349 tests pass on Python 3.13 (run in this
-  audit, 2026-10-17). No workflow runs them: `.github/workflows/release.yml` builds and
-  publishes to PyPI on a version bump without running tests. Python 3.10–3.12 (allowed by
-  `requires-python`) were not tested in this audit. → [Status and verification](#status-and-verification)
+- **Verified by a test suite that gates releases.** 349 tests pass on Python 3.13 (run in this
+  audit, 2026-10-17). `.github/workflows/ci.yml` runs them on every pull request and every push
+  to `main`, and the PyPI publish job in `release.yml` needs them to pass. CI covers Python 3.13
+  only; on 3.10 (allowed by `requires-python`) one test fails.
+  → [Status and verification](#status-and-verification)
 - **Used in production by one downstream project.** Commit messages and PR descriptions report
   emboss as the cache of the author's touchstone fleet (a 14.9M-key corpus; values up to 185 MB). That
   evidence lives in the other repo and was not re-checked here. [confidence: ~75%]
@@ -424,8 +425,8 @@ Each new day → new dir → effectively fresh cache. Old dirs land in `/tmp` an
 | What | Evidence | Confidence |
 |---|---|---|
 | Library behaves as documented above | 349 tests in `tests/` pass on Python 3.13.16 (local run, 2026-10-17, ~5 s); `test_log_cache.py` holds 139 of them | ~85% for the tested paths |
-| Python 3.10–3.12 support | Declared by `requires-python = ">=3.10"`; not run in this audit, and no CI matrix exists | unverified |
-| Releases are tested | No: `release.yml` builds and publishes to PyPI (trusted publishing) whenever `version` in `pyproject.toml` has no `v<version>` tag. It does not run the test suite | — |
+| Python 3.10–3.12 support | Declared by `requires-python = ">=3.10"`. A local run on 2026-10-18 passed on 3.11 and 3.12; on 3.10, `test_nested_forward_ref_without_future_import_encodes` fails. CI runs 3.13 only | 3.11–3.12 likely; 3.10 has a known failure |
+| Releases are tested | Yes: `release.yml` publishes to PyPI (trusted publishing) whenever `version` in `pyproject.toml` has no `v<version>` tag, and the publish job `needs:` the test suite (`ci.yml`) to pass on that commit | high |
 | Survives production load | Commit messages describe `LogCache` and `@cached` fixes driven by forensics on touchstone's fleet cache; the data is in that repo | ~75% |
 | Cross-host sync safety of `FileCache` / `LogCache` | Follows from the design (atomic rename; one writer per file), plus fault-injection tests in `test_log_cache.py`. Not exercised across real hosts here | ~80% |
 
@@ -469,8 +470,9 @@ uv pip install -e '.[dev]'      # pytest, pydantic, diskcache
 
 Releases: bump the version with `bumpver` (configured in `pyproject.toml`; it also rewrites the
 `Version:` line in this README, but is not a declared dependency) and merge to `main`;
-`.github/workflows/release.yml` publishes the new version to PyPI and tags it. The repo has no
-linter configuration and no CI test or lint job.
+`.github/workflows/release.yml` runs the test suite, then publishes the new version to PyPI and
+tags it; a failing suite blocks the publish. `.github/workflows/ci.yml` runs the suite on pull
+requests. The repo has no linter configuration, so CI has no lint job.
 
 ## Provenance and research process
 

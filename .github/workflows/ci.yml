@@ -1,0 +1,45 @@
+name: CI
+
+# Runs the test suite on every pull request. Pushes to main run it through
+# release.yml, which calls this workflow and makes publishing wait on it, so a
+# commit whose tests fail is never released (and main is not tested twice).
+# The repo has no linter or type-checker configuration, so tests are the gate.
+
+on:
+  pull_request:
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (Python 3.13)
+    # taffy's self-hosted pool, with the fork guard: this repo is public and a
+    # fork PR runs arbitrary code, so it goes to a GitHub-hosted VM instead.
+    # Escape hatch: set the CI_FALLBACK repo variable to 'true'.
+    runs-on: >-
+      ${{ ((github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name != github.repository)
+      || vars.CI_FALLBACK == 'true')
+      && 'ubuntu-latest'
+      || fromJSON('["self-hosted", "linux", "x64", "taffy"]') }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout (no creds)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.1"
+
+      - name: Install package with dev extras
+        run: |
+          uv venv --python 3.13 .venv
+          uv pip install --python .venv -e '.[dev]'
+
+      - name: Run tests
+        run: .venv/bin/pytest -q
