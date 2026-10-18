@@ -29,12 +29,13 @@ jobs:
       ${{ vars.CI_FALLBACK == 'true'
       && 'ubuntu-latest'
       || fromJSON('["self-hosted", "linux", "x64", "taffy"]') }}
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.v.outputs.version }}
       publish: ${{ steps.v.outputs.publish }}
     steps:
       - name: Checkout (no creds)
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -69,6 +70,7 @@ jobs:
     # alongside unrelated jobs. It fires only on a version bump, so the paid
     # minutes are rare and buy real isolation.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment:
       name: pypi
       url: https://pypi.org/p/emboss
@@ -78,13 +80,13 @@ jobs:
 
     steps:
       - name: Checkout (no creds)
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
 
@@ -98,7 +100,7 @@ jobs:
         run: ls -la dist/
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         # No `with:` block — OIDC handles auth; project `emboss` matches pyproject.
 
       - name: Tag the release and cut a GitHub release
