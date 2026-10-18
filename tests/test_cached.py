@@ -8,6 +8,7 @@ from collections.abc import Mapping
 
 import diskcache
 import pytest
+from no_future_annotations_module import QuotedFieldBasket
 from pydantic import BaseModel
 
 from emboss import cached
@@ -139,6 +140,82 @@ def test_nested_forward_ref_under_typing_generic_without_future_import_encodes(c
     stored = _stored_values(cache)[0]
     assert isinstance(stored["a"][0], dict) and stored["a"][0] == {"name": "typing-wrapped"}
     assert isinstance(k()["a"][0], NestedRefModel)  # warm hit rehydrates
+
+
+def test_quoted_name_in_dataclass_field_without_future_import_encodes(cache):
+    """A dataclass field annotated `list["M"]` (no PEP 563) must resolve the
+    quoted name too, so the models inside the field are stored as dicts."""
+    from no_future_annotations_module import (
+        NestedRefModel,
+        QuotedFieldBasket,
+        make_quoted_field_dataclass_function,
+    )
+
+    b = make_quoted_field_dataclass_function(cache)
+    assert isinstance(b().items[0], NestedRefModel)
+    stored = _stored_values(cache)[0]
+    assert stored == {"items": [{"name": "in-field"}]}
+    warm = b()
+    assert isinstance(warm, QuotedFieldBasket) and isinstance(warm.items[0], NestedRefModel)
+
+
+@dataclasses.dataclass
+class DoubleQuotedFieldBasket:
+    items: list["M"]  # noqa: UP037 — the inner quote IS the test subject
+
+
+def test_nested_quoted_name_in_dataclass_field_under_future_import_encodes(cache):
+    """Under PEP 563 a field annotated `list["M"]` arrives as the string
+    `'list["M"]'`; its second resolution pass must reach the model too."""
+
+    @cached(cache)
+    def b() -> DoubleQuotedFieldBasket:
+        return DoubleQuotedFieldBasket(items=[M(name="double-in-field")])
+
+    assert isinstance(b().items[0], M)
+    stored = _stored_values(cache)[0]
+    assert stored == {"items": [{"name": "double-in-field", "n": 0}]}
+    assert isinstance(b().items[0], M)  # warm hit rehydrates
+
+
+@dataclasses.dataclass
+class ShadowedQuotedFieldBasket:
+    items: list["M"]  # noqa: UP037 — the inner quote IS the test subject
+    M = 3  # a class attribute named like the module-level model
+
+
+def test_quoted_field_name_prefers_module_global_over_class_attribute(cache):
+    """`typing.get_type_hints(cls)` looks a name up in the module's globals
+    before the class namespace; the 3.10 quoted-field pass must too, or a
+    shadowing class attribute disables the codec for the whole dataclass."""
+
+    @cached(cache)
+    def b() -> ShadowedQuotedFieldBasket:
+        return ShadowedQuotedFieldBasket(items=[M(name="shadowed")])
+
+    b()
+    assert _stored_values(cache)[0] == {"items": [{"name": "shadowed", "n": 0}]}
+    assert isinstance(b().items[0], M)  # warm hit rehydrates
+
+
+@dataclasses.dataclass
+class ForeignBasketSubclass(QuotedFieldBasket):
+    extra: int = 0
+
+
+def test_inherited_quoted_field_resolves_in_declaring_module(cache):
+    """A quoted field inherited from a dataclass in another module resolves in
+    that module's namespace, where the name is defined (this module has no
+    module-level `NestedRefModel`)."""
+    from no_future_annotations_module import NestedRefModel
+
+    @cached(cache)
+    def b() -> ForeignBasketSubclass:
+        return ForeignBasketSubclass(items=[NestedRefModel(name="inherited")], extra=1)
+
+    b()
+    assert _stored_values(cache)[0] == {"items": [{"name": "inherited"}], "extra": 1}
+    assert isinstance(b().items[0], NestedRefModel)  # warm hit rehydrates
 
 
 def test_nested_quoted_name_under_future_import_encodes(cache):

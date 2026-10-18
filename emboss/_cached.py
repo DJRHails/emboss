@@ -13,6 +13,7 @@ import inspect
 import json
 import logging
 import os
+import sys
 import tempfile
 import textwrap
 import threading
@@ -403,9 +404,25 @@ def _dataclass_hints(cls: type) -> Mapping[str, Any] | None:
     """Resolved field annotations for recursive encode/decode of nested fields;
     `None` when a hint cannot be resolved (the field then passes through raw)."""
     try:
-        return typing.get_type_hints(cls)
+        hints = typing.get_type_hints(cls)
+        for name, hint in hints.items():
+            if _quoted_args_as_forward_refs(hint) is not hint:
+                hints[name] = _resolve_quoted_field_hint(cls, name, hint)
+        return hints
     except Exception:  # noqa: BLE001 — unresolvable hints → passthrough fields
         return None
+
+
+def _resolve_quoted_field_hint(cls: type, name: str, hint: Any) -> Any:
+    """Finish resolving field `name`'s hint, which still holds a quoted name
+    inside a builtin generic (Python 3.10 only; see
+    `_quoted_args_as_forward_refs`). Evaluates in the namespace of the class in
+    the MRO that declares the field, as `typing.get_type_hints` does: the
+    module's globals first, then the class's own namespace."""
+    owner = next(base for base in cls.__mro__ if name in inspect.get_annotations(base))
+    module_globals = getattr(sys.modules.get(owner.__module__), "__dict__", {})
+    stub = types.FunctionType((lambda: None).__code__, module_globals)
+    return _evaluate_return_hint(stub, hint, localns={**vars(owner), **module_globals})
 
 
 def _member_shapes(a: Any) -> tuple[type, ...]:
@@ -500,8 +517,11 @@ def _quoted_args_as_forward_refs(anno: Any) -> Any:
     return anno.copy_with(args)
 
 
-def _evaluate_return_hint(stub: types.FunctionType, anno: Any) -> Any:
-    """`typing.get_type_hints` of `anno` as the stub's return annotation.
+def _evaluate_return_hint(
+    stub: types.FunctionType, anno: Any, localns: Mapping[str, Any] | None = None
+) -> Any:
+    """`typing.get_type_hints` of `anno` as the stub's return annotation, with
+    names looked up in `localns` first and then the stub's globals.
 
     Each pass that leaves a quoted builtin-generic argument behind (Python 3.10
     only, see `_quoted_args_as_forward_refs`) wraps it and evaluates again;
@@ -510,7 +530,8 @@ def _evaluate_return_hint(stub: types.FunctionType, anno: Any) -> Any:
     resolved = inspect.Parameter.empty
     for _ in range(8):
         stub.__annotations__ = {"return": anno}
-        resolved = typing.get_type_hints(stub).get("return", inspect.Parameter.empty)
+        hints = typing.get_type_hints(stub, localns=None if localns is None else dict(localns))
+        resolved = hints.get("return", inspect.Parameter.empty)
         anno = _quoted_args_as_forward_refs(resolved)
         if anno is resolved:
             break
