@@ -141,6 +141,42 @@ def test_nested_forward_ref_under_typing_generic_without_future_import_encodes(c
     assert isinstance(k()["a"][0], NestedRefModel)  # warm hit rehydrates
 
 
+def test_quoted_name_in_dataclass_field_without_future_import_encodes(cache):
+    """A dataclass field annotated `list["M"]` (no PEP 563) must resolve the
+    quoted name too, so the models inside the field are stored as dicts."""
+    from no_future_annotations_module import (
+        NestedRefModel,
+        QuotedFieldBasket,
+        make_quoted_field_dataclass_function,
+    )
+
+    b = make_quoted_field_dataclass_function(cache)
+    assert isinstance(b().items[0], NestedRefModel)
+    stored = _stored_values(cache)[0]
+    assert stored == {"items": [{"name": "in-field"}]}
+    warm = b()
+    assert isinstance(warm, QuotedFieldBasket) and isinstance(warm.items[0], NestedRefModel)
+
+
+@dataclasses.dataclass
+class DoubleQuotedFieldBasket:
+    items: list["M"]  # noqa: UP037 — the inner quote IS the test subject
+
+
+def test_nested_quoted_name_in_dataclass_field_under_future_import_encodes(cache):
+    """Under PEP 563 a field annotated `list["M"]` arrives as the string
+    `'list["M"]'`; its second resolution pass must reach the model too."""
+
+    @cached(cache)
+    def b() -> DoubleQuotedFieldBasket:
+        return DoubleQuotedFieldBasket(items=[M(name="double-in-field")])
+
+    assert isinstance(b().items[0], M)
+    stored = _stored_values(cache)[0]
+    assert stored == {"items": [{"name": "double-in-field", "n": 0}]}
+    assert isinstance(b().items[0], M)  # warm hit rehydrates
+
+
 def test_nested_quoted_name_under_future_import_encodes(cache):
     """Under PEP 563 a redundant inner quote (`-> list["M"]`) arrives as the
     string `'list["M"]'`, which evaluates to a generic still holding `'M'` — a
