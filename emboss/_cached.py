@@ -477,22 +477,27 @@ def _quoted_args_as_forward_refs(anno: Any) -> Any:
     3.10's `typing.get_type_hints` leaves such strings unevaluated, so
     `-> list["M"]` resolves to `list['M']` and the model stays invisible to the
     codec. 3.11+ does this wrapping inside `get_type_hints` itself (gh-85542).
-    Recurses through nested builtin generics and unions; returns `anno` itself
-    (the same object) when it holds no such string."""
+    Recurses through nested builtin generics, unions, and the `typing` aliases
+    of the containers `_wants_codec` walks (`Dict[str, list["M"]]`); returns
+    `anno` itself (the same object) when it holds no such string."""
+    origin = typing.get_origin(anno)
+    old_args = typing.get_args(anno)  # `()` for a bare `List`, which has no `__args__`
     if type(anno) is types.GenericAlias:
         args = tuple(
             typing.ForwardRef(a) if isinstance(a, str) else _quoted_args_as_forward_refs(a)
-            for a in anno.__args__
+            for a in old_args
         )
-    elif typing.get_origin(anno) in (Union, types.UnionType):
-        args = tuple(_quoted_args_as_forward_refs(a) for a in anno.__args__)
+    elif origin in (Union, types.UnionType, list, tuple, dict):
+        args = tuple(_quoted_args_as_forward_refs(a) for a in old_args)
     else:
         return anno
-    if all(new is old for new, old in zip(args, anno.__args__)):
+    if all(new is old for new, old in zip(args, old_args)):
         return anno
     if type(anno) is types.GenericAlias:
         return types.GenericAlias(anno.__origin__, args)
-    return Union[args]  # noqa: UP007 — `|` can't join a ForwardRef, `Union[...]` can
+    if origin in (Union, types.UnionType):
+        return Union[args]  # noqa: UP007 — `|` can't join a ForwardRef, `Union[...]` can
+    return anno.copy_with(args)
 
 
 def _evaluate_return_hint(stub: types.FunctionType, anno: Any) -> Any:

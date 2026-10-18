@@ -126,6 +126,21 @@ def test_nested_forward_ref_in_union_without_future_import_encodes(cache):
     assert isinstance(h()[0], NestedRefModel)  # warm hit rehydrates
 
 
+def test_nested_forward_ref_under_typing_generic_without_future_import_encodes(cache):
+    """A `typing` generic may wrap the builtin generic holding the quoted name
+    (`-> Dict[str, list["M"]]`); resolution must recurse through it too."""
+    from no_future_annotations_module import (
+        NestedRefModel,
+        make_typing_wrapped_nested_ref_function,
+    )
+
+    k = make_typing_wrapped_nested_ref_function(cache)
+    assert isinstance(k()["a"][0], NestedRefModel)
+    stored = _stored_values(cache)[0]
+    assert isinstance(stored["a"][0], dict) and stored["a"][0] == {"name": "typing-wrapped"}
+    assert isinstance(k()["a"][0], NestedRefModel)  # warm hit rehydrates
+
+
 def test_nested_quoted_name_under_future_import_encodes(cache):
     """Under PEP 563 a redundant inner quote (`-> list["M"]`) arrives as the
     string `'list["M"]'`, which evaluates to a generic still holding `'M'` — a
