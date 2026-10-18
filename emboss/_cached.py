@@ -417,11 +417,12 @@ def _resolve_quoted_field_hint(cls: type, name: str, hint: Any) -> Any:
     """Finish resolving field `name`'s hint, which still holds a quoted name
     inside a builtin generic (Python 3.10 only; see
     `_quoted_args_as_forward_refs`). Evaluates in the namespace of the class in
-    the MRO that declares the field, as `typing.get_type_hints` does."""
+    the MRO that declares the field, as `typing.get_type_hints` does: the
+    module's globals first, then the class's own namespace."""
     owner = next(base for base in cls.__mro__ if name in inspect.get_annotations(base))
     module_globals = getattr(sys.modules.get(owner.__module__), "__dict__", {})
     stub = types.FunctionType((lambda: None).__code__, module_globals)
-    return _evaluate_return_hint(stub, hint, localns=dict(vars(owner)))
+    return _evaluate_return_hint(stub, hint, localns={**vars(owner), **module_globals})
 
 
 def _member_shapes(a: Any) -> tuple[type, ...]:
