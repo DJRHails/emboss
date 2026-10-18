@@ -100,9 +100,10 @@ def test_unresolvable_param_annotation_keeps_return_codec(cache):
 
 
 def test_nested_forward_ref_without_future_import_encodes(cache):
-    """In a module without PEP 563, `-> list["M"]` arrives holding a ForwardRef
-    object (not a string); the codec must still resolve it rather than pickling
-    the models by class reference."""
+    """In a module without PEP 563, `-> list["M"]` arrives as a builtin generic
+    holding the bare string `'M'` (Python 3.10's `get_type_hints` leaves it
+    unevaluated); the codec must still resolve it rather than pickling the
+    models by class reference."""
     from no_future_annotations_module import NestedRefModel, make_nested_ref_function
 
     g = make_nested_ref_function(cache)
@@ -111,6 +112,48 @@ def test_nested_forward_ref_without_future_import_encodes(cache):
     stored = _stored_values(cache)[0]
     assert isinstance(stored[0], dict) and stored[0] == {"name": "nested"}
     assert isinstance(g()[0], NestedRefModel)  # warm hit rehydrates
+
+
+def test_nested_forward_ref_in_union_without_future_import_encodes(cache):
+    """The quoted name may sit inside a builtin generic inside a union
+    (`-> list["M"] | None`); resolution must reach it there too."""
+    from no_future_annotations_module import NestedRefModel, make_optional_nested_ref_function
+
+    h = make_optional_nested_ref_function(cache)
+    assert isinstance(h()[0], NestedRefModel)
+    stored = _stored_values(cache)[0]
+    assert isinstance(stored[0], dict) and stored[0] == {"name": "optional"}
+    assert isinstance(h()[0], NestedRefModel)  # warm hit rehydrates
+
+
+def test_nested_forward_ref_under_typing_generic_without_future_import_encodes(cache):
+    """A `typing` generic may wrap the builtin generic holding the quoted name
+    (`-> Dict[str, list["M"]]`); resolution must recurse through it too."""
+    from no_future_annotations_module import (
+        NestedRefModel,
+        make_typing_wrapped_nested_ref_function,
+    )
+
+    k = make_typing_wrapped_nested_ref_function(cache)
+    assert isinstance(k()["a"][0], NestedRefModel)
+    stored = _stored_values(cache)[0]
+    assert isinstance(stored["a"][0], dict) and stored["a"][0] == {"name": "typing-wrapped"}
+    assert isinstance(k()["a"][0], NestedRefModel)  # warm hit rehydrates
+
+
+def test_nested_quoted_name_under_future_import_encodes(cache):
+    """Under PEP 563 a redundant inner quote (`-> list["M"]`) arrives as the
+    string `'list["M"]'`, which evaluates to a generic still holding `'M'` — a
+    second resolution pass must turn that into the model too."""
+
+    @cached(cache)
+    def f() -> list["M"]:  # noqa: UP037 — the inner quote IS the test subject
+        return [M(name="double-quoted")]
+
+    assert isinstance(f()[0], M)
+    stored = _stored_values(cache)[0]
+    assert isinstance(stored[0], dict) and stored[0]["name"] == "double-quoted"
+    assert isinstance(f()[0], M)  # warm hit rehydrates
 
 
 def test_list_of_basemodel_round_trip(cache):

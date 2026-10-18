@@ -14,7 +14,13 @@ permissions:
 
 jobs:
   tests:
-    name: Tests (Python 3.13)
+    name: Tests (Python ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # The declared minimum (`requires-python` in pyproject.toml) and the newest
+        # supported version; raise the first entry whenever the minimum moves.
+        python: ["3.10", "3.13"]
     # taffy's self-hosted pool, with the fork guard: this repo is public and a
     # fork PR runs arbitrary code, so it goes to a GitHub-hosted VM instead.
     # Escape hatch: set the CI_FALLBACK repo variable to 'true'.
@@ -37,8 +43,10 @@ jobs:
           version: "0.13.1"
 
       - name: Install package with dev extras
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
         run: |
-          uv venv --python 3.13 .venv
+          uv venv --python "$PYTHON_VERSION" .venv
           uv pip install --python .venv -e '.[dev]'
 
       # basetemp under RUNNER_TEMP: the default /tmp/pytest-of-<user> is shared with

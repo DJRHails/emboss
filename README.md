@@ -37,10 +37,10 @@ pip install emboss[diskcache]   # + use diskcache.Cache as a backend (now option
 - **Four stdlib-only backends; pick by where the cache lives.** `SqliteCache`/`FanoutCache` for
   a local disk, `FileCache`/`LogCache` for a network mount or a file-synced directory.
   → [Backends](#backends-cache-protocol)
-- **Verified by a test suite that gates releases.** 349 tests pass on Python 3.13 (run in this
-  audit, 2026-10-17). `.github/workflows/ci.yml` runs them on every pull request and every push
-  to `main`, and the PyPI publish job in `release.yml` needs them to pass. CI covers Python 3.13
-  only; on 3.10 (allowed by `requires-python`) one test fails.
+- **Verified by a test suite that gates releases.** 352 tests pass on Python 3.10, 3.11, 3.12
+  and 3.13 (local run, 2026-10-18). `.github/workflows/ci.yml` runs them on every pull request
+  and every push to `main`, and the PyPI publish job in `release.yml` needs them to pass. CI
+  covers Python 3.10 (the `requires-python` minimum) and 3.13.
   → [Status and verification](#status-and-verification)
 - **Used in production by one downstream project.** Commit messages and PR descriptions report
   emboss as the cache of the author's touchstone fleet (a 14.9M-key corpus; values up to 185 MB). That
@@ -51,7 +51,7 @@ pip install emboss[diskcache]   # + use diskcache.Cache as a backend (now option
 keying must never return a value computed for different code or different inputs; a wrong key
 fails silently. (2) `LogCache` never has two nodes write the same file, which is what makes it
 safe under a last-write-wins file syncer. About half the test suite covers these two (167 of
-349: `test_keying.py`, `test_migration.py`, and `test_log_cache.py`).
+352: `test_keying.py`, `test_migration.py`, and `test_log_cache.py`).
 
 *How to read this:* confidence tags are an assessment of the evidence in this repo (sample sizes,
 seeds, intervals), added in a 2026-10 README audit; they are not new measurements.
@@ -424,8 +424,8 @@ Each new day → new dir → effectively fresh cache. Old dirs land in `/tmp` an
 
 | What | Evidence | Confidence |
 |---|---|---|
-| Library behaves as documented above | 349 tests in `tests/` pass on Python 3.13.16 (local run, 2026-10-17, ~5 s); `test_log_cache.py` holds 139 of them | ~85% for the tested paths |
-| Python 3.10–3.12 support | Declared by `requires-python = ">=3.10"`. A local run on 2026-10-18 passed on 3.11 and 3.12; on 3.10, `test_nested_forward_ref_without_future_import_encodes` fails. CI runs 3.13 only | 3.11–3.12 likely; 3.10 has a known failure |
+| Library behaves as documented above | 352 tests in `tests/` pass on Python 3.13 (local run, 2026-10-18, ~5 s); `test_log_cache.py` holds 139 of them | ~85% for the tested paths |
+| Python 3.10–3.12 support | Declared by `requires-python = ">=3.10"`. A local run on 2026-10-18 passed all 352 tests on 3.10, 3.11 and 3.12. CI runs 3.10 and 3.13 | high for 3.10 and 3.13; 3.11–3.12 likely |
 | Releases are tested | Yes: `release.yml` publishes to PyPI (trusted publishing) whenever `version` in `pyproject.toml` has no `v<version>` tag, and the publish job `needs:` the test suite (`ci.yml`) to pass on that commit | high |
 | Survives production load | Commit messages describe `LogCache` and `@cached` fixes driven by forensics on touchstone's fleet cache; the data is in that repo | ~75% |
 | Cross-host sync safety of `FileCache` / `LogCache` | Follows from the design (atomic rename; one writer per file), plus fault-injection tests in `test_log_cache.py`. Not exercised across real hosts here | ~80% |

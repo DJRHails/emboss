@@ -470,6 +470,53 @@ def _wants_codec(anno: Any, _depth: int = 0) -> bool:
     return False
 
 
+def _quoted_args_as_forward_refs(anno: Any) -> Any:
+    """Wrap the quoted names inside builtin generics (`list["M"]`) as `ForwardRef`s.
+
+    A builtin generic keeps a quoted argument as a bare string, and Python
+    3.10's `typing.get_type_hints` leaves such strings unevaluated, so
+    `-> list["M"]` resolves to `list['M']` and the model stays invisible to the
+    codec. 3.11+ does this wrapping inside `get_type_hints` itself (gh-85542).
+    Recurses through nested builtin generics, unions, and the `typing` aliases
+    of the containers `_wants_codec` walks (`Dict[str, list["M"]]`); returns
+    `anno` itself (the same object) when it holds no such string."""
+    origin = typing.get_origin(anno)
+    old_args = typing.get_args(anno)  # `()` for a bare `List`, which has no `__args__`
+    if type(anno) is types.GenericAlias:
+        args = tuple(
+            typing.ForwardRef(a) if isinstance(a, str) else _quoted_args_as_forward_refs(a)
+            for a in old_args
+        )
+    elif origin in (Union, types.UnionType, list, tuple, dict):
+        args = tuple(_quoted_args_as_forward_refs(a) for a in old_args)
+    else:
+        return anno
+    if all(new is old for new, old in zip(args, old_args)):
+        return anno
+    if type(anno) is types.GenericAlias:
+        return types.GenericAlias(anno.__origin__, args)
+    if origin in (Union, types.UnionType):
+        return Union[args]  # noqa: UP007 — `|` can't join a ForwardRef, `Union[...]` can
+    return anno.copy_with(args)
+
+
+def _evaluate_return_hint(stub: types.FunctionType, anno: Any) -> Any:
+    """`typing.get_type_hints` of `anno` as the stub's return annotation.
+
+    Each pass that leaves a quoted builtin-generic argument behind (Python 3.10
+    only, see `_quoted_args_as_forward_refs`) wraps it and evaluates again;
+    a PEP 563 `"list['M']"` takes two passes. The bound stops a self-referencing
+    alias (`X = list["X"]`) from looping, leaving it unresolved."""
+    resolved = inspect.Parameter.empty
+    for _ in range(8):
+        stub.__annotations__ = {"return": anno}
+        resolved = typing.get_type_hints(stub).get("return", inspect.Parameter.empty)
+        anno = _quoted_args_as_forward_refs(resolved)
+        if anno is resolved:
+            break
+    return resolved
+
+
 def _resolve_return_annotation(func: Callable[..., Any], anno: Any) -> Any:
     """Resolve a string / forward-ref return annotation to real types.
 
@@ -484,14 +531,13 @@ def _resolve_return_annotation(func: Callable[..., Any], anno: Any) -> Any:
     function) keeps the raw-pickle passthrough — with a warning, because any
     model/dataclass it names will then be stored by class reference."""
     stub = types.FunctionType((lambda: None).__code__, getattr(func, "__globals__", {}))
-    stub.__annotations__ = {"return": anno}
     # PEP 695 generics: `def f[T]() -> "list[T]"` resolves T off the function's
     # own type params, which the stub must inherit or the name never resolves.
     stub.__type_params__ = getattr(  # ty: ignore[unresolved-attribute] — writable since 3.12
         func, "__type_params__", ()
     )
     try:
-        return typing.get_type_hints(stub).get("return", inspect.Parameter.empty)
+        return _evaluate_return_hint(stub, anno)
     except Exception as exc:  # noqa: BLE001 — unresolvable annotation → passthrough
         logger.warning(
             "emboss.cached: return annotation %r of %s() did not resolve (%s); "
