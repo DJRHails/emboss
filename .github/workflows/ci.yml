@@ -41,5 +41,7 @@ jobs:
           uv venv --python 3.13 .venv
           uv pip install --python .venv -e '.[dev]'
 
+      # basetemp under RUNNER_TEMP: the default /tmp/pytest-of-<user> is shared with
+      # every other repo's CI on taffy, and pytest warns while pruning their leftovers.
       - name: Run tests
-        run: .venv/bin/pytest -q
+        run: .venv/bin/pytest -q --basetemp="$RUNNER_TEMP/pytest"
